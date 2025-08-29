@@ -54,6 +54,8 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     val busy = Output(Bool())
 
     val counter = new CounterEventIO()
+
+    val profile = new ProfileIO(cmd_t, ROB_ID_WIDTH)
   })
 
   // TODO make this a ChiselEnum
@@ -71,6 +73,15 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
         !(start.is_garbage() || other.start.is_garbage()) // TODO the "is_garbage" check might not really be necessary
     }
   }
+
+  val issue_cmd = Wire(new ReservationStationIssue(cmd_t, ROB_ID_WIDTH))
+  
+  issue_cmd := DontCare
+  issue_cmd.valid := false.B
+  
+  io.profile.issue_cmd.valid := issue_cmd.valid
+  io.profile.issue_cmd.cmd := issue_cmd.cmd
+  io.profile.issue_cmd.rob_id := issue_cmd.rob_id
 
   val instructions_allocated = RegInit(0.U(32.W))
   when (io.alloc.fire) {
@@ -355,6 +366,10 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
           val alloc_id = MuxCase((entries_count - 1).U, entries_type.zipWithIndex.map { case (e, i) => !e.valid -> i.U })
 
           when (!entries_type(alloc_id).valid) {
+            issue_cmd.cmd := new_entry.cmd
+            issue_cmd.rob_id := Cat(q.asUInt, alloc_id.pad(log2Up(res_max_per_type)))
+            issue_cmd.valid := true.B
+
             io.alloc.ready := true.B
             entries_type(alloc_id).valid := true.B
             entries_type(alloc_id).bits := new_entry
@@ -568,4 +583,6 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
   io.counter.connectExternalCounter(CounterExternal.RESERVATION_STATION_EX_COUNT, utilization_ex_q)
   io.counter.connectEventSignal(CounterEvent.RESERVATION_STATION_ACTIVE_CYCLES, io.busy)
   io.counter.connectEventSignal(CounterEvent.RESERVATION_STATION_FULL_CYCLES, !io.alloc.ready)
+
+  ProfileEventIO.init(io.profile.event_io)
 }

@@ -50,7 +50,9 @@ class AccumulatorMemIO [T <: Data: Arithmetic, U <: Data](n: Int, t: Vec[Vec[T]]
   val read = Flipped(new AccumulatorReadIO(n, t, scale_t))
   val write = Flipped(Decoupled(new AccumulatorWriteReq(n, t)))
 
-  val ext_mem = if (use_shared_ext_mem) Some(Vec(acc_sub_banks, new ExtMemIO)) else None
+  // changed
+  // val ext_mem = if (use_shared_ext_mem) Some(Vec(acc_sub_banks, new ExtMemIO)) else None
+  val ext_mem = if (use_shared_ext_mem) Some(Vec(acc_sub_banks, new ExtMemIO_4)) else None
 
   val adder = new Bundle {
     val valid = Output(Bool())
@@ -134,6 +136,11 @@ class AccumulatorMem[T <: Data, U <: Data](
   val mask_len = t.getWidth / 8
   val mask_elem = UInt((t.getWidth / mask_len).W)
 
+  // made
+  val rvalid = WireInit(false.B)
+  // val rvalid = Wire(Bool())
+  // rvalid := DontCare
+
   if (!acc_singleported && !is_dummy) {
     require(!use_shared_ext_mem)
     val mem = TwoPortSyncMem(n, t, mask_len) // TODO We assume byte-alignment here. Use aligned_to instead
@@ -164,11 +171,17 @@ class AccumulatorMem[T <: Data, U <: Data](
       def isThisBank(addr: UInt) = addr(log2Ceil(acc_sub_banks)-1,0) === i.U
       def getBankIdx(addr: UInt) = addr >> log2Ceil(acc_sub_banks)
       val (read, write) = if (use_shared_ext_mem) {
+        // changed
         def read(addr: UInt, ren: Bool): Data = {
           io.ext_mem.get(i).read_en := ren
           io.ext_mem.get(i).read_addr := addr
           io.ext_mem.get(i).read_data
         }
+        // def read(addr: UInt, ren: Bool): (Data, Bool) = {
+        //   io.ext_mem.get(i).read_en := ren
+        //   io.ext_mem.get(i).read_addr := addr
+        //   (io.ext_mem.get(i).read_data, io.ext_mem.get(i).read_valid)
+        // }
         io.ext_mem.get(i).write_en := false.B
         io.ext_mem.get(i).write_addr := DontCare
         io.ext_mem.get(i).write_data := DontCare
@@ -182,7 +195,9 @@ class AccumulatorMem[T <: Data, U <: Data](
         (read _, write _)
       } else {
         val mem = SyncReadMem(n / acc_sub_banks, Vec(mask_len, mask_elem))
+        // changed
         def read(addr: UInt, ren: Bool): Data = mem.read(addr, ren)
+        // def read(addr: UInt, ren: Bool): (Data, Bool) = (mem.read(addr, ren), ren)
         def write(addr: UInt, wdata: Vec[UInt], wmask: Vec[Bool]) = mem.write(addr, wdata, wmask)
         (read _, write _)
       }
@@ -254,12 +269,24 @@ class AccumulatorMem[T <: Data, U <: Data](
         }
       }
 
+      // changed
       val bank_rdata = read(raddr, ren && !wen).asTypeOf(t)
+      // val (rdata, rvalidd) = read(raddr, ren && !wen)
+      // val bank_rdata = rdata.asTypeOf(t)
+      
+      // changed
       when (RegNext(ren && rmw_req.valid && isThisBank(rmw_req.bits))) {
         rdata_for_adder := bank_rdata
       } .elsewhen (RegNext(ren)) {
         rdata_for_read_resp := bank_rdata
       }
+      // when (RegNext(rvalidd && rmw_req.valid && isThisBank(rmw_req.bits))) {
+      //   rdata_for_adder := bank_rdata
+      //   rvalid := true.B
+      // } .elsewhen (RegNext(rvalidd)) {
+      //   rdata_for_read_resp := bank_rdata
+      //   rvalid := true.B
+      // }
 
       when (wen) {
         write(waddr, wdata, wmask)
@@ -281,7 +308,9 @@ class AccumulatorMem[T <: Data, U <: Data](
           only_read_req.ready := false.B
         }
       } .otherwise {
+        // changed
         ren := isThisBank(only_read_req.bits) && only_read_req.fire
+        // ren := isThisBank(only_read_req.bits) && io.read.req.fire
         raddr := getBankIdx(only_read_req.bits)
       }
 
@@ -290,6 +319,7 @@ class AccumulatorMem[T <: Data, U <: Data](
       }
     }
   }
+
 
   val q = Module(new Queue(new AccumulatorReadResp(t, scale_t),  1, true, true))
   q.io.enq.bits.data := rdata_for_read_resp
@@ -307,7 +337,9 @@ class AccumulatorMem[T <: Data, U <: Data](
   q.io.enq.bits.act := RegNext(io.read.req.bits.act)
   q.io.enq.bits.fromDMA := RegNext(io.read.req.bits.fromDMA)
   q.io.enq.bits.acc_bank_id := DontCare
+  // changed
   q.io.enq.valid := RegNext(io.read.req.fire)
+  // q.io.enq.valid := rvalid
 
   val p = q.io.deq
 
@@ -324,15 +356,25 @@ class AccumulatorMem[T <: Data, U <: Data](
   p.ready := io.read.resp.ready
 
   val q_will_be_empty = (q.io.count +& q.io.enq.fire) - q.io.deq.fire === 0.U
+  // changed
   io.read.req.ready := q_will_be_empty && (
       // Make sure we aren't accumulating, which would take over both ports
       !(io.write.valid && io.write.bits.acc) &&
       !pipelined_writes.map(r => r.valid && r.bits.addr === io.read.req.bits.addr).reduce(_||_)  &&
       !block_read_req
   )
+  // io.read.req.ready := q_will_be_empty && (
+  //     // Make sure we aren't accumulating, which would take over both ports
+  //     !(io.write.valid && io.write.bits.acc) &&
+  //     !pipelined_writes.map(r => r.valid && r.bits.addr === io.read.req.bits.addr).reduce(_||_)  &&
+  //     !block_read_req
+  // ) && (io.ext_mem.get.map(_.rw_ready).reduce(_ || _))
 
+  // changed
   io.write.ready := !block_write_req &&
     !pipelined_writes.map(r => r.valid && r.bits.addr === io.write.bits.addr && io.write.bits.acc).reduce(_||_)
+  // io.write.ready := !block_write_req &&
+  //   !pipelined_writes.map(r => r.valid && r.bits.addr === io.write.bits.addr && io.write.bits.acc).reduce(_||_) && (io.ext_mem.get.map(_.rw_ready).reduce(_ || _))
 
   when (reset.asBool) {
     pipelined_writes.foreach(_.valid := false.B)

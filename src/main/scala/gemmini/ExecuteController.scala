@@ -45,6 +45,8 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val busy = Output(Bool())
 
     val counter = new CounterEventIO()
+
+    val profile = new ProfileEventIO(ROB_ID_WIDTH)
   })
 
   val block_size = meshRows*tileRows
@@ -60,6 +62,9 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       addr.make_this_garbage()
     }
   }
+
+  // made
+  val profile_cmd = WireInit(0.U(ROB_ID_WIDTH.W))
 
   val unrolled_cmd = TransposePreloadUnroller(io.cmd, config, io.counter)
 
@@ -173,6 +178,9 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
   // val pending_completed_rob_id = Reg(UDValid(UInt(log2Up(rob_entries).W)))
   val pending_completed_rob_ids = Reg(Vec(2, UDValid(UInt(log2Up(reservation_station_entries).W))))
+
+  // made
+  val profile_comp_rob_ids = Reg(Vec(2, UDValid(UInt(log2Up(reservation_station_entries).W))))
 
   // Instantiate a queue which queues up signals which must be fed into the mesh
   val mesh_cntl_signals_q = Module(new Queue(new ComputeCntlSignals, spad_read_delay+1,
@@ -594,6 +602,8 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
           start_inputting_d := true.B
 
           control_state := compute
+
+          profile_comp_rob_ids(0) := cmd.bits(0).rob_id
         }
 
         // Overlap compute and preload
@@ -607,6 +617,9 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
           start_inputting_d := true.B
 
           control_state := compute
+
+          profile_comp_rob_ids(0) := cmd.bits(0).rob_id
+          profile_comp_rob_ids(1) := cmd.bits(1).rob_id
         }
 
         // Single mul
@@ -618,6 +631,8 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
           start_inputting_b := !b_should_be_fed_into_transposer
 
           control_state := compute
+
+          profile_comp_rob_ids(0) := cmd.bits(0).rob_id
         }
 
         // Flush
@@ -1024,6 +1039,21 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     !(!cntl.b_fire || mesh.io.b.fire || !mesh.io.b.ready) && !cntl.b_read_from_acc)
   io.counter.connectEventSignal(CounterEvent.SCRATCHPAD_D_WAIT_CYCLE,
     !(!cntl.d_fire || mesh.io.d.fire || !mesh.io.d.ready) && !cntl.d_read_from_acc)
+
+
+  // Profiler
+  when(profile_comp_rob_ids(0).valid) {
+    profile_cmd := profile_comp_rob_ids(0).pop()
+  }.elsewhen(profile_comp_rob_ids(1).valid && !profile_comp_rob_ids(0).valid) {
+    profile_cmd := profile_comp_rob_ids(1).pop()
+  }
+
+  when (reset.asBool) {
+    profile_comp_rob_ids.foreach(_.valid := false.B)
+  }
+
+  ProfileEventIO.init(io.profile)
+  io.profile.connectEventSignal(ProfileEvent.EX_CTRL_EXECUTE, profile_comp_rob_ids.map(_.valid).reduce(_||_), profile_cmd)
 
   if (use_firesim_simulation_counters) {
     val ex_flush_cycle = control_state === flushing || control_state === flush

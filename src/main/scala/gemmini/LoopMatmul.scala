@@ -9,6 +9,7 @@ import org.chipsalliance.cde.config.Parameters
 import GemminiISA._
 import LocalAddr._
 import Util._
+import freechips.rocketchip.tile.OpcodeSet
 
 // LdA
 
@@ -17,6 +18,7 @@ class LoopMatmulLdAReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
   val max_k = UInt(iterator_bitwidth.W)
   val pad_i = UInt(log2Up(block_size).W)
   val pad_k = UInt(log2Up(block_size).W)
+  val laddrI_offset = UInt(iterator_bitwidth.W) // made
   val dram_addr = UInt(coreMaxAddrBits.W)
   val dram_stride = UInt(coreMaxAddrBits.W)
   val transpose = Bool()
@@ -60,7 +62,9 @@ class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   val max_col_dim = Mux(req.transpose, req.max_i, req.max_k)
   val max_blocks = Mux(max_col_dim <= max_block_len.U, max_col_dim, max_block_len.U)
 
-  val sp_addr_start = req.addr_start
+  // changed
+  // val sp_addr_start = req.addr_start
+  val sp_addr_start = req.addr_start + req.laddrI_offset * req.max_k * block_size.U
 
   val dram_offset = (row_iterator * req.dram_stride + col_iterator) * block_size.U * (input_w/8).U
   val dram_addr = req.dram_addr + LoopMatmul.castDramOffset(dram_offset)
@@ -119,9 +123,11 @@ class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 
 class LoopMatmulLdBReq(val block_size: Int, val coreMaxAddrBits: Int, val iterator_bitwidth: Int, val max_addr: Int, val concurrent_loops: Int) extends Bundle {
   val max_k = UInt(iterator_bitwidth.W)
+  val max_fk = UInt(iterator_bitwidth.W) // made
   val max_j = UInt(iterator_bitwidth.W)
   val pad_k = UInt(log2Up(block_size).W)
   val pad_j = UInt(log2Up(block_size).W)
+  val laddrK_offset = UInt(iterator_bitwidth.W) // made
   val dram_addr = UInt(coreMaxAddrBits.W)
   val dram_stride = UInt(coreMaxAddrBits.W)
   val transpose = Bool()
@@ -141,6 +147,8 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 
     val idle = Output(Bool())
     val rob_overloaded = Input(Bool())
+
+    val laddrK_offset = Output(UInt(iterator_bitwidth.W)) // made
 
     val loop_id = Output(UInt(log2Up(concurrent_loops).W))
   })
@@ -168,7 +176,9 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   val max_col_dim = Mux(req.transpose, req.max_k, req.max_j)
   val max_blocks = Mux(max_col_dim <= max_block_len.U, max_col_dim, max_block_len.U)
 
-  val sp_addr_start = req.addr_end - req.max_k * req.max_j * block_size.U
+  // changed
+  // val sp_addr_start = req.addr_end - req.max_k * req.max_j * block_size.U
+  val sp_addr_start = req.addr_end - (req.max_fk - req.laddrK_offset) * req.max_j * block_size.U
 
   val dram_offset = (row_iterator * req.dram_stride + col_iterator) * block_size.U * (input_w/8).U
   val dram_addr = req.dram_addr + LoopMatmul.castDramOffset(dram_offset)
@@ -198,6 +208,8 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   io.cmd.bits := mvin_cmd
 
   io.loop_id := req.loop_id
+
+  io.laddrK_offset := req.laddrK_offset // made
 
   when (io.cmd.fire) {
     // The order here is k, j, i
@@ -230,6 +242,7 @@ class LoopMatmulLdDReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
   val max_i = UInt(iterator_bitwidth.W)
   val pad_j = UInt(log2Up(block_size).W)
   val pad_i = UInt(log2Up(block_size).W)
+  val laddrI_offset = UInt(iterator_bitwidth.W) // made
   val dram_addr = UInt(coreMaxAddrBits.W)
   val dram_stride = UInt(coreMaxAddrBits.W)
   val low_d = Bool()
@@ -264,7 +277,10 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   val j = Reg(UInt(iterator_bitwidth.W))
   val i = Reg(UInt(iterator_bitwidth.W))
 
-  val acc_addr_start = req.addr_start
+  // changed
+  // val acc_addr_start = req.addr_start
+  val acc_addr_start = req.addr_start + req.laddrI_offset * req.max_j * block_size.U
+  // end
 
   val dram_offset = Mux(req.low_d, (i * req.dram_stride + j) * block_size.U * (input_w/8).U,
     (i * req.dram_stride + j) * block_size.U * (acc_w/8).U)
@@ -332,6 +348,9 @@ class LoopMatmulExecuteReq(val block_size: Int, val coreMaxAddrBits: Int, val it
   val a_addr_start = UInt(log2Up(max_addr).W)
   val b_addr_end = UInt(log2Up(max_addr+1).W)
   val c_addr_start = UInt(log2Up(max_acc_addr).W)
+  // made
+  val laddrI_ex_offset = UInt(iterator_bitwidth.W)
+  // end
   val loop_id = UInt(log2Up(concurrent_loops).W)
 }
 
@@ -369,8 +388,14 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
 
   val req = Reg(new LoopMatmulExecuteReq(block_size, coreMaxAddrBits, iterator_bitwidth, max_addr, max_acc_addr, concurrent_loops))
 
-  val c_addr_start = /*(BigInt(1) << 31).U |*/ req.c_addr_start
+  // changed
+  // val c_addr_start = /*(BigInt(1) << 31).U |*/ req.c_addr_start
+  val c_addr_start = /*(BigInt(1) << 31).U |*/ req.c_addr_start + req.laddrI_ex_offset * req.max_j * block_size.U
+  // end
   val b_addr_start = req.b_addr_end - req.max_k * req.max_j * block_size.U
+  // made
+  val a_addr_start = req.a_addr_start + req.laddrI_ex_offset * req.max_k * block_size.U
+  // end
 
   val k = Reg(UInt(iterator_bitwidth.W))
   val j = Reg(UInt(iterator_bitwidth.W))
@@ -384,7 +409,10 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
   val a_max_col = Mux(req.a_tranpose, req.max_i, req.max_k)
   val b_max_col = Mux(req.b_tranpose, req.max_k, req.max_j)
 
-  val a_addr = req.a_addr_start + (a_row * a_max_col + a_col) * block_size.U
+  // changed
+  // val a_addr = req.a_addr_start + (a_row * a_max_col + a_col) * block_size.U
+  val a_addr = a_addr_start + (a_row * a_max_col + a_col) * block_size.U
+  // end
   val b_addr = b_addr_start + (b_row * b_max_col + b_col) * block_size.U
   val c_addr = c_addr_start + (i * req.max_j + j) * block_size.U
 
@@ -442,7 +470,7 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
 
   // The order here is k, j, i
   val lda_ahead = io.lda_completed || io.ld_ka > k || (io.ld_ka === k && io.ld_i > i)
-  val ldb_ahead = io.ldb_completed || io.ld_kb > k || (io.ld_ka === k && io.ld_j > j)
+  val ldb_ahead = io.ldb_completed || io.ld_kb > k || (io.ld_kb === k && io.ld_j > j)
   val ldd_ahead = io.ldd_completed
   val ld_ahead = lda_ahead && ldb_ahead && ldd_ahead
 
@@ -486,6 +514,7 @@ class LoopMatmulStCReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
   val max_i = UInt(iterator_bitwidth.W)
   val pad_j = UInt(log2Up(block_size).W)
   val pad_i = UInt(log2Up(block_size).W)
+  val laddrI_offset = UInt(iterator_bitwidth.W) // made
   val dram_addr = UInt(coreMaxAddrBits.W)
   val dram_stride = UInt(coreMaxAddrBits.W)
   val full_c = Bool()
@@ -528,7 +557,9 @@ class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   val j = Reg(UInt(iterator_bitwidth.W))
   val i = Reg(UInt(iterator_bitwidth.W))
 
-  val acc_addr_start = /*(BigInt(1) << 31).U | (req.full_c << 29.U).asUInt |*/ req.addr_start
+  // changed
+  // val acc_addr_start = /*(BigInt(1) << 31).U | (req.full_c << 29.U).asUInt |*/ req.addr_start
+  val acc_addr_start = /*(BigInt(1) << 31).U | (req.full_c << 29.U).asUInt |*/ req.addr_start + req.laddrI_offset * req.max_j * block_size.U
 
   val dram_offset = Mux(req.full_c, (i * req.dram_stride + j) * block_size.U * (acc_w/8).U,
     (i * req.dram_stride + j) * block_size.U * (input_w/8).U)
@@ -671,6 +702,13 @@ class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 
 // Combined loop
 class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val max_addr: Int, val max_acc_addr: Int) extends Bundle {
+  // made
+  val mv_K = UInt(iterator_bitwidth.W)
+  val mv_pad_K = UInt(iterator_bitwidth.W)
+  val laddrK_offset = UInt(iterator_bitwidth.W)
+  
+  val laddrI_offset = UInt(iterator_bitwidth.W)
+  // made end
   val max_k = UInt(iterator_bitwidth.W)
   val max_j = UInt(iterator_bitwidth.W)
   val max_i = UInt(iterator_bitwidth.W)
@@ -791,7 +829,10 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   ldab_arb.io.weightA := 0.U
   ldab_arb.io.inA_idle := ldA.io.idle
   ldab_arb.io.inB_idle := ldB.io.idle
-  ldab_arb.io.inA_k := ldA.io.k
+  // changed
+  // ldab_arb.io.inA_k := ldA.io.k
+  ldab_arb.io.inA_k := ldA.io.k + ldB.io.laddrK_offset
+  //end
   ldab_arb.io.inA_i := ldA.io.i
   ldab_arb.io.inB_k := ldB.io.k
   ldab_arb.io.inB_j := ldB.io.j
@@ -819,7 +860,9 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
 
   // Wire up unrolled command output
   val is_loop_run_cmd = cmd.bits.cmd.inst.funct === LOOP_WS
-  val is_loop_config_cmd = cmd.bits.cmd.inst.funct >= LOOP_WS_CONFIG_BOUNDS && cmd.bits.cmd.inst.funct <= LOOP_WS_CONFIG_STRIDES_DC
+  // changed
+  // val is_loop_config_cmd = cmd.bits.cmd.inst.funct >= LOOP_WS_CONFIG_BOUNDS && cmd.bits.cmd.inst.funct <= LOOP_WS_CONFIG_STRIDES_DC
+  val is_loop_config_cmd = (cmd.bits.cmd.inst.funct >= LOOP_WS_CONFIG_BOUNDS && cmd.bits.cmd.inst.funct <= LOOP_WS_CONFIG_STRIDES_DC) || (cmd.bits.cmd.inst.funct === LOOP_WS_CONFIG_MV_BOUNDS_1)
   val is_loop_cmd = is_loop_run_cmd || is_loop_config_cmd
 
   io.out.bits.cmd := Mux(loop_configured, unrolled_cmd.bits, cmd.bits.cmd)
@@ -860,6 +903,15 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   when(cmd.valid && is_loop_cmd && !loop_being_configured.configured) {
 
     switch (cmd.bits.cmd.inst.funct) {
+      // made
+      is (LOOP_WS_CONFIG_MV_BOUNDS_1) {
+        loop_being_configured.mv_K := cmd.bits.cmd.rs2(iterator_bitwidth * 3 - 1, iterator_bitwidth * 2)
+        loop_being_configured.mv_pad_K := cmd.bits.cmd.rs2(iterator_bitwidth * 2 - 1, iterator_bitwidth)
+        loop_being_configured.laddrK_offset := cmd.bits.cmd.rs2(iterator_bitwidth-1, 0)
+
+        loop_being_configured.laddrI_offset := cmd.bits.cmd.rs1(iterator_bitwidth-1, 0)
+      }
+      // made end
       is (LOOP_WS_CONFIG_BOUNDS) {
         loop_being_configured.max_k := cmd.bits.cmd.rs2(iterator_bitwidth * 3 - 1, iterator_bitwidth * 2)
         loop_being_configured.max_j := cmd.bits.cmd.rs2(iterator_bitwidth * 2 - 1, iterator_bitwidth)
@@ -917,6 +969,9 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   ldA.io.req.bits.max_i := loop_requesting_ldA.max_i
   ldA.io.req.bits.pad_k := loop_requesting_ldA.pad_k
   ldA.io.req.bits.pad_i := loop_requesting_ldA.pad_i
+  // made
+  ldA.io.req.bits.laddrI_offset := loop_requesting_ldA.laddrI_offset
+  // end
   ldA.io.req.bits.dram_addr := loop_requesting_ldA.a_dram_addr
   ldA.io.req.bits.dram_stride := loop_requesting_ldA.a_dram_stride
   ldA.io.req.bits.transpose := loop_requesting_ldA.a_transpose
@@ -933,9 +988,15 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   val loop_requesting_ldB_id = Mux(head_loop.ldb_started, tail_loop_id, head_loop_id)
   val loop_requesting_ldB = loops(loop_requesting_ldB_id)
   ldB.io.req.bits.max_j := loop_requesting_ldB.max_j
-  ldB.io.req.bits.max_k := loop_requesting_ldB.max_k
   ldB.io.req.bits.pad_j := loop_requesting_ldB.pad_j
-  ldB.io.req.bits.pad_k := loop_requesting_ldB.pad_k
+  // changed
+  // ldB.io.req.bits.max_k := loop_requesting_ldB.max_k
+  // ldB.io.req.bits.pad_k := loop_requesting_ldB.pad_k
+  ldB.io.req.bits.max_k := loop_requesting_ldB.mv_K
+  ldB.io.req.bits.pad_k := loop_requesting_ldB.mv_pad_K
+  ldB.io.req.bits.max_fk := loop_requesting_ldB.max_k // made
+  ldB.io.req.bits.laddrK_offset := loop_requesting_ldB.laddrK_offset // made
+  // end
   ldB.io.req.bits.dram_addr := loop_requesting_ldB.b_dram_addr
   ldB.io.req.bits.dram_stride := loop_requesting_ldB.b_dram_stride
   ldB.io.req.bits.transpose := loop_requesting_ldB.b_transpose
@@ -963,6 +1024,9 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   ex.io.req.bits.a_tranpose := loop_requesting_ex.a_transpose
   ex.io.req.bits.b_tranpose := loop_requesting_ex.b_transpose
   ex.io.req.bits.c_addr_start := ex_c_addr_start
+  // made
+  ex.io.req.bits.laddrI_ex_offset := loop_requesting_ex.laddrI_offset
+  // end
   ex.io.req.bits.loop_id := loop_requesting_ex_id
 
   ex.io.req.valid := !loop_requesting_ex.ex_started && loop_requesting_ex.lda_started &&
@@ -983,6 +1047,9 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   ldD.io.req.bits.max_i := loop_requesting_ldD.max_i
   ldD.io.req.bits.pad_j := loop_requesting_ldD.pad_j
   ldD.io.req.bits.pad_i := loop_requesting_ldD.pad_i
+  // made
+  ldD.io.req.bits.laddrI_offset := loop_requesting_ldD.laddrI_offset
+  // end
   ldD.io.req.bits.dram_addr := loop_requesting_ldD.d_dram_addr
   ldD.io.req.bits.dram_stride := loop_requesting_ldD.d_dram_stride
   ldD.io.req.bits.low_d := loop_requesting_ldD.low_d
@@ -1007,6 +1074,9 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   stC.io.req.bits.max_i := loop_requesting_st.max_i
   stC.io.req.bits.pad_j := loop_requesting_st.pad_j
   stC.io.req.bits.pad_i := loop_requesting_st.pad_i
+  // made
+  stC.io.req.bits.laddrI_offset := loop_requesting_st.laddrI_offset
+  // end
   stC.io.req.bits.dram_addr := loop_requesting_st.c_dram_addr
   stC.io.req.bits.dram_stride := loop_requesting_st.c_dram_stride
   stC.io.req.bits.full_c := loop_requesting_st.full_c

@@ -21,6 +21,11 @@ object GemminiISA {
   val LOOP_WS_CONFIG_STRIDES_AB = 12.U
   val LOOP_WS_CONFIG_STRIDES_DC = 13.U
 
+  // made
+  val SET_PROFILER_PADDR = 23.U
+  val LOOP_WS_CONFIG_MV_BOUNDS_1 = 24.U
+  // made end
+
   val LOAD3_CMD = 14.U
 
   // TODO add orows and ocols to this as well
