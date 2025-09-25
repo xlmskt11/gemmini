@@ -130,6 +130,8 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   */
 
   val reservation_station = withClock (gated_clock) { Module(new ReservationStation(outer.config, new GemminiCmd(reservation_station_entries))) }
+  val ext_deps_io = if (use_shared_res_entries) Some(IO(new EntriesForDeps(local_addr_t, reservation_station_entries_ld, reservation_station_entries_ex, reservation_station_entries_st, res_max_per_type))) else None
+  ext_deps_io.foreach(_ <> reservation_station.io.ext_deps.get)
   counters.io.event_io.collect(reservation_station.io.counter)
   
   profilers.module.io.profile_io.issue_cmd <> reservation_station.io.profile.issue_cmd
@@ -168,12 +170,18 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t),
     has_training_convs, has_max_pool, has_first_layer_optimizations, has_dw_convs) }
 
-  val (loop_cmd, loop_matmul_unroller_busy) = withClock (gated_clock) { LoopMatmul(conv_cmd, reservation_station.io.matmul_ld_completed, reservation_station.io.matmul_st_completed, reservation_station.io.matmul_ex_completed,
+  val (loop_cmd, loop_matmul_unroller_busy, ext_loop_ws) = withClock (gated_clock) { LoopMatmul(conv_cmd, reservation_station.io.matmul_ld_completed, reservation_station.io.matmul_st_completed, reservation_station.io.matmul_ex_completed,
     meshRows*tileRows, coreMaxAddrBits, reservation_station_entries, max_lds, max_exs, max_sts, sp_banks * sp_bank_entries, acc_banks * acc_bank_entries,
     inputType.getWidth, accType.getWidth, dma_maxbytes, new MvinRs2(mvin_rows_bits, mvin_cols_bits, local_addr_t),
     new PreloadRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new PreloadRs(mvout_rows_bits, mvout_cols_bits, local_addr_t),
     new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t),
-    new MvoutRs2(mvout_rows_bits, mvout_cols_bits, local_addr_t)) }
+    new MvoutRs2(mvout_rows_bits, mvout_cols_bits, local_addr_t), use_shared_res_entries) }
+
+  val iterator_bitwidth = 16;
+  val group_w = 5
+  val nSharers = 4
+  val ext_loop_ws_io = if (use_shared_res_entries) Some(IO(new LdBExIO(group_w, nSharers, iterator_bitwidth))) else None
+  ext_loop_ws_io.foreach(_ <> ext_loop_ws.get)
 
   val unrolled_cmd = Queue(loop_cmd)
   unrolled_cmd.ready := false.B

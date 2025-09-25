@@ -220,7 +220,7 @@ object GemminiConfigs {
     ex_write_to_acc = defaultConfig.ex_write_to_acc,
   )
 
-  val chipConfig = defaultConfig.copy(sp_capacity=CapacityInKilobytes(64), acc_capacity=CapacityInKilobytes(32), dataflow=Dataflow.WS,
+  val chipConfig = defaultConfig.copy(sp_capacity=CapacityInKilobytes(64), acc_capacity=CapacityInKilobytes(32), dataflow=Dataflow.BOTH,
     acc_scale_args=Some(defaultConfig.acc_scale_args.get.copy(latency=4)),
     acc_singleported=true,
     acc_sub_banks=2,
@@ -250,8 +250,8 @@ class DefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
   op_num: Int = 3,
   mesh_rows: Int = 16,
   mesh_cols: Int = 16,
-  sp_kb: Int = 256,
-  acc_kb: Int = 64,
+  sp_kb: Int = 64,
+  acc_kb: Int = 32,
   gemminiConfig: GemminiArrayConfig[T,U,V] = GemminiConfigs.chipConfig
 ) extends Config((site, here, up) => {
   case BuildRoCC => up(BuildRoCC) ++ Seq(
@@ -283,9 +283,10 @@ class DefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       },
       meshColumns = mesh_cols,
       meshRows = mesh_rows,
-      // sp_capacity = CapacityInKilobytes(sp_kb),
-      // acc_capacity = CapacityInKilobytes(acc_kb),
-      clock_gate = true
+      sp_capacity = CapacityInKilobytes(sp_kb),
+      acc_capacity = CapacityInKilobytes(acc_kb),
+      clock_gate = true,
+      use_shared_res_entries = false
       )))
       gemmini
     }
@@ -294,9 +295,12 @@ class DefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
 
 // made
 class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
-  gemmini_num: Int = 4,
   mesh_rows: Int = 16,
   mesh_cols: Int = 16,
+  dma_maxB: Int = 64,
+  dma_bus: Int = 128,
+  sp_kB: Int = 64,
+  acc_kB: Int = 32,
   gemminiConfig: GemminiArrayConfig[T,U,V] = GemminiConfigs.chipConfig
 ) extends Config((site, here, up) => {
   case BuildRoCC => {
@@ -307,11 +311,16 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
     val gemmini_0 = (p: Parameters) => {
       implicit val q = p
       gemmini0 = LazyModule(new Gemmini(gemminiConfig.copy(opcodes = OpcodeSet.custom0,
-      headerFileName = "gemmini_op0_params.h",
+      headerFileName = "gemmini_params.h",
       meshColumns = mesh_cols,
       meshRows = mesh_rows,
       use_shared_ext_mem = true,
-      clock_gate = true
+      clock_gate = true,
+      dma_maxbytes = dma_maxB,
+      dma_buswidth = dma_bus,
+      sp_capacity = CapacityInKilobytes(sp_kB),
+      acc_capacity = CapacityInKilobytes(acc_kB),
+      use_shared_res_entries = true
       )))
       gemmini0
     }
@@ -322,7 +331,12 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       meshColumns = mesh_cols,
       meshRows = mesh_rows,
       use_shared_ext_mem = true,
-      clock_gate = true
+      clock_gate = true,
+      dma_maxbytes = dma_maxB,
+      dma_buswidth = dma_bus,
+      sp_capacity = CapacityInKilobytes(sp_kB),
+      acc_capacity = CapacityInKilobytes(acc_kB),
+      use_shared_res_entries = true
       )))
       gemmini1
     }
@@ -333,38 +347,43 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       meshColumns = mesh_cols,
       meshRows = mesh_rows,
       use_shared_ext_mem = true,
-      clock_gate = true
+      clock_gate = true,
+      dma_maxbytes = dma_maxB,
+      dma_buswidth = dma_bus,
+      sp_capacity = CapacityInKilobytes(sp_kB),
+      acc_capacity = CapacityInKilobytes(acc_kB),
+      use_shared_res_entries = true
       )))
       gemmini2
     }
     val gemmini_3 = (p: Parameters) => {
       implicit val q = p
       gemmini3 = LazyModule(new Gemmini(gemminiConfig.copy(opcodes = OpcodeSet.custom3,
-      headerFileName = "gemmini_params.h",
+      headerFileName = "gemmini_op3_params.h",
       meshColumns = mesh_cols,
       meshRows = mesh_rows,
       use_shared_ext_mem = true,
-      clock_gate = true
+      clock_gate = true,
+      dma_maxbytes = dma_maxB,
+      dma_buswidth = dma_bus,
+      sp_capacity = CapacityInKilobytes(sp_kB),
+      acc_capacity = CapacityInKilobytes(acc_kB),
+      use_shared_res_entries = true
       )))
       InModuleBody {
-        // require(gemmini0.config.sp_banks == gemmini1.config.sp_banks)
-        // require(gemmini0.config.acc_banks == gemmini1.config.acc_banks)
-        // require(gemmini0.config.acc_sub_banks == gemmini1.config.acc_sub_banks)
-        // require(gemmini0.config.sp_singleported && gemmini1.config.sp_singleported)
-        // require(gemmini0.config.acc_singleported && gemmini1.config.acc_singleported)
+        require(gemmini0.config.sp_banks == gemmini1.config.sp_banks && gemmini2.config.sp_banks == gemmini3.config.sp_banks && gemmini0.config.sp_banks == gemmini2.config.sp_banks)
+        require(gemmini0.config.acc_banks == gemmini1.config.acc_banks && gemmini2.config.acc_banks == gemmini3.config.acc_banks && gemmini0.config.acc_banks == gemmini2.config.acc_banks)
+        require(gemmini0.config.acc_sub_banks == gemmini1.config.acc_sub_banks && gemmini2.config.acc_sub_banks == gemmini3.config.acc_sub_banks && gemmini0.config.acc_sub_banks == gemmini2.config.acc_sub_banks)
+        require(gemmini0.config.sp_singleported && gemmini1.config.sp_singleported && gemmini2.config.sp_singleported && gemmini3.config.sp_singleported && gemmini0.config.sp_singleported && gemmini2.config.sp_singleported)
+        require(gemmini0.config.acc_singleported && gemmini1.config.acc_singleported && gemmini2.config.acc_singleported && gemmini3.config.acc_singleported && gemmini0.config.acc_singleported && gemmini2.config.acc_singleported)
 
-        // require(gemmini0.config.sp_bank_entries == gemmini1.config.sp_bank_entries)
-        // require(gemmini0.spad.module.spad_mems(0).mask_len == gemmini1.spad.module.spad_mems(0).mask_len)
-        // require(gemmini0.spad.module.spad_mems(0).mask_elem.getWidth == gemmini1.spad.module.spad_mems(0).mask_elem.getWidth)
+        require(gemmini0.config.sp_bank_entries == gemmini1.config.sp_bank_entries && gemmini2.config.sp_bank_entries == gemmini3.config.sp_bank_entries && gemmini0.config.sp_bank_entries == gemmini2.config.sp_bank_entries)
+        require(gemmini0.spad.module.spad_mems(0).mask_len == gemmini1.spad.module.spad_mems(0).mask_len && gemmini2.spad.module.spad_mems(0).mask_len == gemmini3.spad.module.spad_mems(0).mask_len && gemmini0.spad.module.spad_mems(0).mask_len == gemmini2.spad.module.spad_mems(0).mask_len)
+        require(gemmini0.spad.module.spad_mems(0).mask_elem.getWidth == gemmini1.spad.module.spad_mems(0).mask_elem.getWidth && gemmini2.spad.module.spad_mems(0).mask_elem.getWidth == gemmini3.spad.module.spad_mems(0).mask_elem.getWidth && gemmini0.spad.module.spad_mems(0).mask_elem.getWidth == gemmini2.spad.module.spad_mems(0).mask_elem.getWidth)
 
-        // println(gemmini0.config.acc_bank_entries, gemmini1.config.acc_bank_entries)
-        // println(gemmini0.spad.module.acc_mems(0).mask_len, gemmini1.spad.module.acc_mems(0).mask_len)
-        // println(gemmini0.spad.module.acc_mems(0).mask_elem.getWidth, gemmini1.spad.module.acc_mems(0).mask_elem.getWidth)
-
-        // require(gemmini0.config.acc_bank_entries == fp_gemmini.config.acc_bank_entries / 2)
-        // require(gemmini0.config.acc_sub_banks == fp_gemmini.config.acc_sub_banks)
-        // require(gemmini0.spad.module.acc_mems(0).mask_len == fp_gemmini.spad.module.acc_mems(0).mask_len * 2)
-        // require(gemmini0.spad.module.acc_mems(0).mask_elem.getWidth == fp_gemmini.spad.module.acc_mems(0).mask_elem.getWidth)
+        require(gemmini0.config.acc_bank_entries == gemmini1.config.acc_bank_entries && gemmini2.config.acc_bank_entries == gemmini3.config.acc_bank_entries && gemmini0.config.acc_bank_entries == gemmini2.config.acc_bank_entries)
+        require(gemmini0.spad.module.acc_mems(0).mask_len == gemmini1.spad.module.acc_mems(0).mask_len && gemmini2.spad.module.acc_mems(0).mask_len == gemmini3.spad.module.acc_mems(0).mask_len && gemmini0.spad.module.acc_mems(0).mask_len == gemmini2.spad.module.acc_mems(0).mask_len)
+        require(gemmini0.spad.module.acc_mems(0).mask_elem.getWidth == gemmini1.spad.module.acc_mems(0).mask_elem.getWidth && gemmini2.spad.module.acc_mems(0).mask_elem.getWidth == gemmini3.spad.module.acc_mems(0).mask_elem.getWidth && gemmini0.spad.module.acc_mems(0).mask_elem.getWidth == gemmini2.spad.module.acc_mems(0).mask_elem.getWidth)
 
         val spad_mask_len = gemmini0.spad.module.spad_mems(0).mask_len
         val spad_data_len = gemmini0.spad.module.spad_mems(0).mask_elem.getWidth
@@ -376,10 +395,33 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
           gemmini0.config.sp_bank_entries, spad_mask_len, spad_data_len,
           gemmini0.config.acc_bank_entries / gemmini0.config.acc_sub_banks, acc_mask_len, acc_data_len
         ))
+
         shared_mem.io.in(0) <> gemmini0.module.ext_mem_io.get
         shared_mem.io.in(1) <> gemmini1.module.ext_mem_io.get
         shared_mem.io.in(2) <> gemmini2.module.ext_mem_io.get
         shared_mem.io.in(3) <> gemmini3.module.ext_mem_io.get
+
+        if (gemmini0.config.use_shared_res_entries) {
+          require(gemmini0.config.reservation_station_entries_ld == gemmini1.config.reservation_station_entries_ld && gemmini2.config.reservation_station_entries_ld == gemmini3.config.reservation_station_entries_ld && gemmini0.config.reservation_station_entries_ld == gemmini2.config.reservation_station_entries_ld)
+          require(gemmini0.config.reservation_station_entries_ex == gemmini1.config.reservation_station_entries_ex && gemmini2.config.reservation_station_entries_ex == gemmini3.config.reservation_station_entries_ex && gemmini0.config.reservation_station_entries_ex == gemmini2.config.reservation_station_entries_ex)
+          require(gemmini0.config.reservation_station_entries_st == gemmini1.config.reservation_station_entries_st && gemmini2.config.reservation_station_entries_st == gemmini3.config.reservation_station_entries_st && gemmini0.config.reservation_station_entries_st == gemmini2.config.reservation_station_entries_st)
+          // val total_reservation_station_entries_ld = gemmini0.config.reservation_station_entries_ld + gemmini1.config.reservation_station_entries_ld + gemmini2.config.reservation_station_entries_ld + gemmini3.config.reservation_station_entries_ld
+          // val total_reservation_station_entries_ex = gemmini0.config.reservation_station_entries_ex + gemmini1.config.reservation_station_entries_ex + gemmini2.config.reservation_station_entries_ex + gemmini3.config.reservation_station_entries_ex
+          // val total_reservation_station_entries_st = gemmini0.config.reservation_station_entries_st + gemmini1.config.reservation_station_entries_st + gemmini2.config.reservation_station_entries_st + gemmini3.config.reservation_station_entries_st
+          val nSharers = 4
+
+          val shared_deps = Module(new SharedExtEntries(nSharers, gemmini0.config.local_addr_t, gemmini0.config.reservation_station_entries_ld, gemmini0.config.reservation_station_entries_ex, gemmini0.config.reservation_station_entries_st, gemmini0.config.res_max_per_type))
+          shared_deps.io.in(0) <> gemmini0.module.ext_deps_io.get
+          shared_deps.io.in(1) <> gemmini1.module.ext_deps_io.get
+          shared_deps.io.in(2) <> gemmini2.module.ext_deps_io.get
+          shared_deps.io.in(3) <> gemmini3.module.ext_deps_io.get
+
+          val ldb_ex_control = Module(new LdBCompleteControl(nSharers))
+          ldb_ex_control.io.in(0) <> gemmini0.module.ext_loop_ws_io.get
+          ldb_ex_control.io.in(1) <> gemmini1.module.ext_loop_ws_io.get
+          ldb_ex_control.io.in(2) <> gemmini2.module.ext_loop_ws_io.get
+          ldb_ex_control.io.in(3) <> gemmini3.module.ext_loop_ws_io.get
+        }
       }
       gemmini3
     }

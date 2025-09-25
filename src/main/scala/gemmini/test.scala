@@ -143,10 +143,10 @@ class SRAMBlackbox(numReadPorts: Int, numWritePorts: Int, numReadwritePorts: Int
     val RW1_rdata = Output(UInt((data_len * mask_len).W))
     val RW2_rdata = Output(UInt((data_len * mask_len).W))
     val RW3_rdata = Output(UInt((data_len * mask_len).W))
-    val RW0_wmask = if (masked) Some(Input(Vec(mask_len, Bool()))) else None
-    val RW1_wmask = if (masked) Some(Input(Vec(mask_len, Bool()))) else None
-    val RW2_wmask = if (masked) Some(Input(Vec(mask_len, Bool()))) else None
-    val RW3_wmask = if (masked) Some(Input(Vec(mask_len, Bool()))) else None
+    val RW0_wmask = if (masked) Some(Input(UInt(mask_len.W))) else None
+    val RW1_wmask = if (masked) Some(Input(UInt(mask_len.W))) else None
+    val RW2_wmask = if (masked) Some(Input(UInt(mask_len.W))) else None
+    val RW3_wmask = if (masked) Some(Input(UInt(mask_len.W))) else None
   })
 
   private val verilogInterface: String =

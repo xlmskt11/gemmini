@@ -86,49 +86,12 @@ class SharedSyncReadMem(nSharers: Int, depth: Int, mask_len: Int, data_len: Int)
 }
 
 // made
-private object ArbiterCtrl {
-  def apply(request: Seq[Bool]): Seq[Bool] = request.length match {
-    case 0 => Seq()
-    case 1 => Seq(true.B)
-    case _ => true.B +: request.tail.init.scanLeft(request.head)(_ || _).map(!_)
-  }
-}
-
-// made
-class RrArbiter[T <: Data](val gen: T, val n: Int) extends Module {
-  val io = IO(new ArbiterIO(gen, n))
-
-  val lastGrant = RegInit((n - 1).U(log2Ceil(n).W))
-
-  io.chosen := (n - 1).asUInt
-  io.out.bits := io.in(n - 1).bits
-  io.out.valid := false.B
-
-  for (i <- n - 1 to 0 by -1) {
-    val idx = (lastGrant + 1.U + i.U)(log2Ceil(n) - 1, 0)
-    when(io.in(idx).valid) {
-      io.chosen := idx
-      io.out.bits := io.in(idx).bits
-      io.out.valid := true.B
-    }
-  }
-
-  for ((in, idx) <- io.in.zipWithIndex) {
-    in.ready := (io.out.valid && (io.chosen === idx.U) && io.out.ready)
-  }
-
-  when(io.out.fire) {
-    lastGrant := io.chosen
-  }
-}
-
-// made
 class SharedSyncReadMem_4(nSharers: Int, depth: Int, mask_len: Int, data_len: Int) extends Module {
   val io = IO(new Bundle {
     val in = Vec(nSharers, Flipped(new ExtMemIO_4()))
   })
 
-  val mem = SRAM(depth, Vec(mask_len, UInt(data_len.W)), 0, 0, 4)
+  val mem = SRAM(depth, Vec(mask_len, UInt(data_len.W)), 0, 0, 4, true)
 
   for (i <- 0 until nSharers) {
     mem.readwritePorts(i).enable := false.B
@@ -152,65 +115,6 @@ class SharedSyncReadMem_4(nSharers: Int, depth: Int, mask_len: Int, data_len: In
     }
   }
 }
-
-// class SharedSyncReadMem_4(nSharers: Int, depth: Int, mask_len: Int, data_len: Int) extends Module {
-//   val io = IO(new Bundle {
-//     val in = Vec(nSharers, Flipped(new ExtMemIO_4()))
-//   })
-
-//   val mem = SyncReadMem(depth, Vec(mask_len, UInt(data_len.W)))
-
-//   val q = Seq.fill(nSharers)(Module(new Queue(new ExtMemRWIO_4(), 1, true, true)))
-
-//   for (i <- 0 until nSharers) {
-//     q(i).io.enq.valid := io.in(i).read_en || io.in(i).write_en
-
-//     q(i).io.enq.bits.read_en := io.in(i).read_en
-//     q(i).io.enq.bits.read_addr := io.in(i).read_addr
-
-//     q(i).io.enq.bits.write_en := io.in(i).write_en
-//     q(i).io.enq.bits.write_addr := io.in(i).write_addr
-//     q(i).io.enq.bits.write_data := io.in(i).write_data
-//     q(i).io.enq.bits.write_mask := io.in(i).write_mask
-
-//     io.in(i).rw_ready := q(i).io.enq.ready
-//   }
-
-//   val arb = Module(new RRArbiter(new ExtMemRWIO_4(), nSharers))
-
-//   // io.in.foreach(_.read_data := 0.U)
-//   io.in.foreach(_.read_valid := false.B)
-//   //io.in.foreach(_.write_over := false.B)
-
-//   arb.io.out.ready := true.B
-
-//   for (i <- 0 until nSharers) {
-//     arb.io.in(i) <> q(i).io.deq
-//   }
-  
-//   val en = arb.io.out.valid
-
-//   val ren = arb.io.out.bits.read_en
-//   val raddr = arb.io.out.bits.read_addr
-
-//   val wen = arb.io.out.bits.write_en
-//   val waddr = arb.io.out.bits.write_addr
-//   val wdata = arb.io.out.bits.write_data
-//   val wmask = arb.io.out.bits.write_mask
-
-//   val rdata = mem.read(raddr, en && ren && !wen)
-//   io.in.foreach(_.read_data := rdata.asUInt)
-
-//   when (en) {
-//     when (ren && !wen) {
-//       io.in(arb.io.chosen).read_valid := true.B
-//     }
-
-//     when (wen) {
-//       mem.write(waddr, wdata.asTypeOf(Vec(mask_len, UInt(data_len.W))), wmask.asTypeOf(Vec(mask_len, Bool())))
-//     }
-//   }
-// }
 
 class SharedExtMem(
   sp_banks: Int, acc_banks: Int, acc_sub_banks: Int,
