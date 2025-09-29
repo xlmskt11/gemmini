@@ -78,7 +78,7 @@ class LdBCompleteControl(
     }
   }
 
-  val alloc_id = MuxCase((nSharers*concurrent_loops - 1).U, group_data.zipWithIndex.map { case (e, i) => !e.valid -> i.U })
+  val alloc_id = MuxCase((nSharers*(concurrent_loops+1) - 1).U, group_data.zipWithIndex.map { case (e, i) => !e.valid -> i.U })
   val masks = Wire(Vec(nSharers+1, UInt(group_num.W)))
   masks(0) := groupMask.reduce(_|_)
   for (i <- 0 until nSharers) {
