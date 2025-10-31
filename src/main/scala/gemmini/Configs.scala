@@ -297,8 +297,6 @@ class DefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
 class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
   mesh_rows: Int = 16,
   mesh_cols: Int = 16,
-  dma_maxB: Int = 64,
-  dma_bus: Int = 128,
   sp_kB: Int = 64,
   acc_kB: Int = 32,
   gemminiConfig: GemminiArrayConfig[T,U,V] = GemminiConfigs.chipConfig
@@ -316,8 +314,6 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       meshRows = mesh_rows,
       use_shared_ext_mem = true,
       clock_gate = true,
-      dma_maxbytes = dma_maxB,
-      dma_buswidth = dma_bus,
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
       use_shared_res_entries = true
@@ -332,8 +328,6 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       meshRows = mesh_rows,
       use_shared_ext_mem = true,
       clock_gate = true,
-      dma_maxbytes = dma_maxB,
-      dma_buswidth = dma_bus,
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
       use_shared_res_entries = true
@@ -348,8 +342,6 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       meshRows = mesh_rows,
       use_shared_ext_mem = true,
       clock_gate = true,
-      dma_maxbytes = dma_maxB,
-      dma_buswidth = dma_bus,
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
       use_shared_res_entries = true
@@ -364,8 +356,6 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       meshRows = mesh_rows,
       use_shared_ext_mem = true,
       clock_gate = true,
-      dma_maxbytes = dma_maxB,
-      dma_buswidth = dma_bus,
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
       use_shared_res_entries = true
