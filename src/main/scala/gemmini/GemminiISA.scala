@@ -25,6 +25,8 @@ object GemminiISA {
   val SET_PROFILER_PADDR = 23.U
   val LOOP_WS_CONFIG_MV_BOUNDS_1 = 24.U
   val LOOP_WS_CONFIG_SPADDR = 25.U
+  val LOOP_CONV_WS_CONFIG_MV_BOUNDS_1 = 26.U
+  val LOOP_CONV_WS_CONFIG_SPADDR = 27.U
   // made end
 
   val LOAD3_CMD = 14.U

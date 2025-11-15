@@ -286,7 +286,8 @@ class DefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       sp_capacity = CapacityInKilobytes(sp_kb),
       acc_capacity = CapacityInKilobytes(acc_kb),
       clock_gate = true,
-      use_shared_res_entries = false
+      use_shared_res_entries = false,
+      max_in_flight_mem_reqs = 32
       )))
       gemmini
     }
@@ -411,6 +412,12 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
           ldb_ex_control.io.in(1) <> gemmini1.module.ext_loop_ws_io.get
           ldb_ex_control.io.in(2) <> gemmini2.module.ext_loop_ws_io.get
           ldb_ex_control.io.in(3) <> gemmini3.module.ext_loop_ws_io.get
+
+          val ldinput_ex_control = Module(new LdICompleteControl(nSharers))
+          ldinput_ex_control.io.in(0) <> gemmini0.module.ext_loop_conv_ws_io.get
+          ldinput_ex_control.io.in(1) <> gemmini1.module.ext_loop_conv_ws_io.get
+          ldinput_ex_control.io.in(2) <> gemmini2.module.ext_loop_conv_ws_io.get
+          ldinput_ex_control.io.in(3) <> gemmini3.module.ext_loop_conv_ws_io.get
         }
       }
       gemmini3
