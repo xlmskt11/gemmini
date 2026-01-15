@@ -314,7 +314,6 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       meshColumns = mesh_cols,
       meshRows = mesh_rows,
       use_shared_ext_mem = true,
-      clock_gate = true,
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
       use_shared_res_entries = true
@@ -328,7 +327,6 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       meshColumns = mesh_cols,
       meshRows = mesh_rows,
       use_shared_ext_mem = true,
-      clock_gate = true,
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
       use_shared_res_entries = true
@@ -342,7 +340,6 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       meshColumns = mesh_cols,
       meshRows = mesh_rows,
       use_shared_ext_mem = true,
-      clock_gate = true,
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
       use_shared_res_entries = true
@@ -356,7 +353,6 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       meshColumns = mesh_cols,
       meshRows = mesh_rows,
       use_shared_ext_mem = true,
-      clock_gate = true,
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
       use_shared_res_entries = true
@@ -381,16 +377,18 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
         val acc_mask_len = gemmini0.spad.module.acc_mems(0).mask_len
         val acc_data_len = gemmini0.spad.module.acc_mems(0).mask_elem.getWidth
 
-        val shared_mem = Module(new SharedExtMem_4(
-          gemmini0.config.sp_banks, gemmini0.config.acc_banks, gemmini0.config.acc_sub_banks,
-          gemmini0.config.sp_bank_entries, spad_mask_len, spad_data_len,
-          gemmini0.config.acc_bank_entries / gemmini0.config.acc_sub_banks, acc_mask_len, acc_data_len
-        ))
+        if (gemmini0.config.use_shared_ext_mem) {
+          val shared_mem = Module(new SharedExtMem_4(
+            gemmini0.config.sp_banks, gemmini0.config.acc_banks, gemmini0.config.acc_sub_banks,
+            gemmini0.config.sp_bank_entries, spad_mask_len, spad_data_len,
+            gemmini0.config.acc_bank_entries / gemmini0.config.acc_sub_banks, acc_mask_len, acc_data_len
+          ))
 
-        shared_mem.io.in(0) <> gemmini0.module.ext_mem_io.get
-        shared_mem.io.in(1) <> gemmini1.module.ext_mem_io.get
-        shared_mem.io.in(2) <> gemmini2.module.ext_mem_io.get
-        shared_mem.io.in(3) <> gemmini3.module.ext_mem_io.get
+          shared_mem.io.in(0) <> gemmini0.module.ext_mem_io.get
+          shared_mem.io.in(1) <> gemmini1.module.ext_mem_io.get
+          shared_mem.io.in(2) <> gemmini2.module.ext_mem_io.get
+          shared_mem.io.in(3) <> gemmini3.module.ext_mem_io.get
+        }
 
         if (gemmini0.config.use_shared_res_entries) {
           require(gemmini0.config.reservation_station_entries_ld == gemmini1.config.reservation_station_entries_ld && gemmini2.config.reservation_station_entries_ld == gemmini3.config.reservation_station_entries_ld && gemmini0.config.reservation_station_entries_ld == gemmini2.config.reservation_station_entries_ld)

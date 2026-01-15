@@ -91,26 +91,26 @@ class SharedSyncReadMem_4(nSharers: Int, depth: Int, mask_len: Int, data_len: In
     val in = Vec(nSharers, Flipped(new ExtMemIO_4()))
   })
 
-  val mem = SRAM(depth, Vec(mask_len, UInt(data_len.W)), 0, 0, 4, true)
+  // val mem = SRAM(depth, Vec(mask_len, UInt(data_len.W)), 0, 0, 4, true)
+  val mem = SRAM.masked(depth, Vec(mask_len, UInt(data_len.W)), 4, 4, 0)
 
   for (i <- 0 until nSharers) {
-    mem.readwritePorts(i).enable := false.B
-    when(io.in(i).write_en || io.in(i).read_en) {
-      mem.readwritePorts(i).enable := true.B
+    mem.readPorts(i).enable := false.B
+    mem.writePorts(i).enable := false.B
+    when(io.in(i).read_en) {
+      mem.readPorts(i).enable := true.B
+    }.elsewhen(io.in(i).write_en) {
+      mem.writePorts(i).enable := true.B
     }
 
-    mem.readwritePorts(i).address := io.in(i).read_addr
-    mem.readwritePorts(i).isWrite := false.B
-    when(io.in(i).write_en) {
-      mem.readwritePorts(i).address := io.in(i).write_addr
-      mem.readwritePorts(i).isWrite := true.B
-    }
+    mem.readPorts(i).address := io.in(i).read_addr
+    mem.writePorts(i).address := io.in(i).write_addr
 
-    mem.readwritePorts(i).writeData := io.in(i).write_data.asTypeOf(Vec(mask_len, UInt(data_len.W)))
-    val rdata = WireInit(Vec(mask_len, UInt(data_len.W)), mem.readwritePorts(i).readData)
+    mem.writePorts(i).data := io.in(i).write_data.asTypeOf(Vec(mask_len, UInt(data_len.W)))
+    val rdata = WireInit(Vec(mask_len, UInt(data_len.W)), mem.readPorts(i).data)
     io.in(i).read_data := rdata.asUInt
     
-    mem.readwritePorts(i).mask.foreach { m =>
+    mem.writePorts(i).mask.foreach { m =>
       m := io.in(i).write_mask.asTypeOf(Vec(mask_len, Bool()))
     }
   }
