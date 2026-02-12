@@ -163,6 +163,54 @@ object GemminiConfigs {
     ex_write_to_acc = true,
   )
 
+  val firesimConfig = defaultConfig.copy(
+    has_training_convs = false,
+    max_in_flight_mem_reqs = 64,
+    acc_scale_args = Some(ScaleArguments(
+      (t: SInt, f: Float) => {
+        val f_rec = recFNFromFN(f.expWidth, f.sigWidth, f.bits)
+
+        val in_to_rec_fn = Module(new INToRecFN(t.getWidth, f.expWidth, f.sigWidth))
+        in_to_rec_fn.io.signedIn := true.B
+        in_to_rec_fn.io.in := t.asTypeOf(UInt(t.getWidth.W))
+        in_to_rec_fn.io.roundingMode := consts.round_near_even
+        in_to_rec_fn.io.detectTininess := consts.tininess_afterRounding
+
+        val t_rec = in_to_rec_fn.io.out
+
+        val muladder = Module(new MulAddRecFN(f.expWidth, f.sigWidth))
+        muladder.io.op := 0.U
+        muladder.io.roundingMode := consts.round_near_even
+        muladder.io.detectTininess := consts.tininess_afterRounding
+
+        muladder.io.a := t_rec
+        muladder.io.b := f_rec
+        muladder.io.c := 0.U
+
+        val rec_fn_to_in = Module(new RecFNToIN(f.expWidth, f.sigWidth, t.getWidth))
+        rec_fn_to_in.io.in := muladder.io.out
+        rec_fn_to_in.io.roundingMode := consts.round_near_even
+        rec_fn_to_in.io.signedOut := true.B
+
+        val overflow = rec_fn_to_in.io.intExceptionFlags(1)
+        val maxsat = ((1 << (t.getWidth-1))-1).S
+        val minsat = (-(1 << (t.getWidth-1))).S
+        val sign = rawFloatFromRecFN(f.expWidth, f.sigWidth, rec_fn_to_in.io.in).sign
+        val sat = Mux(sign, minsat, maxsat)
+
+        Mux(overflow, sat, rec_fn_to_in.io.out.asTypeOf(t))
+      },
+      1, Float(8, 24), -1,
+      identity = "1.0",
+      c_str = "({float y = ROUND_NEAR_EVEN((x) * (scale)); y > INT8_MAX ? INT8_MAX : (y < INT8_MIN ? INT8_MIN : (acc_t)y);})"
+    )),
+    num_counter = 0,
+    acc_singleported = true,
+    acc_sub_banks = 2,
+    ex_read_from_acc = false,
+    ex_write_to_spad = false
+  )
+
   val dummyConfig = GemminiArrayConfig[DummySInt, Float, Float](
     inputType = DummySInt(8),
     accType = DummySInt(32),
@@ -285,9 +333,10 @@ class DefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       meshRows = mesh_rows,
       sp_capacity = CapacityInKilobytes(sp_kb),
       acc_capacity = CapacityInKilobytes(acc_kb),
-      clock_gate = true,
       use_shared_res_entries = false,
-      max_in_flight_mem_reqs = 32
+      nSharers = 1,
+      use_shared_ext_mem = false,
+      max_in_flight_mem_reqs = mesh_rows
       )))
       gemmini
     }
@@ -313,10 +362,12 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       headerFileName = "gemmini_params.h",
       meshColumns = mesh_cols,
       meshRows = mesh_rows,
+      max_in_flight_mem_reqs = mesh_rows,
       use_shared_ext_mem = true,
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
-      use_shared_res_entries = true
+      use_shared_res_entries = true,
+      nSharers = 4
       )))
       gemmini0
     }
@@ -326,10 +377,12 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       headerFileName = "gemmini_op1_params.h",
       meshColumns = mesh_cols,
       meshRows = mesh_rows,
+      max_in_flight_mem_reqs = mesh_rows,
       use_shared_ext_mem = true,
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
-      use_shared_res_entries = true
+      use_shared_res_entries = true,
+      nSharers = 4
       )))
       gemmini1
     }
@@ -339,10 +392,12 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       headerFileName = "gemmini_op2_params.h",
       meshColumns = mesh_cols,
       meshRows = mesh_rows,
+      max_in_flight_mem_reqs = mesh_rows,
       use_shared_ext_mem = true,
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
-      use_shared_res_entries = true
+      use_shared_res_entries = true,
+      nSharers = 4
       )))
       gemmini2
     }
@@ -352,10 +407,12 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       headerFileName = "gemmini_op3_params.h",
       meshColumns = mesh_cols,
       meshRows = mesh_rows,
+      max_in_flight_mem_reqs = mesh_rows,
       use_shared_ext_mem = true,
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
-      use_shared_res_entries = true
+      use_shared_res_entries = true,
+      nSharers = 4
       )))
       InModuleBody {
         require(gemmini0.config.sp_banks == gemmini1.config.sp_banks && gemmini2.config.sp_banks == gemmini3.config.sp_banks && gemmini0.config.sp_banks == gemmini2.config.sp_banks)
@@ -379,6 +436,7 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
 
         if (gemmini0.config.use_shared_ext_mem) {
           val shared_mem = Module(new SharedExtMem_4(
+            gemmini0.config.nSharers,
             gemmini0.config.sp_banks, gemmini0.config.acc_banks, gemmini0.config.acc_sub_banks,
             gemmini0.config.sp_bank_entries, spad_mask_len, spad_data_len,
             gemmini0.config.acc_bank_entries / gemmini0.config.acc_sub_banks, acc_mask_len, acc_data_len
@@ -397,21 +455,20 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
           // val total_reservation_station_entries_ld = gemmini0.config.reservation_station_entries_ld + gemmini1.config.reservation_station_entries_ld + gemmini2.config.reservation_station_entries_ld + gemmini3.config.reservation_station_entries_ld
           // val total_reservation_station_entries_ex = gemmini0.config.reservation_station_entries_ex + gemmini1.config.reservation_station_entries_ex + gemmini2.config.reservation_station_entries_ex + gemmini3.config.reservation_station_entries_ex
           // val total_reservation_station_entries_st = gemmini0.config.reservation_station_entries_st + gemmini1.config.reservation_station_entries_st + gemmini2.config.reservation_station_entries_st + gemmini3.config.reservation_station_entries_st
-          val nSharers = 4
 
-          val shared_deps = Module(new SharedExtEntries(nSharers, gemmini0.config.local_addr_t, gemmini0.config.reservation_station_entries_ld, gemmini0.config.reservation_station_entries_ex, gemmini0.config.reservation_station_entries_st, gemmini0.config.res_max_per_type))
+          val shared_deps = Module(new SharedExtEntries(gemmini0.config.nSharers, gemmini0.config.local_addr_t, gemmini0.config.reservation_station_entries_ld, gemmini0.config.reservation_station_entries_ex, gemmini0.config.reservation_station_entries_st, gemmini0.config.res_max_per_type))
           shared_deps.io.in(0) <> gemmini0.module.ext_deps_io.get
           shared_deps.io.in(1) <> gemmini1.module.ext_deps_io.get
           shared_deps.io.in(2) <> gemmini2.module.ext_deps_io.get
           shared_deps.io.in(3) <> gemmini3.module.ext_deps_io.get
 
-          val ldb_ex_control = Module(new LdBCompleteControl(nSharers))
+          val ldb_ex_control = Module(new LdBCompleteControl(gemmini0.config.nSharers))
           ldb_ex_control.io.in(0) <> gemmini0.module.ext_loop_ws_io.get
           ldb_ex_control.io.in(1) <> gemmini1.module.ext_loop_ws_io.get
           ldb_ex_control.io.in(2) <> gemmini2.module.ext_loop_ws_io.get
           ldb_ex_control.io.in(3) <> gemmini3.module.ext_loop_ws_io.get
 
-          val ldinput_ex_control = Module(new LdICompleteControl(nSharers))
+          val ldinput_ex_control = Module(new LdICompleteControl(gemmini0.config.nSharers))
           ldinput_ex_control.io.in(0) <> gemmini0.module.ext_loop_conv_ws_io.get
           ldinput_ex_control.io.in(1) <> gemmini1.module.ext_loop_conv_ws_io.get
           ldinput_ex_control.io.in(2) <> gemmini2.module.ext_loop_conv_ws_io.get

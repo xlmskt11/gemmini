@@ -204,7 +204,7 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   val sp_addr = sp_addr_start + (row_iterator * spad_stride + col_iterator) * block_size.U
   val blocks = Mux(col_iterator + max_blocks <= max_col_iterator, max_blocks, max_col_iterator-col_iterator)
   val cols = (blocks * block_size.U) - Mux(col_iterator + blocks >= max_col_iterator, col_pad, 0.U)
-  val rows = block_size.U - Mux(max_row_iterator === max_row_iterator-1.U, row_pad, 0.U)
+  val rows = block_size.U - Mux(row_iterator === max_row_iterator-1.U, row_pad, 0.U)
 
   val mvin_cmd = Wire(new RoCCCommand)
   mvin_cmd := DontCare
@@ -761,6 +761,7 @@ class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val max_addr: Int, val max_acc_addr: Int, val group_w: Int, val nSharers: Int) extends Bundle {
   // made
   val sp_addr_start = UInt(log2Up(max_addr).W)
+  val sp_addr_end = UInt(log2Up(max_addr+1).W)
   val acc_addr_start = UInt(log2Up(max_acc_addr).W)
 
   val mv_K = UInt(iterator_bitwidth.W)
@@ -847,7 +848,7 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   val iterator_bitwidth = 16
   val concurrent_loops = 2
   val group_num = nSharers * concurrent_loops
-  val group_w = log2Up(group_num) + 1
+  val group_w = log2Up(group_num)
   val max_block_len = (dma_max_bytes / (block_size * input_w / 8)) max 1
   val max_block_len_acc = (dma_max_bytes / (block_size * acc_w / 8)) max 1
 
@@ -1010,7 +1011,8 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
     switch (cmd.bits.cmd.inst.funct) {
       // made
       is (LOOP_WS_CONFIG_SPADDR) {
-        loop_being_configured.sp_addr_start := cmd.bits.cmd.rs2(log2Up(max_addr)-1, 0)
+        loop_being_configured.sp_addr_end := cmd.bits.cmd.rs2(iterator_bitwidth + log2Up(max_addr+1) - 1, iterator_bitwidth)
+        loop_being_configured.sp_addr_start := cmd.bits.cmd.rs2(log2Up(max_addr)-1, 0)   
 
         loop_being_configured.acc_addr_start := cmd.bits.cmd.rs1(log2Up(max_acc_addr)-1, 0)
       }
@@ -1019,7 +1021,7 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
         loop_being_configured.mv_pad_K := cmd.bits.cmd.rs2(iterator_bitwidth * 2 - 1, iterator_bitwidth)
         loop_being_configured.ex_I := cmd.bits.cmd.rs2(iterator_bitwidth - 1, 0)
 
-        loop_being_configured.group_list := cmd.bits.cmd.rs1(iterator_bitwidth * 2 + group_w + nSharers - 1, iterator_bitwidth * 2 + group_w)
+        loop_being_configured.group_list := cmd.bits.cmd.rs1(iterator_bitwidth * 3 + nSharers - 1, iterator_bitwidth * 3)
         loop_being_configured.group_id := cmd.bits.cmd.rs1(iterator_bitwidth * 2 + group_w - 1, iterator_bitwidth * 2)
         loop_being_configured.laddrRB_offset := cmd.bits.cmd.rs1(iterator_bitwidth * 2 - 1, iterator_bitwidth)
         loop_being_configured.laddrRA_offset := cmd.bits.cmd.rs1(iterator_bitwidth - 1, 0)
@@ -1127,7 +1129,7 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   // changed
   // ldB.io.req.bits.addr_end := loop_requesting_ldB.b_addr_end
   if (use_shared_res_entries) {
-    ldB.io.req.bits.addr_end := loop_requesting_ldB.sp_addr_start + (loop_requesting_ldB.max_i * loop_requesting_ldB.max_k + loop_requesting_ldB.max_k * loop_requesting_ldB.max_j) * block_size.U
+    ldB.io.req.bits.addr_end := loop_requesting_ldB.sp_addr_end
   } else {
     ldB.io.req.bits.addr_end := loop_requesting_ldB.b_addr_end
   }
@@ -1156,7 +1158,7 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   // ex.io.req.bits.c_addr_start := ex_c_addr_start
   if (use_shared_res_entries) {
     ex.io.req.bits.a_addr_start := loop_requesting_ex.sp_addr_start
-    ex.io.req.bits.b_addr_end := loop_requesting_ex.sp_addr_start + (loop_requesting_ex.max_i * loop_requesting_ex.max_k + loop_requesting_ex.max_k * loop_requesting_ex.max_j) * block_size.U
+    ex.io.req.bits.b_addr_end := loop_requesting_ex.sp_addr_end
     ex.io.req.bits.c_addr_start := loop_requesting_ex.acc_addr_start
     ex.io.req.valid := !loop_requesting_ex.ex_started && loop_requesting_ex.lda_started &&
       loop_requesting_ex.ldb_started && loop_requesting_ex.ldd_started && loop_requesting_ex.configured &&

@@ -1285,6 +1285,7 @@ class LoopConvSt(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwidth:
 class LoopConvState(val block_size: Int, val large_iterator_bitwidth: Int, val small_iterator_bitwidth: Int, val tiny_iterator_bitwidth: Int, val coreMaxAddrBits: Int, val max_addr: Int, val max_acc_addr: Int, val group_w: Int, val nSharers: Int) extends Bundle {
   // made
   val sp_addr_start = UInt(log2Up(max_addr).W)
+  val sp_addr_end = UInt(log2Up(max_addr+1).W)
   val acc_addr_start = UInt(log2Up(max_acc_addr).W)
 
   val mv_kchs = UInt(large_iterator_bitwidth.W)
@@ -1414,7 +1415,7 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   (implicit p: Parameters) extends Module {
   val concurrent_loops = 2
   val group_num = nSharers * concurrent_loops
-  val group_w = log2Up(group_num) + 1
+  val group_w = log2Up(group_num)
   val large_iterator_bitwidth = 16
   val small_iterator_bitwidth = 16 // 8
   val tiny_iterator_bitwidth = 16 // 4
@@ -1559,6 +1560,7 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
     switch (cmd.bits.cmd.inst.funct) {
       // made
       is (LOOP_CONV_WS_CONFIG_SPADDR) {
+        loop_being_configured.sp_addr_end := cmd.bits.cmd.rs2(large_iterator_bitwidth + log2Up(max_addr+1) - 1, large_iterator_bitwidth)
         loop_being_configured.sp_addr_start := cmd.bits.cmd.rs2(log2Up(max_addr)-1, 0)
 
         loop_being_configured.acc_addr_start := cmd.bits.cmd.rs1(log2Up(max_acc_addr)-1, 0)
@@ -1567,7 +1569,7 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
         loop_being_configured.mv_kchs := cmd.bits.cmd.rs2(large_iterator_bitwidth * 2 - 1, large_iterator_bitwidth)
         loop_being_configured.ex_ochs := cmd.bits.cmd.rs2(large_iterator_bitwidth - 1, 0)
 
-        loop_being_configured.group_list := cmd.bits.cmd.rs1(large_iterator_bitwidth * 2 + group_w + nSharers - 1, large_iterator_bitwidth * 2 + group_w)
+        loop_being_configured.group_list := cmd.bits.cmd.rs1(large_iterator_bitwidth * 3 + nSharers - 1, large_iterator_bitwidth * 3)
         loop_being_configured.group_id := cmd.bits.cmd.rs1(large_iterator_bitwidth * 2 + group_w - 1, large_iterator_bitwidth * 2)
         loop_being_configured.laddrkchs_offset := cmd.bits.cmd.rs1(large_iterator_bitwidth * 2 - 1, large_iterator_bitwidth)
         loop_being_configured.laddrochs_offset := cmd.bits.cmd.rs1(large_iterator_bitwidth - 1, 0)
@@ -1741,7 +1743,7 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
     //   loop_requesting_ld_weights.inner_bounds.batches, loop_requesting_ld_weights.derived_params().in_channels_per_bank)
     // ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.sp_addr_start + loop_requesting_ld_weights.derived_params().input_spad_stride * ldInputBlocks
     // ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.sp_addr_start + loop_requesting_ld_weights.derived_params().input_spad_stride * Mux(loop_requesting_ld_weights.trans_input_3120, loop_requesting_ld_weights.inner_bounds.batches >> log2Up(block_size), loop_requesting_ld_weights.derived_params().in_channels_per_bank)
-    ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.sp_addr_start + loop_requesting_ld_weights.derived_params().input_spad_stride * Mux(loop_requesting_ld_weights.trans_input_3120, loop_requesting_ld_weights.derived_params().batches_per_bank, loop_requesting_ld_weights.derived_params().in_channels_per_bank)
+    ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.sp_addr_end
     ld_weights.io.req.valid := !loop_requesting_ld_weights.ld_weights_started && loop_requesting_ld_weights.configured &&
       loop_requesting_ld_weights.ld_input_started &&
       !(loop_requesting_ld_weights_id === ld_input.io.loop_id && io.ext_loop_conv_ws.get.loop_full && !ld_input.io.idle) // made
@@ -1779,7 +1781,7 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
     //   loop_requesting_ex.inner_bounds.batches, loop_requesting_ex.derived_params().in_channels_per_bank)
     // ex.io.req.bits.b_addr_end := loop_requesting_ex.sp_addr_start + loop_requesting_ex.derived_params().input_spad_stride * exInputBlocks // made
     // ex.io.req.bits.b_addr_end := loop_requesting_ex.sp_addr_start + loop_requesting_ex.derived_params().input_spad_stride * Mux(loop_requesting_ex.trans_input_3120, loop_requesting_ex.inner_bounds.batches >> log2Up(block_size), loop_requesting_ex.derived_params().in_channels_per_bank) // made
-    ex.io.req.bits.b_addr_end := loop_requesting_ex.sp_addr_start + loop_requesting_ex.derived_params().input_spad_stride * Mux(loop_requesting_ex.trans_input_3120, loop_requesting_ex.derived_params().batches_per_bank, loop_requesting_ex.derived_params().in_channels_per_bank) // made
+    ex.io.req.bits.b_addr_end := loop_requesting_ex.sp_addr_end
     ex.io.req.bits.c_addr_start := loop_requesting_ex.acc_addr_start // made
     ex.io.req.valid := !loop_requesting_ex.ex_started && loop_requesting_ex.ld_bias_started &&
       loop_requesting_ex.ld_input_started && loop_requesting_ex.ld_weights_started && loop_requesting_ex.configured &&

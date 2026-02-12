@@ -187,13 +187,13 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val ext_loop_conv_ws_io = if (use_shared_res_entries) Some(IO(new LdIExIO(group_w, nSharers, iterator_bitwidth))) else None
   ext_loop_conv_ws_io.foreach(_ <> ext_loop_conv_ws.get)
 
-  val unrolled_cmd = Queue(loop_cmd)
-  unrolled_cmd.ready := false.B
+  // val unrolled_cmd = Queue(loop_cmd)
+  loop_cmd.ready := false.B
   counters.io.event_io.connectEventSignal(CounterEvent.LOOP_MATMUL_ACTIVE_CYCLES, loop_matmul_unroller_busy)
 
   // Wire up controllers to ROB
   reservation_station.io.alloc.valid := false.B
-  reservation_station.io.alloc.bits := unrolled_cmd.bits
+  reservation_station.io.alloc.bits := loop_cmd.bits
 
   /*
   //-------------------------------------------------------------------------
@@ -328,7 +328,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   // Wire up controllers to ROB
   reservation_station.io.alloc.valid := false.B
   // rob.io.alloc.bits := compressed_cmd.bits
-  reservation_station.io.alloc.bits := unrolled_cmd.bits
+  reservation_station.io.alloc.bits := loop_cmd.bits
 
   /*
   //=========================================================================
@@ -369,7 +369,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   reservation_station_completed_arb.io.out.ready := true.B
 
   // Wire up global RoCC signals
-  io.busy := raw_cmd.valid || loop_conv_unroller_busy || loop_matmul_unroller_busy || reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid || conv_cmd.valid
+  io.busy := raw_cmd.valid || loop_conv_unroller_busy || loop_matmul_unroller_busy || reservation_station.io.busy || spad.module.io.busy || loop_cmd.valid || conv_cmd.valid
 
   io.interrupt := tlb.io.exp.map(_.interrupt).reduce(_ || _)
 
@@ -397,11 +397,11 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   // Issue commands to controllers
   // TODO we combinationally couple cmd.ready and cmd.valid signals here
   // when (compressed_cmd.valid) {
-  when (unrolled_cmd.valid) {
+  when (loop_cmd.valid) {
     // val config_cmd_type = cmd.bits.rs1(1,0) // TODO magic numbers
 
     //val funct = unrolled_cmd.bits.inst.funct
-    val risc_funct = unrolled_cmd.bits.cmd.inst.funct
+    val risc_funct = loop_cmd.bits.cmd.inst.funct
 
     val is_flush = risc_funct === FLUSH_CMD
     val is_counter_op = risc_funct === COUNTER_OP
@@ -416,27 +416,27 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     */
 
     when (is_flush) {
-      val skip = unrolled_cmd.bits.cmd.rs1(0)
+      val skip = loop_cmd.bits.cmd.rs1(0)
       tlb.io.exp.foreach(_.flush_skip := skip)
       tlb.io.exp.foreach(_.flush_retry := !skip)
 
-      unrolled_cmd.ready := true.B // TODO should we wait for an acknowledgement from the TLB?
+      loop_cmd.ready := true.B // TODO should we wait for an acknowledgement from the TLB?
     }
 
     .elsewhen (is_counter_op) {
       // If this is a counter access/configuration command, execute immediately
-      counters.io.in.valid := unrolled_cmd.valid
-      unrolled_cmd.ready := counters.io.in.ready
-      counters.io.in.bits := unrolled_cmd.bits.cmd
+      counters.io.in.valid := loop_cmd.valid
+      loop_cmd.ready := counters.io.in.ready
+      counters.io.in.bits := loop_cmd.bits.cmd
     }
 
     .elsewhen (is_clock_gate_en) {
-      unrolled_cmd.ready := true.B
+      loop_cmd.ready := true.B
     }
 
     .elsewhen (is_profiler_paddr){
-      profilers.module.io.profiler_dram_addr := unrolled_cmd.bits.cmd.rs1
-      unrolled_cmd.ready := true.B
+      profilers.module.io.profiler_dram_addr := loop_cmd.bits.cmd.rs1
+      loop_cmd.ready := true.B
     }
 
     .otherwise {
@@ -444,7 +444,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
       when(reservation_station.io.alloc.fire) {
         // compressed_cmd.ready := true.B
-        unrolled_cmd.ready := true.B
+        loop_cmd.ready := true.B
       }
     }
   }
