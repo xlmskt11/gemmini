@@ -94,6 +94,213 @@ class ScratchpadWriteIO(val n: Int, val w: Int, val mask_len: Int) extends Bundl
   val data = Output(UInt(w.W))
 }
 
+class ExtSpadSubBankAdapter(n: Int, subBanks: Int, w: Int, mask_len: Int, capacity: Int) extends Module {
+  require(subBanks > 0 && isPow2(subBanks))
+  require(n % subBanks == 0)
+
+  private val subBits = log2Ceil(subBanks)
+  private val selWidth = (1 max subBits)
+
+  def subIdx(addr: UInt): UInt = if (subBanks == 1) 0.U(selWidth.W) else addr(subBits - 1, 0)
+  def subAddr(addr: UInt): UInt = if (subBanks == 1) addr else (addr >> subBits)
+
+  val io = IO(new Bundle {
+    val bank = new Bundle {
+      val read = Flipped(new ScratchpadReadIO(n, w))
+      val write = Flipped(Decoupled(new ExtScratchpadWriteReq(n, w, mask_len)))
+    }
+    val ext = Vec(subBanks, new ExtScratchpadBankIO(n / subBanks, w, mask_len, capacity))
+  })
+
+  val readSelQ = Module(new Queue(UInt(selWidth.W), capacity, pipe = true, flow = true))
+
+  io.bank.read.req.ready := false.B
+  io.bank.read.resp.valid := false.B
+  io.bank.read.resp.bits := DontCare
+  io.bank.write.ready := false.B
+  readSelQ.io.enq.valid := false.B
+  readSelQ.io.enq.bits := 0.U
+  readSelQ.io.deq.ready := false.B
+
+  for (s <- 0 until subBanks) {
+    io.ext(s).read.req.valid := false.B
+    io.ext(s).read.req.bits := DontCare
+    io.ext(s).read.resp.ready := false.B
+
+    io.ext(s).write.valid := false.B
+    io.ext(s).write.bits := DontCare
+    io.ext(s).write.bits.exwrite := false.B
+  }
+
+  val readSel = subIdx(io.bank.read.req.bits.addr)
+  val readSelOH = if (subBanks == 1) 1.U(1.W) else UIntToOH(readSel, subBanks)
+  val selectedReadReady = Mux1H(readSelOH.asBools.zip(io.ext.map(_.read.req.ready)))
+
+  io.bank.read.req.ready := selectedReadReady && readSelQ.io.enq.ready
+  readSelQ.io.enq.valid := io.bank.read.req.valid && selectedReadReady
+  readSelQ.io.enq.bits := readSel
+
+  for (s <- 0 until subBanks) {
+    when (readSelOH(s)) {
+      io.ext(s).read.req.valid := io.bank.read.req.valid && readSelQ.io.enq.ready
+      io.ext(s).read.req.bits.addr := subAddr(io.bank.read.req.bits.addr)
+      io.ext(s).read.req.bits.fromDMA := io.bank.read.req.bits.fromDMA
+    }
+  }
+
+  val headSelOH = if (subBanks == 1) 1.U(1.W) else UIntToOH(readSelQ.io.deq.bits, subBanks)
+  val selectedRespValid = Mux1H(headSelOH.asBools.zip(io.ext.map(_.read.resp.valid)))
+  val selectedRespBits = Mux1H(headSelOH.asBools.zip(io.ext.map(_.read.resp.bits)))
+
+  io.bank.read.resp.valid := readSelQ.io.deq.valid && selectedRespValid
+  when (readSelQ.io.deq.valid) {
+    io.bank.read.resp.bits := selectedRespBits
+  }
+
+  readSelQ.io.deq.ready := io.bank.read.resp.fire
+  for (s <- 0 until subBanks) {
+    io.ext(s).read.resp.ready := readSelQ.io.deq.valid && headSelOH(s) && io.bank.read.resp.ready
+  }
+
+  val writeSel = subIdx(io.bank.write.bits.addr)
+  val writeSelOH = if (subBanks == 1) 1.U(1.W) else UIntToOH(writeSel, subBanks)
+  val selectedWriteReady = Mux1H(writeSelOH.asBools.zip(io.ext.map(_.write.ready)))
+  io.bank.write.ready := selectedWriteReady
+
+  for (s <- 0 until subBanks) {
+    when (writeSelOH(s)) {
+      io.ext(s).write.valid := io.bank.write.valid
+      io.ext(s).write.bits.addr := subAddr(io.bank.write.bits.addr)
+      io.ext(s).write.bits.mask := io.bank.write.bits.mask
+      io.ext(s).write.bits.data := io.bank.write.bits.data
+      io.ext(s).write.bits.exwrite := io.bank.write.bits.exwrite
+    }
+  }
+}
+
+class ExtAccSubBankAdapter[T <: Data: Arithmetic, U <: Data](
+  n: Int, t: Vec[Vec[T]], scale_t: U, subBanks: Int, capacity: Int
+) extends Module {
+  require(subBanks > 0 && isPow2(subBanks))
+  require(n % subBanks == 0)
+
+  private val subBits = log2Ceil(subBanks)
+  private val selWidth = (1 max subBits)
+
+  def subIdx(addr: UInt): UInt = if (subBanks == 1) 0.U(selWidth.W) else addr(subBits - 1, 0)
+  def subAddr(addr: UInt): UInt = if (subBanks == 1) addr else (addr >> subBits)
+
+  class AccReadRespMeta extends Bundle {
+    val fromDMA = Bool()
+    val scale = scale_t.cloneType
+    val igelu_qb = t.head.head.cloneType
+    val igelu_qc = t.head.head.cloneType
+    val iexp_qln2 = t.head.head.cloneType
+    val iexp_qln2_inv = t.head.head.cloneType
+    val act = UInt(Activation.bitwidth.W)
+  }
+
+  val io = IO(new Bundle {
+    val bank = new Bundle {
+      val read = Flipped(new AccumulatorReadIO(n, t, scale_t))
+      val write = Flipped(Decoupled(new ExtAccumulatorWriteReq(n, t)))
+    }
+    val ext = Vec(subBanks, new ExtAccumulatorBankIO(n / subBanks, t, capacity))
+  })
+
+  val readSelQ = Module(new Queue(UInt(selWidth.W), capacity, pipe = true, flow = true))
+  val readMetaQ = Module(new Queue(new AccReadRespMeta, capacity, pipe = true, flow = true))
+
+  io.bank.read.req.ready := false.B
+  io.bank.read.resp.valid := false.B
+  io.bank.read.resp.bits := DontCare
+  io.bank.write.ready := false.B
+
+  readSelQ.io.enq.valid := false.B
+  readSelQ.io.enq.bits := 0.U
+  readSelQ.io.deq.ready := false.B
+  readMetaQ.io.enq.valid := false.B
+  readMetaQ.io.enq.bits := DontCare
+  readMetaQ.io.deq.ready := false.B
+
+  for (s <- 0 until subBanks) {
+    io.ext(s).read.req.valid := false.B
+    io.ext(s).read.req.bits := DontCare
+    io.ext(s).read.req.bits.idx := 0.U
+    io.ext(s).read.resp.ready := false.B
+
+    io.ext(s).write.valid := false.B
+    io.ext(s).write.bits := DontCare
+    io.ext(s).write.bits.exwrite := false.B
+  }
+
+  val readSel = subIdx(io.bank.read.req.bits.addr)
+  val readSelOH = if (subBanks == 1) 1.U(1.W) else UIntToOH(readSel, subBanks)
+  val selectedReadReady = Mux1H(readSelOH.asBools.zip(io.ext.map(_.read.req.ready)))
+
+  io.bank.read.req.ready := selectedReadReady && readSelQ.io.enq.ready && readMetaQ.io.enq.ready
+
+  readSelQ.io.enq.valid := io.bank.read.req.valid && selectedReadReady
+  readSelQ.io.enq.bits := readSel
+  readMetaQ.io.enq.valid := io.bank.read.req.valid && selectedReadReady
+  readMetaQ.io.enq.bits.fromDMA := io.bank.read.req.bits.fromDMA
+  readMetaQ.io.enq.bits.scale := io.bank.read.req.bits.scale
+  readMetaQ.io.enq.bits.igelu_qb := io.bank.read.req.bits.igelu_qb
+  readMetaQ.io.enq.bits.igelu_qc := io.bank.read.req.bits.igelu_qc
+  readMetaQ.io.enq.bits.iexp_qln2 := io.bank.read.req.bits.iexp_qln2
+  readMetaQ.io.enq.bits.iexp_qln2_inv := io.bank.read.req.bits.iexp_qln2_inv
+  readMetaQ.io.enq.bits.act := io.bank.read.req.bits.act
+
+  for (s <- 0 until subBanks) {
+    when (readSelOH(s)) {
+      io.ext(s).read.req.valid := io.bank.read.req.valid && readSelQ.io.enq.ready && readMetaQ.io.enq.ready
+      io.ext(s).read.req.bits.addr := subAddr(io.bank.read.req.bits.addr)
+      io.ext(s).read.req.bits.full := io.bank.read.req.bits.full
+      io.ext(s).read.req.bits.idx := 0.U
+    }
+  }
+
+  val headSelOH = if (subBanks == 1) 1.U(1.W) else UIntToOH(readSelQ.io.deq.bits, subBanks)
+  val selectedRespValid = Mux1H(headSelOH.asBools.zip(io.ext.map(_.read.resp.valid)))
+  val selectedRespBits = Mux1H(headSelOH.asBools.zip(io.ext.map(_.read.resp.bits)))
+
+  io.bank.read.resp.valid := readSelQ.io.deq.valid && readMetaQ.io.deq.valid && selectedRespValid
+  when (readSelQ.io.deq.valid && readMetaQ.io.deq.valid) {
+    io.bank.read.resp.bits.data := selectedRespBits.data
+    io.bank.read.resp.bits.fromDMA := readMetaQ.io.deq.bits.fromDMA
+    io.bank.read.resp.bits.scale := readMetaQ.io.deq.bits.scale
+    io.bank.read.resp.bits.igelu_qb := readMetaQ.io.deq.bits.igelu_qb
+    io.bank.read.resp.bits.igelu_qc := readMetaQ.io.deq.bits.igelu_qc
+    io.bank.read.resp.bits.iexp_qln2 := readMetaQ.io.deq.bits.iexp_qln2
+    io.bank.read.resp.bits.iexp_qln2_inv := readMetaQ.io.deq.bits.iexp_qln2_inv
+    io.bank.read.resp.bits.act := readMetaQ.io.deq.bits.act
+    io.bank.read.resp.bits.acc_bank_id := 0.U
+  }
+
+  readSelQ.io.deq.ready := io.bank.read.resp.fire
+  readMetaQ.io.deq.ready := io.bank.read.resp.fire
+  for (s <- 0 until subBanks) {
+    io.ext(s).read.resp.ready := readSelQ.io.deq.valid && readMetaQ.io.deq.valid && headSelOH(s) && io.bank.read.resp.ready
+  }
+
+  val writeSel = subIdx(io.bank.write.bits.addr)
+  val writeSelOH = if (subBanks == 1) 1.U(1.W) else UIntToOH(writeSel, subBanks)
+  val selectedWriteReady = Mux1H(writeSelOH.asBools.zip(io.ext.map(_.write.ready)))
+
+  io.bank.write.ready := selectedWriteReady
+
+  for (s <- 0 until subBanks) {
+    when (writeSelOH(s)) {
+      io.ext(s).write.valid := io.bank.write.valid
+      io.ext(s).write.bits.addr := subAddr(io.bank.write.bits.addr)
+      io.ext(s).write.bits.data := io.bank.write.bits.data
+      io.ext(s).write.bits.acc := io.bank.write.bits.acc
+      io.ext(s).write.bits.mask := io.bank.write.bits.mask
+      io.ext(s).write.bits.exwrite := io.bank.write.bits.exwrite
+    }
+  }
+}
+
 class ScratchpadBank(n: Int, w: Int, aligned_to: Int, single_ported: Boolean, use_shared_ext_mem: Boolean, is_dummy: Boolean) extends Module {
   // This is essentially a pipelined SRAM with the ability to stall pipeline stages
 
@@ -225,6 +432,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
   val block_cols = meshColumns * tileColumns
   val spad_w = inputType.getWidth *  block_cols
   val acc_w = accType.getWidth * block_cols
+  val sp_mask_len = (spad_w / (aligned_to * 8)) max 1
 
   val id_node = TLIdentityNode()
   val xbar_node = TLXbar()
@@ -246,6 +454,9 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
 
   lazy val module = new Impl
   class Impl extends LazyModuleImp(this) with HasCoreParameters {
+    val acc_row_t = Vec(meshColumns, Vec(tileColumns, accType))
+    val spad_row_t = Vec(meshColumns, Vec(tileColumns, inputType))
+
     val io = IO(new Bundle {
       // DMA ports
       val dma = new Bundle {
@@ -278,7 +489,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       val ext_mem = if (use_shared_ext_mem) {
         // changed
         // Some(new ExtSpadMemIO(sp_banks, acc_banks, acc_sub_banks))
-        Some(new ExtSpadMemIO_4(sp_banks, acc_banks, acc_sub_banks))
+        Some(new ExtMemIO_new(sp_banks, sp_sub_banks, sp_bank_entries / sp_sub_banks, spad_w, sp_mask_len, 8, acc_banks, acc_sub_banks, acc_bank_entries / acc_sub_banks, acc_row_t, 8))
       } else {
         None
       }
@@ -490,7 +701,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
 
     io.busy := writer.module.io.busy || reader.module.io.busy || write_issue_q.io.deq.valid || write_norm_q.io.deq.valid || write_scale_q.io.deq.valid || write_dispatch_q.valid
 
-    val spad_mems = {
+    val spad_mems = if (!use_shared_ext_mem) {
       val banks = Seq.fill(sp_banks) { Module(new ScratchpadBank(
         sp_bank_entries, spad_w,
         aligned_to, config.sp_singleported,
@@ -507,15 +718,10 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         val exread = ex_read_req.valid
 
         // TODO we tie the write dispatch queue's, and write issue queue's, ready and valid signals together here
-        // changed
         val dmawrite = write_dispatch_q.valid && write_norm_q.io.enq.ready &&
           !write_dispatch_q.bits.laddr.is_garbage() &&
           !(bio.write.en && config.sp_singleported.B) &&
           !write_dispatch_q.bits.laddr.is_acc_addr && write_dispatch_q.bits.laddr.sp_bank() === i.U
-        // val dmawrite = write_dispatch_q.valid && write_norm_q.io.enq.ready &&
-        //   !write_dispatch_q.bits.laddr.is_garbage() &&
-        //   !(bio.write.bits.en && config.sp_singleported.B) &&
-        //   !write_dispatch_q.bits.laddr.is_acc_addr && write_dispatch_q.bits.laddr.sp_bank() === i.U
 
         bio.read.req.valid := exread || dmawrite
         ex_read_req.ready := bio.read.req.ready
@@ -563,9 +769,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
 
       // Writing to the SRAM banks
       bank_ios.zipWithIndex.foreach { case (bio, i) =>
-        // changed
         val exwrite = io.srams.write(i).en
-        // val exwrite = io.srams.write(i).bits.en && io.srams.write(i).valid
 
         // val laddr = mvin_scale_out.bits.tag.addr.asTypeOf(local_addr_t) + mvin_scale_out.bits.row
         val laddr = mvin_scale_pixel_repeater.io.resp.bits.laddr
@@ -574,8 +778,6 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         val dmaread = mvin_scale_pixel_repeater.io.resp.valid && !mvin_scale_pixel_repeater.io.resp.bits.tag.is_acc &&
           laddr.sp_bank() === i.U
 
-        // made
-        // io.srams.write(i).ready := bio.write.ready
 
         // We need to make sure that we don't try to return a dma read resp from both zero_writer and either mvin_scale
         // or mvin_acc_scale at the same time. The scalers always get priority in those cases
@@ -586,13 +788,8 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
           // !((mvin_scale_out.valid && mvin_scale_out.bits.last) || (mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.last))
           !((mvin_scale_pixel_repeater.io.resp.valid && mvin_scale_pixel_repeater.io.resp.bits.last) || (mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.last))
 
-        // changed
         bio.write.en := exwrite || dmaread || zerowrite
-        // bio.write.bits.en := exwrite || dmaread || zerowrite
-        // bio.write.valid := exwrite || dmaread || zerowrite
 
-
-        // changed
         when (exwrite) {
           bio.write.addr := io.srams.write(i).addr
           bio.write.data := io.srams.write(i).data
@@ -614,33 +811,126 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
           bio.write.data := DontCare
           bio.write.mask := DontCare
         }
-        // when (exwrite) {
-        //   bio.write.bits.addr := io.srams.write(i).bits.addr
-        //   bio.write.bits.data := io.srams.write(i).bits.data
-        //   bio.write.bits.mask := io.srams.write(i).bits.mask
-        // }.elsewhen (dmaread) {
-        //   bio.write.bits.addr := laddr.sp_row()
-        //   bio.write.bits.data := mvin_scale_pixel_repeater.io.resp.bits.out.asUInt
-        //   bio.write.bits.mask := mvin_scale_pixel_repeater.io.resp.bits.mask take ((spad_w / (aligned_to * 8)) max 1)
-
-        //   mvin_scale_pixel_repeater.io.resp.ready := true.B // TODO we combinationally couple valid and ready signals
-        // }.elsewhen (zerowrite) {
-        //   bio.write.bits.addr := zero_writer_pixel_repeater.io.resp.bits.laddr.sp_row()
-        //   bio.write.bits.data := 0.U
-        //   bio.write.bits.mask := zero_writer_pixel_repeater.io.resp.bits.mask
-
-        //   zero_writer_pixel_repeater.io.resp.ready := true.B // TODO we combinationally couple valid and ready signals
-        // }.otherwise {
-        //   bio.write.bits.addr := DontCare
-        //   bio.write.bits.data := DontCare
-        //   bio.write.bits.mask := DontCare
-        // }
       }
-      banks
+      Some(banks)
     }
+    else {
+      // Reading from the SRAM banks
+      val spad_adapters = Seq.fill(sp_banks) {
+        Module(new ExtSpadSubBankAdapter(sp_bank_entries, sp_sub_banks, spad_w, sp_mask_len, 8))
+      }
+      spad_adapters.zipWithIndex.foreach { case (adapter, i) =>
+        io.ext_mem.get.spad(i) <> adapter.io.ext
+      }
+      val bank_ios = spad_adapters.map(_.io.bank)
+      bank_ios.zipWithIndex.foreach { case (bio, i) =>
 
-    val acc_row_t = Vec(meshColumns, Vec(tileColumns, accType))
-    val spad_row_t = Vec(meshColumns, Vec(tileColumns, inputType))
+        val ex_read_req = io.srams.read(i).req
+        val exread = ex_read_req.valid
+
+        // TODO we tie the write dispatch queue's, and write issue queue's, ready and valid signals together here
+        val dmawrite = write_dispatch_q.valid && write_norm_q.io.enq.ready &&
+          !write_dispatch_q.bits.laddr.is_garbage() &&
+          !(bio.write.valid && config.sp_singleported.B) &&
+          !write_dispatch_q.bits.laddr.is_acc_addr && write_dispatch_q.bits.laddr.sp_bank() === i.U
+
+        bio.read.req.valid := exread || dmawrite
+        ex_read_req.ready := bio.read.req.ready
+
+        // The ExecuteController gets priority when reading from SRAMs
+        when (exread) {
+          bio.read.req.bits.addr := ex_read_req.bits.addr
+          bio.read.req.bits.fromDMA := false.B
+        }.elsewhen (dmawrite) {
+          bio.read.req.bits.addr := write_dispatch_q.bits.laddr.sp_row()
+          bio.read.req.bits.fromDMA := true.B
+
+          when (bio.read.req.fire) {
+            write_dispatch_q.ready := true.B
+            write_norm_q.io.enq.valid := true.B
+
+            io.dma.write.resp.valid := true.B
+          }
+        }.otherwise {
+          bio.read.req.bits := DontCare
+        }
+
+        val dma_read_resp = Wire(Decoupled(new ScratchpadReadResp(spad_w)))
+        dma_read_resp.valid := bio.read.resp.valid && bio.read.resp.bits.fromDMA
+        dma_read_resp.bits := bio.read.resp.bits
+        val ex_read_resp = Wire(Decoupled(new ScratchpadReadResp(spad_w)))
+        ex_read_resp.valid := bio.read.resp.valid && !bio.read.resp.bits.fromDMA
+        ex_read_resp.bits := bio.read.resp.bits
+
+        val dma_read_pipe = Pipeline(dma_read_resp, spad_read_delay)
+        val ex_read_pipe = Pipeline(ex_read_resp, spad_read_delay)
+
+        bio.read.resp.ready := Mux(bio.read.resp.bits.fromDMA, dma_read_resp.ready, ex_read_resp.ready)
+
+        dma_read_pipe.ready := writer.module.io.req.ready &&
+          !write_issue_q.io.deq.bits.laddr.is_acc_addr && write_issue_q.io.deq.bits.laddr.sp_bank() === i.U && // I believe we don't need to check that write_issue_q is valid here, because if the SRAM's resp is valid, then that means that the write_issue_q's deq should also be valid
+          !write_issue_q.io.deq.bits.laddr.is_garbage()
+        when (dma_read_pipe.fire) {
+          writeData.valid := true.B
+          writeData.bits := dma_read_pipe.bits.data
+        }
+
+        io.srams.read(i).resp <> ex_read_pipe
+      }
+
+      // Writing to the SRAM banks
+      bank_ios.zipWithIndex.foreach { case (bio, i) =>
+        val exwrite = io.srams.write(i).en
+
+        // val laddr = mvin_scale_out.bits.tag.addr.asTypeOf(local_addr_t) + mvin_scale_out.bits.row
+        val laddr = mvin_scale_pixel_repeater.io.resp.bits.laddr
+
+        // val dmaread = mvin_scale_out.valid && !mvin_scale_out.bits.tag.is_acc &&
+        val dmaread = mvin_scale_pixel_repeater.io.resp.valid && !mvin_scale_pixel_repeater.io.resp.bits.tag.is_acc &&
+          laddr.sp_bank() === i.U
+
+
+        // We need to make sure that we don't try to return a dma read resp from both zero_writer and either mvin_scale
+        // or mvin_acc_scale at the same time. The scalers always get priority in those cases
+        /* val zerowrite = zero_writer.io.resp.valid && !zero_writer.io.resp.bits.laddr.is_acc_addr &&
+          zero_writer.io.resp.bits.laddr.sp_bank() === i.U && */
+        val zerowrite = zero_writer_pixel_repeater.io.resp.valid && !zero_writer_pixel_repeater.io.resp.bits.laddr.is_acc_addr &&
+          zero_writer_pixel_repeater.io.resp.bits.laddr.sp_bank() === i.U &&
+          // !((mvin_scale_out.valid && mvin_scale_out.bits.last) || (mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.last))
+          !((mvin_scale_pixel_repeater.io.resp.valid && mvin_scale_pixel_repeater.io.resp.bits.last) || (mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.last))
+
+        bio.write.valid := exwrite || dmaread || zerowrite
+
+        assert(!(exwrite && !bio.write.ready))
+
+        when (exwrite) {
+          bio.write.bits.addr := io.srams.write(i).addr
+          bio.write.bits.data := io.srams.write(i).data
+          bio.write.bits.mask := io.srams.write(i).mask
+          bio.write.bits.exwrite := true.B
+        }.elsewhen (dmaread) {
+          bio.write.bits.addr := laddr.sp_row()
+          bio.write.bits.data := mvin_scale_pixel_repeater.io.resp.bits.out.asUInt
+          bio.write.bits.mask := mvin_scale_pixel_repeater.io.resp.bits.mask take ((spad_w / (aligned_to * 8)) max 1)
+          bio.write.bits.exwrite := false.B
+
+          mvin_scale_pixel_repeater.io.resp.ready := bio.write.fire // TODO we combinationally couple valid and ready signals
+        }.elsewhen (zerowrite) {
+          bio.write.bits.addr := zero_writer_pixel_repeater.io.resp.bits.laddr.sp_row()
+          bio.write.bits.data := 0.U
+          bio.write.bits.mask := zero_writer_pixel_repeater.io.resp.bits.mask
+          bio.write.bits.exwrite := false.B
+
+          zero_writer_pixel_repeater.io.resp.ready := bio.write.fire // TODO we combinationally couple valid and ready signals
+        }.otherwise {
+          bio.write.bits.addr := DontCare
+          bio.write.bits.data := DontCare
+          bio.write.bits.mask := DontCare
+          bio.write.bits.exwrite := DontCare
+        }
+      }
+      None
+    }
 
 //    val acc_norm_unit = Module(new Normalizer(
 //      max_len = block_cols,
@@ -717,9 +1007,13 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       }
     }
 
-    val acc_adders = Module(new AccPipeShared(acc_latency-1, acc_row_t, acc_banks))
+    val acc_adders = if (use_shared_ext_mem) {
+      None
+    } else {
+      Some(Module(new AccPipeShared(acc_latency-1, acc_row_t, acc_banks)))
+    }
 
-    val acc_mems = {
+    val acc_mems = if (!use_shared_ext_mem) {
       val banks = Seq.fill(acc_banks) { Module(new AccumulatorMem(
         acc_bank_entries, acc_row_t, acc_scale_func, acc_scale_t.asInstanceOf[V],
         acc_singleported, acc_sub_banks,
@@ -737,10 +1031,10 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
           io.ext_mem.get.acc(i) <> bio.ext_mem.get
         }
 
-        acc_adders.io.in_sel(i) := bio.adder.valid
-        acc_adders.io.ina(i) := bio.adder.op1
-        acc_adders.io.inb(i) := bio.adder.op2
-        bio.adder.sum := acc_adders.io.out
+        acc_adders.get.io.in_sel(i) := bio.adder.valid
+        acc_adders.get.io.ina(i) := bio.adder.op1
+        acc_adders.get.io.inb(i) := bio.adder.op2
+        bio.adder.sum := acc_adders.get.io.out
 
         val ex_read_req = io.acc.read_req(i)
         val exread = ex_read_req.valid
@@ -913,7 +1207,199 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
           bio.write.bits.mask := DontCare
         }
       }
-      banks
+      Some(banks)
+    } else {
+      val acc_adapters = Seq.fill(acc_banks) {
+        Module(new ExtAccSubBankAdapter(acc_bank_entries, acc_row_t, acc_scale_t.asInstanceOf[V], acc_sub_banks, 8))
+      }
+      acc_adapters.zipWithIndex.foreach { case (adapter, i) =>
+        io.ext_mem.get.acc(i) <> adapter.io.ext
+      }
+      val bank_ios = VecInit(acc_adapters.map(_.io.bank))
+
+      // Getting the output of the bank that's about to be issued to the writer
+      val bank_issued_io = bank_ios(write_issue_q.io.deq.bits.laddr.acc_bank())
+
+      // Reading from the Accumulator banks
+      bank_ios.zipWithIndex.foreach { case (bio, i) =>
+        val ex_read_req = io.acc.read_req(i)
+        val exread = ex_read_req.valid
+
+        // TODO we tie the write dispatch queue's, and write issue queue's, ready and valid signals together here
+        val dmawrite = write_dispatch_q.valid && write_norm_q.io.enq.ready &&
+          !write_dispatch_q.bits.laddr.is_garbage() &&
+          write_dispatch_q.bits.laddr.is_acc_addr && write_dispatch_q.bits.laddr.acc_bank() === i.U
+
+        bio.read.req.valid := exread || dmawrite
+        ex_read_req.ready := bio.read.req.ready
+
+        // The ExecuteController gets priority when reading from accumulator banks
+        when (exread) {
+          bio.read.req.bits.addr := ex_read_req.bits.addr
+          bio.read.req.bits.act := ex_read_req.bits.act
+          bio.read.req.bits.igelu_qb := ex_read_req.bits.igelu_qb
+          bio.read.req.bits.igelu_qc := ex_read_req.bits.igelu_qc
+          bio.read.req.bits.iexp_qln2 := ex_read_req.bits.iexp_qln2
+          bio.read.req.bits.iexp_qln2_inv := ex_read_req.bits.iexp_qln2_inv
+          bio.read.req.bits.scale := ex_read_req.bits.scale
+          bio.read.req.bits.full := false.B
+          bio.read.req.bits.fromDMA := false.B
+        }.elsewhen (dmawrite) {
+          bio.read.req.bits.addr := write_dispatch_q.bits.laddr.acc_row()
+          bio.read.req.bits.full := write_dispatch_q.bits.laddr.read_full_acc_row
+          bio.read.req.bits.act := write_dispatch_q.bits.acc_act
+          bio.read.req.bits.igelu_qb := write_dispatch_q.bits.acc_igelu_qb.asTypeOf(bio.read.req.bits.igelu_qb)
+          bio.read.req.bits.igelu_qc := write_dispatch_q.bits.acc_igelu_qc.asTypeOf(bio.read.req.bits.igelu_qc)
+          bio.read.req.bits.iexp_qln2 := write_dispatch_q.bits.acc_iexp_qln2.asTypeOf(bio.read.req.bits.iexp_qln2)
+          bio.read.req.bits.iexp_qln2_inv := write_dispatch_q.bits.acc_iexp_qln2_inv.asTypeOf(bio.read.req.bits.iexp_qln2_inv)
+          bio.read.req.bits.scale := write_dispatch_q.bits.acc_scale.asTypeOf(bio.read.req.bits.scale)
+          bio.read.req.bits.fromDMA := true.B
+
+          when (bio.read.req.fire) {
+            write_dispatch_q.ready := true.B
+            write_norm_q.io.enq.valid := true.B
+
+            io.dma.write.resp.valid := true.B
+          }
+        }.otherwise {
+          bio.read.req.bits := DontCare
+        }
+        bio.read.resp.ready := false.B
+
+        when (write_norm_q.io.deq.valid &&
+          acc_norm_unit_in.ready &&
+          bio.read.resp.valid &&
+          write_scale_q.io.enq.ready &&
+          write_norm_q.io.deq.bits.laddr.is_acc_addr &&
+          !write_norm_q.io.deq.bits.laddr.is_garbage() &&
+          write_norm_q.io.deq.bits.laddr.acc_bank() === i.U)
+        {
+          write_norm_q.io.deq.ready := true.B
+          acc_norm_unit_in.valid := true.B
+          bio.read.resp.ready := true.B
+
+          // Some normalizer commands don't write to main memory, so they don't need to be passed on to the scaling units
+          write_scale_q.io.enq.valid := NormCmd.writes_to_main_memory(write_norm_q.io.deq.bits.laddr.norm_cmd)
+
+          acc_norm_unit_in.bits.acc_read_resp := bio.read.resp.bits
+          acc_norm_unit_in.bits.acc_read_resp.acc_bank_id := i.U
+        }
+      }
+
+      // Writing to the accumulator banks
+      bank_ios.zipWithIndex.foreach { case (bio, i) =>
+        // Order of precedence during writes is ExecuteController, and then mvin_scale, and then mvin_scale_acc, and
+        // then zero_writer
+
+        val exwrite = io.acc.write(i).valid
+        io.acc.write(i).ready := true.B
+        assert(!(exwrite && !bio.write.ready), "Execute controller write to AccumulatorMem was skipped")
+
+        // val from_mvin_scale = mvin_scale_out.valid && mvin_scale_out.bits.tag.is_acc
+        val from_mvin_scale = mvin_scale_pixel_repeater.io.resp.valid && mvin_scale_pixel_repeater.io.resp.bits.tag.is_acc
+        val from_mvin_scale_acc = mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.tag.is_acc
+
+        // val mvin_scale_laddr = mvin_scale_out.bits.tag.addr.asTypeOf(local_addr_t) + mvin_scale_out.bits.row
+        val mvin_scale_laddr = mvin_scale_pixel_repeater.io.resp.bits.laddr
+        val mvin_scale_acc_laddr = mvin_scale_acc_out.bits.tag.addr.asTypeOf(local_addr_t) + mvin_scale_acc_out.bits.row
+
+        val dmaread_bank = Mux(from_mvin_scale, mvin_scale_laddr.acc_bank(),
+          mvin_scale_acc_laddr.acc_bank())
+        val dmaread_row = Mux(from_mvin_scale, mvin_scale_laddr.acc_row(), mvin_scale_acc_laddr.acc_row())
+
+        // We need to make sure that we don't try to return a dma read resp from both mvin_scale and mvin_scale_acc
+        // at the same time. mvin_scale always gets priority in this cases
+        val spad_last = mvin_scale_pixel_repeater.io.resp.valid && mvin_scale_pixel_repeater.io.resp.bits.last && !mvin_scale_pixel_repeater.io.resp.bits.tag.is_acc
+
+        val dmaread = (from_mvin_scale || from_mvin_scale_acc) &&
+          dmaread_bank === i.U /* &&
+          (mvin_scale_same.B || from_mvin_scale || !spad_dmaread_last) */
+
+        // We need to make sure that we don't try to return a dma read resp from both zero_writer and either mvin_scale
+        // or mvin_acc_scale at the same time. The scalers always get priority in those cases
+        /* val zerowrite = zero_writer.io.resp.valid && zero_writer.io.resp.bits.laddr.is_acc_addr &&
+          zero_writer.io.resp.bits.laddr.acc_bank() === i.U && */
+        val zerowrite = zero_writer_pixel_repeater.io.resp.valid && zero_writer_pixel_repeater.io.resp.bits.laddr.is_acc_addr &&
+          zero_writer_pixel_repeater.io.resp.bits.laddr.acc_bank() === i.U &&
+          // !((mvin_scale_out.valid && mvin_scale_out.bits.last) || (mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.last))
+          !((mvin_scale_pixel_repeater.io.resp.valid && mvin_scale_pixel_repeater.io.resp.bits.last) || (mvin_scale_acc_out.valid && mvin_scale_acc_out.bits.last))
+
+        val consecutive_write_block = RegInit(false.B)
+        if (acc_singleported) {
+          val consecutive_write_sub_bank = RegInit(0.U((1 max log2Ceil(acc_sub_banks)).W))
+          when (bio.write.fire && bio.write.bits.acc &&
+            (bio.write.bits.addr(log2Ceil(acc_sub_banks)-1,0) === consecutive_write_sub_bank)) {
+            consecutive_write_block := true.B
+          } .elsewhen (bio.write.fire && bio.write.bits.acc) {
+            consecutive_write_block := false.B
+            consecutive_write_sub_bank := bio.write.bits.addr(log2Ceil(acc_sub_banks)-1,0)
+          } .otherwise {
+            consecutive_write_block := false.B
+          }
+        }
+        bio.write.valid := false.B
+
+        assert(!(exwrite && !bio.write.ready))
+
+        // bio.write.bits.acc := MuxCase(zero_writer.io.resp.bits.laddr.accumulate,
+        bio.write.bits.acc := MuxCase(zero_writer_pixel_repeater.io.resp.bits.laddr.accumulate,
+          Seq(exwrite -> io.acc.write(i).bits.acc,
+            // from_mvin_scale -> mvin_scale_out.bits.tag.accumulate,
+            from_mvin_scale -> mvin_scale_pixel_repeater.io.resp.bits.tag.accumulate,
+            from_mvin_scale_acc -> mvin_scale_acc_out.bits.tag.accumulate))
+
+        // bio.write.bits.addr := MuxCase(zero_writer.io.resp.bits.laddr.acc_row(),
+        bio.write.bits.addr := MuxCase(zero_writer_pixel_repeater.io.resp.bits.laddr.acc_row(),
+          Seq(exwrite -> io.acc.write(i).bits.addr,
+            (from_mvin_scale || from_mvin_scale_acc) -> dmaread_row))
+
+        when (exwrite) {
+          bio.write.valid := true.B
+          bio.write.bits.data := io.acc.write(i).bits.data
+          bio.write.bits.mask := io.acc.write(i).bits.mask
+          bio.write.bits.exwrite := true.B
+        }.elsewhen (dmaread && !spad_last && !consecutive_write_block) {
+          bio.write.valid := true.B
+          bio.write.bits.data := Mux(from_mvin_scale,
+            // VecInit(mvin_scale_out.bits.out.map(e => e.withWidthOf(accType))).asTypeOf(acc_row_t),
+            VecInit(mvin_scale_pixel_repeater.io.resp.bits.out.map(e => e.withWidthOf(accType))).asTypeOf(acc_row_t),
+            mvin_scale_acc_out.bits.out.asTypeOf(acc_row_t))
+          bio.write.bits.mask :=
+            Mux(from_mvin_scale,
+              {
+                val n = accType.getWidth / inputType.getWidth
+                // val mask = mvin_scale_out.bits.tag.mask take ((spad_w / (aligned_to * 8)) max 1)
+                val mask = mvin_scale_pixel_repeater.io.resp.bits.mask take ((spad_w / (aligned_to * 8)) max 1)
+                val expanded = VecInit(mask.flatMap(e => Seq.fill(n)(e)))
+                expanded
+              },
+              mvin_scale_acc_out.bits.tag.mask)
+          bio.write.bits.exwrite := false.B
+
+          when(from_mvin_scale) {
+            mvin_scale_pixel_repeater.io.resp.ready := bio.write.fire
+          }.otherwise {
+            mvin_scale_acc_out.ready := bio.write.fire
+          }
+        }.elsewhen (zerowrite && !spad_last && !consecutive_write_block) {
+          bio.write.valid := true.B
+          bio.write.bits.data := 0.U.asTypeOf(acc_row_t)
+          bio.write.bits.mask := {
+            val n = accType.getWidth / inputType.getWidth
+            val mask = zero_writer_pixel_repeater.io.resp.bits.mask
+            val expanded = VecInit(mask.flatMap(e => Seq.fill(n)(e)))
+            expanded
+          }
+          bio.write.bits.exwrite := false.B
+
+          zero_writer_pixel_repeater.io.resp.ready := bio.write.fire
+        }.otherwise {
+          bio.write.bits.data := DontCare
+          bio.write.bits.mask := DontCare
+          bio.write.bits.exwrite := DontCare
+        }
+      }
+      None
     }
 
     // Counter connection
