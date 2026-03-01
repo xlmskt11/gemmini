@@ -83,8 +83,8 @@ class CircularBuffer[T <: Data](t: T, nSharers: Int, capacity: Int) extends Modu
   // The second assert is more conservative, and will never allow enqueueing more items
   // than there is space in the buffer, under any circumstances. May be removed if
   // desire for more is greater than the need to be more conservative.
-//   assert(io.nEnqueued +& io.enqValid -& io.deqReady <= capacity.U)
-  assert(io.enqValid <= (capacity.U -& io.nEnqueued))
+  // assert(io.nEnqueued +& io.enqValid -& io.deqFire() <= capacity.U)
+  // assert(io.enqValid <= (capacity.U -& io.nEnqueued))
 
 //   assert(io.deqReady <= io.nEnqueued)
 

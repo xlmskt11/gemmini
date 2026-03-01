@@ -108,16 +108,20 @@ class ExtSpadSubBankAdapter(n: Int, subBanks: Int, w: Int, mask_len: Int, capaci
     val bank = new Bundle {
       val read = Flipped(new ScratchpadReadIO(n, w))
       val write = Flipped(Decoupled(new ExtScratchpadWriteReq(n, w, mask_len)))
+      val grant = Flipped(Decoupled(new BankExWriteGrantReq(n)))
+      val remind = Flipped(Decoupled(new BankExWriteRemindReq(n)))
     }
     val ext = Vec(subBanks, new ExtScratchpadBankIO(n / subBanks, w, mask_len, capacity))
   })
 
-  val readSelQ = Module(new Queue(UInt(selWidth.W), capacity, pipe = true, flow = true))
+  val readSelQ = Module(new Queue(UInt(selWidth.W), capacity, pipe = true, flow = false))
 
   io.bank.read.req.ready := false.B
   io.bank.read.resp.valid := false.B
   io.bank.read.resp.bits := DontCare
   io.bank.write.ready := false.B
+  io.bank.grant.ready := false.B
+  io.bank.remind.ready := false.B
   readSelQ.io.enq.valid := false.B
   readSelQ.io.enq.bits := 0.U
   readSelQ.io.deq.ready := false.B
@@ -130,6 +134,10 @@ class ExtSpadSubBankAdapter(n: Int, subBanks: Int, w: Int, mask_len: Int, capaci
     io.ext(s).write.valid := false.B
     io.ext(s).write.bits := DontCare
     io.ext(s).write.bits.exwrite := false.B
+    io.ext(s).grant.valid := false.B
+    io.ext(s).grant.bits := false.B
+    io.ext(s).remind.valid := false.B
+    io.ext(s).remind.bits := false.B
   }
 
   val readSel = subIdx(io.bank.read.req.bits.addr)
@@ -176,6 +184,28 @@ class ExtSpadSubBankAdapter(n: Int, subBanks: Int, w: Int, mask_len: Int, capaci
       io.ext(s).write.bits.exwrite := io.bank.write.bits.exwrite
     }
   }
+
+  val grantSel = subIdx(io.bank.grant.bits.addr)
+  val grantSelOH = if (subBanks == 1) 1.U(1.W) else UIntToOH(grantSel, subBanks)
+  val selectedGrantReady = Mux1H(grantSelOH.asBools.zip(io.ext.map(_.grant.ready)))
+  io.bank.grant.ready := selectedGrantReady
+  for (s <- 0 until subBanks) {
+    when (grantSelOH(s)) {
+      io.ext(s).grant.valid := io.bank.grant.valid
+      io.ext(s).grant.bits := true.B
+    }
+  }
+
+  val remindSel = subIdx(io.bank.remind.bits.addr)
+  val remindSelOH = if (subBanks == 1) 1.U(1.W) else UIntToOH(remindSel, subBanks)
+  val selectedRemindReady = Mux1H(remindSelOH.asBools.zip(io.ext.map(_.remind.ready)))
+  io.bank.remind.ready := selectedRemindReady
+  for (s <- 0 until subBanks) {
+    when (remindSelOH(s)) {
+      io.ext(s).remind.valid := io.bank.remind.valid
+      io.ext(s).remind.bits := true.B
+    }
+  }
 }
 
 class ExtAccSubBankAdapter[T <: Data: Arithmetic, U <: Data](
@@ -204,17 +234,21 @@ class ExtAccSubBankAdapter[T <: Data: Arithmetic, U <: Data](
     val bank = new Bundle {
       val read = Flipped(new AccumulatorReadIO(n, t, scale_t))
       val write = Flipped(Decoupled(new ExtAccumulatorWriteReq(n, t)))
+      val grant = Flipped(Decoupled(new BankExWriteGrantReq(n)))
+      val remind = Flipped(Decoupled(new BankExWriteRemindReq(n)))
     }
     val ext = Vec(subBanks, new ExtAccumulatorBankIO(n / subBanks, t, capacity))
   })
 
-  val readSelQ = Module(new Queue(UInt(selWidth.W), capacity, pipe = true, flow = true))
-  val readMetaQ = Module(new Queue(new AccReadRespMeta, capacity, pipe = true, flow = true))
+  val readSelQ = Module(new Queue(UInt(selWidth.W), capacity, pipe = true, flow = false))
+  val readMetaQ = Module(new Queue(new AccReadRespMeta, capacity, pipe = true, flow = false))
 
   io.bank.read.req.ready := false.B
   io.bank.read.resp.valid := false.B
   io.bank.read.resp.bits := DontCare
   io.bank.write.ready := false.B
+  io.bank.grant.ready := false.B
+  io.bank.remind.ready := false.B
 
   readSelQ.io.enq.valid := false.B
   readSelQ.io.enq.bits := 0.U
@@ -232,6 +266,10 @@ class ExtAccSubBankAdapter[T <: Data: Arithmetic, U <: Data](
     io.ext(s).write.valid := false.B
     io.ext(s).write.bits := DontCare
     io.ext(s).write.bits.exwrite := false.B
+    io.ext(s).grant.valid := false.B
+    io.ext(s).grant.bits := false.B
+    io.ext(s).remind.valid := false.B
+    io.ext(s).remind.bits := false.B
   }
 
   val readSel = subIdx(io.bank.read.req.bits.addr)
@@ -297,6 +335,28 @@ class ExtAccSubBankAdapter[T <: Data: Arithmetic, U <: Data](
       io.ext(s).write.bits.acc := io.bank.write.bits.acc
       io.ext(s).write.bits.mask := io.bank.write.bits.mask
       io.ext(s).write.bits.exwrite := io.bank.write.bits.exwrite
+    }
+  }
+
+  val grantSel = subIdx(io.bank.grant.bits.addr)
+  val grantSelOH = if (subBanks == 1) 1.U(1.W) else UIntToOH(grantSel, subBanks)
+  val selectedGrantReady = Mux1H(grantSelOH.asBools.zip(io.ext.map(_.grant.ready)))
+  io.bank.grant.ready := selectedGrantReady
+  for (s <- 0 until subBanks) {
+    when (grantSelOH(s)) {
+      io.ext(s).grant.valid := io.bank.grant.valid
+      io.ext(s).grant.bits := true.B
+    }
+  }
+
+  val remindSel = subIdx(io.bank.remind.bits.addr)
+  val remindSelOH = if (subBanks == 1) 1.U(1.W) else UIntToOH(remindSel, subBanks)
+  val selectedRemindReady = Mux1H(remindSelOH.asBools.zip(io.ext.map(_.remind.ready)))
+  io.bank.remind.ready := selectedRemindReady
+  for (s <- 0 until subBanks) {
+    when (remindSelOH(s)) {
+      io.ext(s).remind.valid := io.bank.remind.valid
+      io.ext(s).remind.bits := true.B
     }
   }
 }
@@ -485,6 +545,16 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
           acc_bank_entries, Vec(meshColumns, Vec(tileColumns, accType))
         ))))
       }
+
+      val exwrite_grant = if (use_shared_ext_mem) Some(new Bundle {
+        val spad = Flipped(Vec(sp_banks, Decoupled(new BankExWriteGrantReq(sp_bank_entries))))
+        val acc = Flipped(Vec(acc_banks, Decoupled(new BankExWriteGrantReq(acc_bank_entries))))
+      }) else None
+
+      val exwrite_remind = if (use_shared_ext_mem) Some(new Bundle {
+        val spad = Flipped(Vec(sp_banks, Decoupled(new BankExWriteRemindReq(sp_bank_entries))))
+        val acc = Flipped(Vec(acc_banks, Decoupled(new BankExWriteRemindReq(acc_bank_entries))))
+      }) else None
 
       val ext_mem = if (use_shared_ext_mem) {
         // changed
@@ -823,6 +893,12 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         io.ext_mem.get.spad(i) <> adapter.io.ext
       }
       val bank_ios = spad_adapters.map(_.io.bank)
+      bank_ios.zip(io.exwrite_grant.get.spad).foreach { case (bio, grant) =>
+        bio.grant <> grant
+      }
+      bank_ios.zip(io.exwrite_remind.get.spad).foreach { case (bio, remind) =>
+        bio.remind <> remind
+      }
       bank_ios.zipWithIndex.foreach { case (bio, i) =>
 
         val ex_read_req = io.srams.read(i).req
@@ -1216,6 +1292,12 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         io.ext_mem.get.acc(i) <> adapter.io.ext
       }
       val bank_ios = VecInit(acc_adapters.map(_.io.bank))
+      (bank_ios zip io.exwrite_grant.get.acc).foreach { case (bio, grant) =>
+        bio.grant <> grant
+      }
+      (bank_ios zip io.exwrite_remind.get.acc).foreach { case (bio, remind) =>
+        bio.remind <> remind
+      }
 
       // Getting the output of the bank that's about to be issued to the writer
       val bank_issued_io = bank_ios(write_issue_q.io.deq.bits.laddr.acc_bank())

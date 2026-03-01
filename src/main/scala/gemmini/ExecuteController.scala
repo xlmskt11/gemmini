@@ -25,6 +25,8 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val srams = new Bundle {
       val read = Vec(sp_banks, new ScratchpadReadIO(sp_bank_entries, sp_width))
       val write = Vec(sp_banks, new ScratchpadWriteIO(sp_bank_entries, sp_width, (sp_width / (aligned_to * 8)) max 1))
+      val grant = if (use_shared_ext_mem) Some(Vec(sp_banks, Decoupled(new BankExWriteGrantReq(sp_bank_entries)))) else None
+      val remind = if (use_shared_ext_mem) Some(Vec(sp_banks, Decoupled(new BankExWriteRemindReq(sp_bank_entries)))) else None
     }
 
     val acc = new Bundle {
@@ -39,6 +41,8 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
       // val write = Vec(acc_banks, new AccumulatorWriteIO(acc_bank_entries, Vec(meshColumns, Vec(tileColumns, accType))))
       val write = Vec(acc_banks, Decoupled(new AccumulatorWriteReq(acc_bank_entries, Vec(meshColumns, Vec(tileColumns, accType)))))
+      val grant = if (use_shared_ext_mem) Some(Vec(acc_banks, Decoupled(new BankExWriteGrantReq(acc_bank_entries)))) else None
+      val remind = if (use_shared_ext_mem) Some(Vec(acc_banks, Decoupled(new BankExWriteRemindReq(acc_bank_entries)))) else None
     }
 
     val completed = Valid(UInt(log2Up(reservation_station_entries).W))
@@ -50,6 +54,20 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   })
 
   val block_size = meshRows*tileRows
+  val exwrite_reservation_cycles = ((meshRows + meshColumns - 1) * (tile_latency + 1) + mesh_output_delay) max 1
+  val exwrite_buffer_capacity = 8
+  val exwrite_remind_lead_cycles = 2 * exwrite_buffer_capacity
+  val exwrite_remind_delay = (exwrite_reservation_cycles - exwrite_remind_lead_cycles) max 0
+
+  private def spSubBankIdx(addr: UInt): UInt = {
+    val subBits = log2Ceil(sp_sub_banks)
+    if (sp_sub_banks == 1) 0.U((1 max subBits).W) else addr(subBits - 1, 0)
+  }
+
+  private def accSubBankIdx(addr: UInt): UInt = {
+    val subBits = log2Ceil(acc_sub_banks)
+    if (acc_sub_banks == 1) 0.U((1 max subBits).W) else addr(subBits - 1, 0)
+  }
 
   val mesh_tag = new Bundle with TagQueueTag {
     val rob_id = UDValid(UInt(log2Up(reservation_station_entries).W))
@@ -172,6 +190,13 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val c_cols = rs2s(preload_cmd_place)(32 + log2Up(block_size + 1) - 1, 32) // TODO magic numbers
   val c_rows = rs2s(preload_cmd_place)(48 + log2Up(block_size + 1) - 1, 48) // TODO magic numbers
 
+  // "A" stride variables
+  val a_addr_offset = Reg(UInt((16 + log2Up(block_size)).W))
+  val a_addr_stride = Reg(UInt(16.W)) // TODO magic numbers
+
+  // "C" stride variables
+  val c_addr_stride = Reg(UInt(16.W)) // TODO magic numbers
+
   // Dependency stuff
   io.completed.valid := false.B
   io.completed.bits := DontCare
@@ -189,6 +214,88 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val cntl_ready = mesh_cntl_signals_q.io.enq.ready
   val cntl_valid = mesh_cntl_signals_q.io.deq.valid
   val cntl = mesh_cntl_signals_q.io.deq.bits
+  val grant_output_counter = if (use_shared_ext_mem) Some(RegInit(0.U(log2Up(block_size).W))) else None
+  val next_mesh_row_has_data = cntl.a_fire || cntl.b_fire || cntl.d_fire
+
+  val grant_ready_for_next_row = WireInit(true.B)
+  if (use_shared_ext_mem) {
+    io.srams.grant.get.foreach { r =>
+      r.valid := false.B
+      r.bits := DontCare
+    }
+    io.acc.grant.get.foreach { r =>
+      r.valid := false.B
+      r.bits := DontCare
+    }
+    io.srams.remind.get.foreach { r =>
+      r.valid := false.B
+      r.bits := DontCare
+    }
+    io.acc.remind.get.foreach { r =>
+      r.valid := false.B
+      r.bits := DontCare
+    }
+
+    val pred_total_output_rows = cntl.total_rows
+    val pred_w_address = Mux(current_dataflow === Dataflow.WS.id.U,
+      cntl.c_addr + grant_output_counter.get * c_addr_stride,
+      cntl.c_addr + (pred_total_output_rows - 1.U - grant_output_counter.get * c_addr_stride))
+    val pred_write_to_acc = pred_w_address.is_acc_addr
+    val pred_write_this_row = Mux(current_dataflow === Dataflow.WS.id.U,
+      grant_output_counter.get < cntl.c_rows,
+      pred_total_output_rows - 1.U - grant_output_counter.get < cntl.c_rows)
+    val pred_will_execute_write = cntl_valid && next_mesh_row_has_data &&
+      cntl.rob_id.valid && !cntl.c_addr.is_garbage() && pred_write_this_row
+
+    val pred_spad_bank = pred_w_address.sp_bank()
+    val pred_acc_bank = pred_w_address.acc_bank()
+    val pred_spad_row = pred_w_address.sp_row()
+    val pred_acc_row = pred_w_address.acc_row()
+
+    for (i <- 0 until sp_banks) {
+      io.srams.grant.get(i).valid := pred_will_execute_write && ex_write_to_spad.B && !pred_write_to_acc && pred_spad_bank === i.U
+      io.srams.grant.get(i).bits.addr := pred_spad_row
+    }
+    for (i <- 0 until acc_banks) {
+      io.acc.grant.get(i).valid := pred_will_execute_write && ex_write_to_acc.B && pred_write_to_acc && pred_acc_bank === i.U
+      io.acc.grant.get(i).bits.addr := pred_acc_row
+    }
+
+    val spadGrantNeed = pred_will_execute_write && ex_write_to_spad.B && !pred_write_to_acc
+    val accGrantNeed = pred_will_execute_write && ex_write_to_acc.B && pred_write_to_acc
+    val spadGrantReady = if (sp_banks == 1) io.srams.grant.get.head.ready else Mux1H(UIntToOH(pred_spad_bank, sp_banks), io.srams.grant.get.map(_.ready))
+    val accGrantReady = if (acc_banks == 1) io.acc.grant.get.head.ready else Mux1H(UIntToOH(pred_acc_bank, acc_banks), io.acc.grant.get.map(_.ready))
+
+    when (spadGrantNeed) {
+      grant_ready_for_next_row := spadGrantReady
+    }.elsewhen (accGrantNeed) {
+      grant_ready_for_next_row := accGrantReady
+    }
+
+    class ExwriteRemindEvent extends Bundle {
+      val toAcc = Bool()
+      val bank = UInt((1 max log2Ceil(sp_banks max acc_banks)).W)
+      val row = UInt((1 max log2Ceil(sp_bank_entries max acc_bank_entries)).W)
+    }
+
+    val remindEventIn = Wire(Valid(new ExwriteRemindEvent))
+    remindEventIn.valid := mesh_cntl_signals_q.io.deq.fire && pred_will_execute_write
+    remindEventIn.bits.toAcc := pred_write_to_acc
+    remindEventIn.bits.bank := Mux(pred_write_to_acc, pred_acc_bank, pred_spad_bank)
+    remindEventIn.bits.row := Mux(pred_write_to_acc, pred_acc_row, pred_spad_row)
+
+    val remindEvent = if (exwrite_remind_delay == 0) remindEventIn else ShiftRegister(remindEventIn, exwrite_remind_delay)
+
+    for (i <- 0 until sp_banks) {
+      io.srams.remind.get(i).valid := remindEvent.valid && !remindEvent.bits.toAcc && remindEvent.bits.bank === i.U
+      io.srams.remind.get(i).bits.addr := remindEvent.bits.row((1 max log2Ceil(sp_bank_entries)) - 1, 0)
+    }
+    for (i <- 0 until acc_banks) {
+      io.acc.remind.get(i).valid := remindEvent.valid && remindEvent.bits.toAcc && remindEvent.bits.bank === i.U
+      io.acc.remind.get(i).bits.addr := remindEvent.bits.row((1 max log2Ceil(acc_bank_entries)) - 1, 0)
+    }
+  }
+  // val issue_ready = if (use_shared_ext_mem) cntl_ready && grant_ready_for_next_row else cntl_ready
 
   // Instantiate the actual mesh
   val mesh = Module(new MeshWithDelays(inputType, spatialArrayOutputType, accType, mesh_tag, dataflow, tree_reduction, tile_latency, mesh_output_delay,
@@ -248,13 +355,6 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val a_fire_started = RegInit(false.B)
   val d_fire_started = RegInit(false.B)
   val b_fire_started = RegInit(false.B)
-
-  // "A" stride variables
-  val a_addr_offset = Reg(UInt((16 + log2Up(block_size)).W))
-  val a_addr_stride = Reg(UInt(16.W)) // TODO magic numbers
-
-  // "C" stride variables
-  val c_addr_stride = Reg(UInt(16.W)) // TODO magic numbers
 
   val a_address = a_address_rs1 + a_addr_offset
   val b_address = b_address_rs2 + b_fire_counter
@@ -826,7 +926,8 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   mesh_cntl_signals_q.io.deq.ready := (!cntl.a_fire || mesh.io.a.fire || !mesh.io.a.ready) &&
     (!cntl.b_fire || mesh.io.b.fire || !mesh.io.b.ready) &&
     (!cntl.d_fire || mesh.io.d.fire || !mesh.io.d.ready) &&
-    (!cntl.first || mesh.io.req.ready)
+    (!cntl.first || mesh.io.req.ready) &&
+    grant_ready_for_next_row
 
   val dataA_valid = cntl.a_garbage || cntl.a_unpadded_cols === 0.U || Mux(cntl.im2colling, im2ColValid, Mux(cntl.a_read_from_acc, accReadValid(cntl.a_bank_acc), readValid(cntl.a_bank)))
 
@@ -975,6 +1076,12 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     }
 
     assert(!(io.acc.write(i).valid && !io.acc.write(i).ready), "Execute controller write to AccumulatorMem was skipped")
+  }
+
+  if (use_shared_ext_mem) {
+    when (mesh_cntl_signals_q.io.deq.fire && next_mesh_row_has_data && cntl.rob_id.valid) {
+      grant_output_counter.get := wrappingAdd(grant_output_counter.get, 1.U, cntl.total_rows)
+    }
   }
 
   // Handle dependencies and turn off outputs for garbage addresses

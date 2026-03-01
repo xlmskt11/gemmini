@@ -299,6 +299,12 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   spad.module.io.acc.read_req <> ex_controller.io.acc.read_req
   ex_controller.io.acc.read_resp <> spad.module.io.acc.read_resp
   ex_controller.io.acc.write <> spad.module.io.acc.write
+  if (use_shared_ext_mem) {
+    ex_controller.io.srams.grant.get <> spad.module.io.exwrite_grant.get.spad
+    ex_controller.io.acc.grant.get <> spad.module.io.exwrite_grant.get.acc
+    ex_controller.io.srams.remind.get <> spad.module.io.exwrite_remind.get.spad
+    ex_controller.io.acc.remind.get <> spad.module.io.exwrite_remind.get.acc
+  }
 
   // Im2Col unit
   val im2col = withClock (gated_clock) { Module(new Im2Col(outer.config)) }

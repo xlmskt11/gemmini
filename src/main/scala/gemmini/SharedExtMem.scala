@@ -63,9 +63,19 @@ class ExtScratchpadWriteReq(val n: Int, val w: Int, val mask_len: Int) extends B
   val exwrite = Output(Bool())
 }
 
+class BankExWriteGrantReq(val n: Int) extends Bundle {
+  val addr = UInt(log2Ceil(n).W)
+}
+
+class BankExWriteRemindReq(val n: Int) extends Bundle {
+  val addr = UInt(log2Ceil(n).W)
+}
+
 class ExtScratchpadBankIO(val n: Int, val w: Int, val mask_len: Int, val capacity: Int) extends Bundle {
   val read = new ExtScratchpadReadIO(n, w)
   val write = Decoupled(new ExtScratchpadWriteReq(n, w, mask_len))
+  val grant = Decoupled(Bool())
+  val remind = Decoupled(Bool())
   val nSpace = Input(UInt(log2Ceil(capacity + 1).W))
 }
 
@@ -99,6 +109,8 @@ class ExtAccumulatorWriteReq[T <: Data: Arithmetic](n: Int, t: Vec[Vec[T]]) exte
 class ExtAccumulatorBankIO[T <: Data: Arithmetic](n: Int, t: Vec[Vec[T]], capacity: Int) extends Bundle {
   val read = new ExtAccumulatorReadIO(n, t)
   val write = Decoupled(new ExtAccumulatorWriteReq(n, t))
+  val grant = Decoupled(Bool())
+  val remind = Decoupled(Bool())
   val nSpace = Input(UInt(log2Ceil(capacity + 1).W))
 }
 
@@ -162,6 +174,113 @@ class ExtScratchpadBank(nSharers: Int, n: Int, w: Int, aligned_to: Int, single_p
   circbuffer.io.flush := false.B
   io.in.foreach(_.nSpace := circbuffer.io.nSpace)
 
+  private val countBits = log2Ceil((2 * buffer_capacity * nSharers) + buffer_capacity + 2)
+  private val reqCountBits = log2Ceil(nSharers + 1)
+  private val comingWindow = 2 * buffer_capacity
+
+  val gSpace = RegInit(buffer_capacity.U(log2Ceil(buffer_capacity + 1).W))
+  val comingRegs = RegInit(VecInit(Seq.fill(comingWindow)(0.U(reqCountBits.W))))
+  val comingPtr = RegInit(0.U((1 max log2Ceil(comingWindow)).W))
+  val grantRrPtr = RegInit(0.U((1 max log2Ceil(nSharers)).W))
+
+  val availableGrant = Mux(gSpace >= nSharers.U, nSharers.U, gSpace)
+
+  val grantReqMask = VecInit(io.in.map(_.grant.valid)).asUInt
+  val grantReqMaskRR = grantReqMask.rotateRight(grantRrPtr)
+  val grantCandRemaining = Wire(Vec(nSharers + 1, UInt(nSharers.W)))
+  val grantSelectedMask = Wire(Vec(nSharers + 1, UInt(nSharers.W)))
+  val grantSelectedCount = Wire(Vec(nSharers + 1, UInt(reqCountBits.W)))
+  grantCandRemaining(0) := grantReqMaskRR
+  grantSelectedMask(0) := 0.U
+  grantSelectedCount(0) := 0.U
+  for (i <- 0 until nSharers) {
+    val pickOH = PriorityEncoderOH(grantCandRemaining(i))
+    val canGrant = pickOH.orR && (grantSelectedCount(i) < availableGrant)
+    val grantOH = Mux(canGrant, pickOH, 0.U(nSharers.W))
+    grantSelectedMask(i + 1) := grantSelectedMask(i) | grantOH
+    grantCandRemaining(i + 1) := grantCandRemaining(i) & ~grantOH
+    grantSelectedCount(i + 1) := grantSelectedCount(i) + canGrant
+  }
+  val grantSelectedMaskRR = grantSelectedMask(nSharers)
+  val grantSelectedMaskOrig = grantSelectedMaskRR.rotateLeft(grantRrPtr)
+  val grantSelected = grantSelectedMaskOrig.asBools
+
+  for (i <- 0 until nSharers) {
+    io.in(i).grant.ready := grantSelected(i)
+    io.in(i).remind.ready := true.B
+  }
+
+  val grantedCount = PopCount(VecInit(io.in.map(_.grant.fire)))
+  val remindedCount = PopCount(VecInit(io.in.map(_.remind.fire)))
+  val rrAdvance = Mux(grantedCount === nSharers.U, 0.U, grantedCount)
+  when (grantedCount =/= 0.U) {
+    grantRrPtr := wrappingAdd(grantRrPtr, rrAdvance, nSharers)
+  }
+
+  val maxComingExcess = Wire(UInt(countBits.W))
+  if (comingWindow > 1) {
+    val snPrefix = Wire(Vec(comingWindow, UInt(countBits.W)))
+    val snExcess = Wire(Vec(comingWindow, UInt(countBits.W)))
+    val snMax = Wire(Vec(comingWindow, UInt(countBits.W)))
+    snPrefix(0) := 0.U
+    snExcess(0) := 0.U
+    snMax(0) := 0.U
+    for (h <- 1 until comingWindow) {
+      val idx = wrappingAdd(comingPtr, h.U, comingWindow)
+      snPrefix(h) := snPrefix(h - 1) +& comingRegs(idx)
+      snExcess(h) := Mux(snPrefix(h) > h.U, snPrefix(h) - h.U, 0.U)
+      snMax(h) := Mux(snExcess(h) > snMax(h - 1), snExcess(h), snMax(h - 1))
+    }
+    maxComingExcess := snMax(comingWindow - 1)
+  } else {
+    maxComingExcess := 0.U
+  }
+
+  val admitRawSigned = circbuffer.io.nSpace.zext + 1.S - maxComingExcess.zext
+  val admitRaw = Mux(admitRawSigned > 0.S, admitRawSigned.asUInt, 0.U)
+  // val availableAdmitWide = Mux(admitRaw > circbuffer.io.nSpace, circbuffer.io.nSpace, admitRaw)
+  val availableAdmit = Mux(admitRaw >= nSharers.U, nSharers.U, admitRaw)
+
+  val exwriteCandidate = VecInit(io.in.map(in => in.write.valid && in.write.bits.exwrite))
+  val nonExWriteCandidate = VecInit(io.in.zip(exwriteCandidate).map { case (in, exw) =>
+    in.write.valid && !in.write.bits.exwrite && !exw && !port_busy_with_exwrite
+  })
+  val readCandidate = VecInit(io.in.zip(exwriteCandidate).map { case (in, exw) =>
+    in.read.req.valid && !exw && !singleport_busy_with_write
+  })
+  val nonExCandidate = VecInit(nonExWriteCandidate.zip(readCandidate).map { case (wC, rC) => wC || rC })
+
+  val nonExCandRemaining = Wire(Vec(nSharers + 1, UInt(nSharers.W)))
+  val nonExSelectedMask = Wire(Vec(nSharers + 1, UInt(nSharers.W)))
+  val nonExSelectedCount = Wire(Vec(nSharers + 1, UInt(reqCountBits.W)))
+  nonExCandRemaining(0) := nonExCandidate.asUInt
+  nonExSelectedMask(0) := 0.U
+  nonExSelectedCount(0) := 0.U
+  for (i <- 0 until nSharers) {
+    val pickOH = PriorityEncoderOH(nonExCandRemaining(i))
+    val canGrant = pickOH.orR && (nonExSelectedCount(i) < availableAdmit)
+    val grantOH = Mux(canGrant, pickOH, 0.U(nSharers.W))
+    nonExSelectedMask(i + 1) := nonExSelectedMask(i) | grantOH
+    nonExCandRemaining(i + 1) := nonExCandRemaining(i) & ~grantOH
+    nonExSelectedCount(i + 1) := nonExSelectedCount(i) + canGrant
+  }
+  val nonExSelected = nonExSelectedMask(nSharers).asBools
+
+  for (i <- 0 until nSharers) {
+    val canTakeNonExWrite = nonExSelected(i) && nonExWriteCandidate(i)
+    val canTakeRead = nonExSelected(i) && readCandidate(i) && !nonExWriteCandidate(i)
+    io.in(i).write.ready := exwriteCandidate(i) || canTakeNonExWrite
+    io.in(i).read.req.ready := canTakeRead
+  }
+  val gSpaceNextRaw = gSpace - grantedCount + 1.U
+  gSpace := Mux(gSpaceNextRaw >= buffer_capacity.U, buffer_capacity.U, gSpaceNextRaw)
+  comingRegs(comingPtr) := remindedCount
+  comingPtr := wrappingAdd(comingPtr, 1.U, comingWindow)
+
+  when (reset.asBool) {
+    gSpace := buffer_capacity.U
+  }
+
   val enqCandidates = Wire(Vec(nSharers, new ExtScratchpadReqWTag(nSharers, n, w, mask_len)))
   for (i <- 0 until nSharers) {
     enqCandidates(i).ren := io.in(i).read.req.fire
@@ -185,7 +304,7 @@ class ExtScratchpadBank(nSharers: Int, n: Int, w: Int, aligned_to: Int, single_p
 
   val mem = SyncReadMem(n, Vec(mask_len, UInt(mask_elem.getWidth.W)))
 
-  when (circbuffer.io.deqValid && circbuffer.io.dataOut.wen) {
+  when (circbuffer.io.deqFire() && circbuffer.io.dataOut.wen) {
     if (aligned_to >= w)
       mem.write(circbuffer.io.dataOut.waddr, circbuffer.io.dataOut.wdata.asTypeOf(Vec(mask_len, mask_elem)), VecInit((~(0.U(mask_len.W))).asBools))
     else
@@ -193,7 +312,7 @@ class ExtScratchpadBank(nSharers: Int, n: Int, w: Int, aligned_to: Int, single_p
   }
 
   val raddr = circbuffer.io.dataOut.raddr
-  val ren = circbuffer.io.dataOut.ren && circbuffer.io.deqValid
+  val ren = circbuffer.io.dataOut.ren && circbuffer.io.deqFire()
   // changed
   val rdata = if (single_ported) {
     assert(!(ren && circbuffer.io.dataOut.wen))
@@ -205,37 +324,36 @@ class ExtScratchpadBank(nSharers: Int, n: Int, w: Int, aligned_to: Int, single_p
   val fromDMA = circbuffer.io.dataOut.fromDMA
 
 
-  class ExtScratchpadReadRespWTag(val nSharers: Int, val w: Int) extends Bundle {
-    val data = UInt(w.W)
-    val fromDMA = Bool()
-    val tag = UInt(log2Ceil(nSharers).W)
-  }
-  val q = Module(new Queue(new ExtScratchpadReadRespWTag(nSharers, w), 1, true, true))
-
-  q.io.enq.valid := RegNext(ren)
-  q.io.enq.bits.data := rdata
-  q.io.enq.bits.fromDMA := RegNext(fromDMA)
-  q.io.enq.bits.tag := RegNext(circbuffer.io.dataOut.tag)
-
-  val q_will_be_empty = (q.io.count +& q.io.enq.fire) - q.io.deq.fire === 0.U
-
-  circbuffer.io.deqReady := q_will_be_empty
-
-  io.in.foreach(_.read.req.ready := (circbuffer.io.nSpace >= nSharers.U) && !singleport_busy_with_write)
-  io.in.zip(port_exwrite).foreach{ case (in, exwrite) =>
-    in.write.ready := (circbuffer.io.nSpace >= nSharers.U) && (exwrite || !port_busy_with_exwrite)
+  val respQs = Seq.fill(nSharers) {
+    Module(new Queue(new ExtScratchpadReadResp(w), 1, true, true))
   }
 
-  // Default all read responses; selected tag is overwritten below.
-  io.in.foreach { in =>
-    in.read.resp.valid := false.B
-    in.read.resp.bits := DontCare
+  val delayed_ren = RegNext(ren, false.B)
+  val delayed_fromDMA = RegNext(fromDMA, false.B)
+  val delayed_tag = RegNext(circbuffer.io.dataOut.tag)
+
+  for (i <- 0 until nSharers) {
+    val q = respQs(i)
+    q.io.enq.valid := delayed_ren && delayed_tag === i.U
+    q.io.enq.bits.data := rdata
+    q.io.enq.bits.fromDMA := delayed_fromDMA
+
+    io.in(i).read.resp.valid := q.io.deq.valid
+    io.in(i).read.resp.bits.data := q.io.deq.bits.data
+    io.in(i).read.resp.bits.fromDMA := q.io.deq.bits.fromDMA
+    q.io.deq.ready := io.in(i).read.resp.ready
   }
 
-  io.in(q.io.deq.bits.tag).read.resp.valid := q.io.deq.valid
-  io.in(q.io.deq.bits.tag).read.resp.bits.data := q.io.deq.bits.data
-  io.in(q.io.deq.bits.tag).read.resp.bits.fromDMA := q.io.deq.bits.fromDMA
-  q.io.deq.ready := io.in(q.io.deq.bits.tag).read.resp.ready
+  val qWillBeEmpty = VecInit(respQs.map { q =>
+    ((q.io.count +& q.io.enq.fire) - q.io.deq.fire) === 0.U
+  })
+  val selectedQueueWillBeEmpty = if (nSharers == 1) {
+    qWillBeEmpty.head
+  } else {
+    Mux1H(UIntToOH(circbuffer.io.dataOut.tag, nSharers), qWillBeEmpty)
+  }
+
+  circbuffer.io.deqReady := !circbuffer.io.dataOut.ren || selectedQueueWillBeEmpty
 }
 
 class ExtAccBank[T <: Data](nSharers: Int, n: Int, t: Vec[Vec[T]], acc_singleported: Boolean, acc_latency: Int, buffer_capacity: Int)
@@ -281,6 +399,113 @@ class ExtAccBank[T <: Data](nSharers: Int, n: Int, t: Vec[Vec[T]], acc_singlepor
   circbuffer.io.enqValid := PopCount(request_accepted)
   circbuffer.io.flush := false.B
   io.in.foreach(_.nSpace := circbuffer.io.nSpace)
+
+  private val countBits = log2Ceil((2 * buffer_capacity * nSharers) + buffer_capacity + 2)
+  private val reqCountBits = log2Ceil(nSharers + 1)
+  private val comingWindow = 2 * buffer_capacity
+
+  val gSpace = RegInit(buffer_capacity.U(log2Ceil(buffer_capacity + 1).W))
+  val comingRegs = RegInit(VecInit(Seq.fill(comingWindow)(0.U(reqCountBits.W))))
+  val comingPtr = RegInit(0.U((1 max log2Ceil(comingWindow)).W))
+  val grantRrPtr = RegInit(0.U((1 max log2Ceil(nSharers)).W))
+
+  val availableGrant = Mux(gSpace >= nSharers.U, nSharers.U, gSpace)
+
+  val grantReqMask = VecInit(io.in.map(_.grant.valid)).asUInt
+  val grantReqMaskRR = grantReqMask.rotateRight(grantRrPtr)
+  val grantCandRemaining = Wire(Vec(nSharers + 1, UInt(nSharers.W)))
+  val grantSelectedMask = Wire(Vec(nSharers + 1, UInt(nSharers.W)))
+  val grantSelectedCount = Wire(Vec(nSharers + 1, UInt(reqCountBits.W)))
+  grantCandRemaining(0) := grantReqMaskRR
+  grantSelectedMask(0) := 0.U
+  grantSelectedCount(0) := 0.U
+  for (i <- 0 until nSharers) {
+    val pickOH = PriorityEncoderOH(grantCandRemaining(i))
+    val canGrant = pickOH.orR && (grantSelectedCount(i) < availableGrant)
+    val grantOH = Mux(canGrant, pickOH, 0.U(nSharers.W))
+    grantSelectedMask(i + 1) := grantSelectedMask(i) | grantOH
+    grantCandRemaining(i + 1) := grantCandRemaining(i) & ~grantOH
+    grantSelectedCount(i + 1) := grantSelectedCount(i) + canGrant
+  }
+  val grantSelectedMaskRR = grantSelectedMask(nSharers)
+  val grantSelectedMaskOrig = grantSelectedMaskRR.rotateLeft(grantRrPtr)
+  val grantSelected = grantSelectedMaskOrig.asBools
+
+  for (i <- 0 until nSharers) {
+    io.in(i).grant.ready := grantSelected(i)
+    io.in(i).remind.ready := true.B
+  }
+
+  val grantedCount = PopCount(VecInit(io.in.map(_.grant.fire)))
+  val remindedCount = PopCount(VecInit(io.in.map(_.remind.fire)))
+  val rrAdvance = Mux(grantedCount === nSharers.U, 0.U, grantedCount)
+  when (grantedCount =/= 0.U) {
+    grantRrPtr := wrappingAdd(grantRrPtr, rrAdvance, nSharers)
+  }
+
+  val maxComingExcess = Wire(UInt(countBits.W))
+  if (comingWindow > 1) {
+    val snPrefix = Wire(Vec(comingWindow, UInt(countBits.W)))
+    val snExcess = Wire(Vec(comingWindow, UInt(countBits.W)))
+    val snMax = Wire(Vec(comingWindow, UInt(countBits.W)))
+    snPrefix(0) := 0.U
+    snExcess(0) := 0.U
+    snMax(0) := 0.U
+    for (h <- 1 until comingWindow) {
+      val idx = wrappingAdd(comingPtr, h.U, comingWindow)
+      snPrefix(h) := snPrefix(h - 1) +& comingRegs(idx)
+      snExcess(h) := Mux(snPrefix(h) > h.U, snPrefix(h) - h.U, 0.U)
+      snMax(h) := Mux(snExcess(h) > snMax(h - 1), snExcess(h), snMax(h - 1))
+    }
+    maxComingExcess := snMax(comingWindow - 1)
+  } else {
+    maxComingExcess := 0.U
+  }
+
+  val admitRawSigned = circbuffer.io.nSpace.zext + 1.S - maxComingExcess.zext
+  val admitRaw = Mux(admitRawSigned > 0.S, admitRawSigned.asUInt, 0.U)
+  // val availableAdmitWide = Mux(admitRaw > circbuffer.io.nSpace, circbuffer.io.nSpace, admitRaw)
+  val availableAdmit = Mux(admitRaw >= nSharers.U, nSharers.U, admitRaw)
+
+  val exwriteCandidate = VecInit(io.in.map(in => in.write.valid && in.write.bits.exwrite))
+  val nonExWriteCandidate = VecInit(io.in.zip(exwriteCandidate).map { case (in, exw) =>
+    in.write.valid && !in.write.bits.exwrite && !exw && !port_busy_with_exwrite
+  })
+  val readCandidate = VecInit(io.in.zip(exwriteCandidate).map { case (in, exw) =>
+    in.read.req.valid && !exw && !singleport_busy_with_write && !readport_busy_with_accread
+  })
+  val nonExCandidate = VecInit(nonExWriteCandidate.zip(readCandidate).map { case (wC, rC) => wC || rC })
+
+  val nonExCandRemaining = Wire(Vec(nSharers + 1, UInt(nSharers.W)))
+  val nonExSelectedMask = Wire(Vec(nSharers + 1, UInt(nSharers.W)))
+  val nonExSelectedCount = Wire(Vec(nSharers + 1, UInt(reqCountBits.W)))
+  nonExCandRemaining(0) := nonExCandidate.asUInt
+  nonExSelectedMask(0) := 0.U
+  nonExSelectedCount(0) := 0.U
+  for (i <- 0 until nSharers) {
+    val pickOH = PriorityEncoderOH(nonExCandRemaining(i))
+    val canGrant = pickOH.orR && (nonExSelectedCount(i) < availableAdmit)
+    val grantOH = Mux(canGrant, pickOH, 0.U(nSharers.W))
+    nonExSelectedMask(i + 1) := nonExSelectedMask(i) | grantOH
+    nonExCandRemaining(i + 1) := nonExCandRemaining(i) & ~grantOH
+    nonExSelectedCount(i + 1) := nonExSelectedCount(i) + canGrant
+  }
+  val nonExSelected = nonExSelectedMask(nSharers).asBools
+
+  for (i <- 0 until nSharers) {
+    val canTakeNonExWrite = nonExSelected(i) && nonExWriteCandidate(i)
+    val canTakeRead = nonExSelected(i) && readCandidate(i) && !nonExWriteCandidate(i)
+    io.in(i).write.ready := exwriteCandidate(i) || canTakeNonExWrite
+    io.in(i).read.req.ready := canTakeRead
+  }
+  val gSpaceNextRaw = gSpace - grantedCount + 1.U
+  gSpace := Mux(gSpaceNextRaw >= buffer_capacity.U, buffer_capacity.U, gSpaceNextRaw)
+  comingRegs(comingPtr) := remindedCount
+  comingPtr := wrappingAdd(comingPtr, 1.U, comingWindow)
+
+  when (reset.asBool) {
+    gSpace := buffer_capacity.U
+  }
 
   val enqCandidates = Wire(Vec(nSharers, new ExtAccumulatorReqWTag(nSharers, n, t)))
   for (i <- 0 until nSharers) {
@@ -463,56 +688,36 @@ class ExtAccBank[T <: Data](nSharers: Int, n: Int, t: Vec[Vec[T]], acc_singlepor
   //   }
   // }
 
-  class ExtAccumulatorReadRespWTag[T <: Data: Arithmetic](nSharers: Int, fullDataType: Vec[Vec[T]]) extends Bundle {
-    val data = fullDataType.cloneType
-    val acc_bank_id = UInt(2.W) // TODO magic number
-    val idx = UInt(2.W)
-    val tag = UInt(log2Ceil(nSharers).W)
+  val respQs = Seq.fill(nSharers) {
+    Module(new Queue(new ExtAccumulatorReadResp[T](t), 1, true, true))
   }
 
-  val q = Module(new Queue(new ExtAccumulatorReadRespWTag(nSharers, t),  1, true, true))
-  q.io.enq.bits.data := rdata_for_read_resp
+  val delayed_read_valid = RegNext(circbuffer.io.deqFire() && circbuffer.io.dataOut.ren, false.B)
+  val delayed_idx = RegNext(circbuffer.io.dataOut.idx, 0.U(2.W))
+  val delayed_tag = RegNext(circbuffer.io.dataOut.tag)
 
-  // q.io.enq.bits.scale := RegNext(io.read.req.bits.scale)
-  // q.io.enq.bits.igelu_qb := RegNext(io.read.req.bits.igelu_qb)
-  // q.io.enq.bits.igelu_qc := RegNext(io.read.req.bits.igelu_qc)
-  // q.io.enq.bits.iexp_qln2 := RegNext(io.read.req.bits.iexp_qln2)
-  // q.io.enq.bits.iexp_qln2_inv := RegNext(io.read.req.bits.iexp_qln2_inv)
-  // q.io.enq.bits.act := RegNext(io.read.req.bits.act)
-  // q.io.enq.bits.fromDMA := RegNext(io.read.req.bits.fromDMA)
-  q.io.enq.bits.acc_bank_id := DontCare
-  q.io.enq.bits.idx := RegNext(circbuffer.io.dataOut.idx)
-  q.io.enq.bits.tag := RegNext(circbuffer.io.dataOut.tag)
-  q.io.enq.valid := RegNext(circbuffer.io.deqFire() && circbuffer.io.dataOut.ren)
+  for (i <- 0 until nSharers) {
+    val q = respQs(i)
+    q.io.enq.valid := delayed_read_valid && delayed_tag === i.U
+    q.io.enq.bits.data := rdata_for_read_resp
+    q.io.enq.bits.acc_bank_id := DontCare
+    q.io.enq.bits.idx := delayed_idx
 
-  val p = q.io.deq
-
-  // Default all read responses; selected tag is overwritten below.
-  io.in.foreach { in =>
-    in.read.resp.valid := false.B
-    in.read.resp.bits := DontCare
+    io.in(i).read.resp.valid := q.io.deq.valid
+    io.in(i).read.resp.bits := q.io.deq.bits
+    q.io.deq.ready := io.in(i).read.resp.ready
   }
 
-  // io.in(q.io.deq.bits.tag).read.resp.valid := q.io.deq.valid
-  // io.in(q.io.deq.bits.tag).read.resp.bits.data := q.io.deq.bits.data
-  // io.in(q.io.deq.bits.tag).read.resp.bits.fromDMA := q.io.deq.bits.fromDMA
-  io.in(p.bits.tag).read.resp.valid := p.valid
-  io.in(p.bits.tag).read.resp.bits.data := p.bits.data
-  io.in(p.bits.tag).read.resp.bits.acc_bank_id := p.bits.acc_bank_id
-  io.in(p.bits.tag).read.resp.bits.idx := p.bits.idx
-  io.in(p.bits.tag).read.resp.valid := p.valid
-  // io.read.resp.bits.fromDMA := p.bits.fromDMA
-  // io.read.resp.bits.igelu_qb := p.bits.igelu_qb
-  // io.read.resp.bits.igelu_qc := p.bits.igelu_qc
-  // io.read.resp.bits.iexp_qln2 := p.bits.iexp_qln2
-  // io.read.resp.bits.iexp_qln2_inv := p.bits.iexp_qln2_inv
-  // io.read.resp.bits.act := p.bits.act
-  // io.read.resp.bits.scale := p.bits.scale
-  p.ready := io.in(p.bits.tag).read.resp.ready
+  val qWillBeEmpty = VecInit(respQs.map { q =>
+    ((q.io.count +& q.io.enq.fire) - q.io.deq.fire) === 0.U
+  })
+  val selectedQueueWillBeEmpty = if (nSharers == 1) {
+    qWillBeEmpty.head
+  } else {
+    Mux1H(UIntToOH(circbuffer.io.dataOut.tag, nSharers), qWillBeEmpty)
+  }
 
-  val q_will_be_empty = (q.io.count +& q.io.enq.fire) - q.io.deq.fire === 0.U
-
-  circbuffer.io.deqReady := (q_will_be_empty && circbuffer.io.dataOut.ren) || (circbuffer.io.dataOut.wen && !pipelined_writes(0).valid)
+  circbuffer.io.deqReady := (selectedQueueWillBeEmpty && circbuffer.io.dataOut.ren) || (circbuffer.io.dataOut.wen && !pipelined_writes(0).valid)
 
   // io.read.req.ready := q_will_be_empty && (
   //     !pipelined_writes.map(r => r.valid && r.bits.addr === io.read.req.bits.addr).reduce(_||_)  &&
@@ -521,11 +726,6 @@ class ExtAccBank[T <: Data](nSharers: Int, n: Int, t: Vec[Vec[T]], acc_singlepor
 
   // io.write.ready := !block_write_req &&
   //   !pipelined_writes.map(r => r.valid && r.bits.addr === io.write.bits.addr && io.write.bits.acc).reduce(_||_)
-
-  io.in.foreach(_.read.req.ready := (circbuffer.io.nSpace >= nSharers.U) && !singleport_busy_with_write && !readport_busy_with_accread)
-  io.in.zip(port_exwrite).foreach{ case (in, exwrite) =>
-    in.write.ready := (circbuffer.io.nSpace >= nSharers.U) && (exwrite || !port_busy_with_exwrite)
-  }
 
   when (reset.asBool) {
     pipelined_writes.foreach(_.valid := false.B)
