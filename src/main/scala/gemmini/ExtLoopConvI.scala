@@ -137,6 +137,9 @@ class LdICompleteControl(
   val isWaitingReg = RegInit(0.U(nSharers.W))
   val currentWaitingWire = Wire(Vec(nSharers, Bool()))
 
+  val currentWaitingMask = currentWaitingWire.asUInt
+  val leavingWaiters = isWaitingReg & ~currentWaitingMask
+
   for (i <- 0 until nSharers) {
     val theresMyGroup = group_data.map(gd => 
       gd.valid && (gd.bits.group_id === io.in(i).ldinput.group_id)
@@ -148,17 +151,11 @@ class LdICompleteControl(
     val isWaiting = !io.in(i).ldinput.idle && !onGoing
     currentWaitingWire(i) := isWaiting
 
-    when (isWaiting && !isWaitingReg(i)) {
-      // new waiting
-      waitMatrix(i) := isWaitingReg
-    } .elsewhen (!isWaiting) {
-      // waiting over
-      waitMatrix(i) := 0.U
-      for (j <- 0 until nSharers) {
-        waitMatrix(j) := waitMatrix(j) & ~(1.U << i)
-      }
-    }
-    val olderThanMeCount = PopCount(waitMatrix(i))
+    val rowWithoutLeavers = waitMatrix(i) & ~leavingWaiters
+    val nextRow = Mux(!isWaiting, 0.U(nSharers.W), Mux(!isWaitingReg(i), isWaitingReg & ~leavingWaiters, rowWithoutLeavers))
+    waitMatrix(i) := nextRow
+
+    val olderThanMeCount = PopCount(nextRow)
     when (isWaiting) {
       weights(i) := (nSharers.U - 1.U) - olderThanMeCount
     } .otherwise {
@@ -166,7 +163,7 @@ class LdICompleteControl(
     }
   }
 
-  isWaitingReg := currentWaitingWire.asUInt
+  isWaitingReg := currentWaitingMask
 
   // Allocate groups to free slots
   val winnerMask = winnersVec.asUInt

@@ -184,7 +184,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val iterator_bitwidth = 16
   val concurrent_loops = 2
   val group_num = nSharers * concurrent_loops
-  val group_w = log2Up(group_num) + 1
+  val group_w = log2Up(group_num)
 
   val ext_loop_ws_io = if (use_shared_res_entries) Some(IO(new LdBExIO(group_w, nSharers, iterator_bitwidth))) else None
   ext_loop_ws_io.foreach(_ <> ext_loop_ws.get)
