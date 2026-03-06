@@ -41,19 +41,23 @@ class ExtSpadMemIO_4(sp_banks: Int, acc_banks: Int, acc_sub_banks: Int) extends 
 }
 
 // single ported multi-port like sram start
-class ExtScratchpadReadReq(val n: Int) extends Bundle {
+class ExtScratchpadReadReq(val n: Int, val max_in_flight_sram: Int) extends Bundle {
   val addr = UInt(log2Ceil(n).W)
   val fromDMA = Bool()
+
+  val idx = UInt(log2Ceil(max_in_flight_sram).W)
 }
 
-class ExtScratchpadReadResp(val w: Int) extends Bundle {
+class ExtScratchpadReadResp(val w: Int, val max_in_flight_sram: Int) extends Bundle {
   val data = UInt(w.W)
   val fromDMA = Bool()
+
+  val idx = UInt(log2Ceil(max_in_flight_sram).W)
 }
 
-class ExtScratchpadReadIO(val n: Int, val w: Int) extends Bundle {
-  val req = Decoupled(new ExtScratchpadReadReq(n))
-  val resp = Flipped(Decoupled(new ExtScratchpadReadResp(w)))
+class ExtScratchpadReadIO(val n: Int, val w: Int, val max_in_flight_sram: Int) extends Bundle {
+  val req = Decoupled(new ExtScratchpadReadReq(n, max_in_flight_sram))
+  val resp = Flipped(Decoupled(new ExtScratchpadReadResp(w, max_in_flight_sram)))
 }
 
 class ExtScratchpadWriteReq(val n: Int, val w: Int, val mask_len: Int) extends Bundle {
@@ -71,31 +75,33 @@ class BankExWriteRemindReq(val n: Int) extends Bundle {
   val addr = UInt(log2Ceil(n).W)
 }
 
-class ExtScratchpadBankIO(val n: Int, val w: Int, val mask_len: Int, val capacity: Int) extends Bundle {
-  val read = new ExtScratchpadReadIO(n, w)
+class ExtScratchpadBankIO(val n: Int, val w: Int, val mask_len: Int, val capacity: Int, val max_in_flight_sram: Int) extends Bundle {
+  val read = new ExtScratchpadReadIO(n, w, max_in_flight_sram)
   val write = Decoupled(new ExtScratchpadWriteReq(n, w, mask_len))
   val grant = Decoupled(Bool())
   val remind = Decoupled(Bool())
   val nSpace = Input(UInt(log2Ceil(capacity + 1).W))
 }
 
-class ExtAccumulatorReadReq(n: Int) extends Bundle {
+class ExtAccumulatorReadReq(n: Int, max_in_flight_sram: Int) extends Bundle {
   val addr = UInt(log2Ceil(n).W)
   val full = Bool() // Whether or not we return the full bitwidth output
+  val fromDMA = Bool()
 
-  val idx = UInt(2.W)
+  val idx = UInt(log2Ceil(max_in_flight_sram).W)
 }
 
-class ExtAccumulatorReadResp[T <: Data: Arithmetic](fullDataType: Vec[Vec[T]]) extends Bundle {
+class ExtAccumulatorReadResp[T <: Data: Arithmetic](fullDataType: Vec[Vec[T]], max_in_flight_sram: Int) extends Bundle {
   val data = fullDataType.cloneType
   val acc_bank_id = UInt(2.W) // TODO magic number
+  val fromDMA = Bool()
 
-  val idx = UInt(2.W)
+  val idx = UInt(log2Ceil(max_in_flight_sram).W)
 }
 
-class ExtAccumulatorReadIO[T <: Data: Arithmetic](n: Int, fullDataType: Vec[Vec[T]]) extends Bundle {
-  val req = Decoupled(new ExtAccumulatorReadReq(n))
-  val resp = Flipped(Decoupled(new ExtAccumulatorReadResp[T](fullDataType)))
+class ExtAccumulatorReadIO[T <: Data: Arithmetic](n: Int, fullDataType: Vec[Vec[T]], max_in_flight_sram: Int) extends Bundle {
+  val req = Decoupled(new ExtAccumulatorReadReq(n, max_in_flight_sram))
+  val resp = Flipped(Decoupled(new ExtAccumulatorReadResp[T](fullDataType, max_in_flight_sram)))
 }
 
 class ExtAccumulatorWriteReq[T <: Data: Arithmetic](n: Int, t: Vec[Vec[T]]) extends Bundle {
@@ -106,17 +112,17 @@ class ExtAccumulatorWriteReq[T <: Data: Arithmetic](n: Int, t: Vec[Vec[T]]) exte
   val exwrite = Bool()
 }
 
-class ExtAccumulatorBankIO[T <: Data: Arithmetic](n: Int, t: Vec[Vec[T]], capacity: Int) extends Bundle {
-  val read = new ExtAccumulatorReadIO(n, t)
+class ExtAccumulatorBankIO[T <: Data: Arithmetic](n: Int, t: Vec[Vec[T]], capacity: Int, max_in_flight_sram: Int) extends Bundle {
+  val read = new ExtAccumulatorReadIO(n, t, max_in_flight_sram)
   val write = Decoupled(new ExtAccumulatorWriteReq(n, t))
   val grant = Decoupled(Bool())
   val remind = Decoupled(Bool())
   val nSpace = Input(UInt(log2Ceil(capacity + 1).W))
 }
 
-class ExtMemIO_new[T <: Data: Arithmetic](sp_banks: Int, sp_sub_banks: Int, sp_n: Int, sp_w: Int, sp_mask_len: Int, sp_capacity: Int, acc_banks: Int, acc_sub_banks: Int, acc_n: Int, acc_t: Vec[Vec[T]], acc_capacity: Int) extends Bundle {
-  val spad = Vec(sp_banks, Vec(sp_sub_banks, new ExtScratchpadBankIO(sp_n, sp_w, sp_mask_len, sp_capacity)))
-  val acc = Vec(acc_banks, Vec(acc_sub_banks, new ExtAccumulatorBankIO(acc_n, acc_t, acc_capacity)))
+class ExtMemIO_new[T <: Data: Arithmetic](sp_banks: Int, sp_sub_banks: Int, sp_n: Int, sp_w: Int, sp_mask_len: Int, sp_capacity: Int, acc_banks: Int, acc_sub_banks: Int, acc_n: Int, acc_t: Vec[Vec[T]], acc_capacity: Int, max_in_flight_sram: Int) extends Bundle {
+  val spad = Vec(sp_banks, Vec(sp_sub_banks, new ExtScratchpadBankIO(sp_n, sp_w, sp_mask_len, sp_capacity, max_in_flight_sram)))
+  val acc = Vec(acc_banks, Vec(acc_sub_banks, new ExtAccumulatorBankIO(acc_n, acc_t, acc_capacity, max_in_flight_sram)))
 }
 
 class AdderSellector(nSharers: Int, banks: Int) extends Module {
@@ -139,7 +145,7 @@ class AdderSellector(nSharers: Int, banks: Int) extends Module {
   }
 }
 
-class ExtScratchpadBank(nSharers: Int, n: Int, w: Int, aligned_to: Int, single_ported: Boolean, buffer_capacity: Int) extends Module {
+class ExtScratchpadBank(nSharers: Int, n: Int, w: Int, aligned_to: Int, single_ported: Boolean, buffer_capacity: Int, max_in_flight_sram: Int) extends Module {
   // This is essentially a pipelined SRAM with the ability to stall pipeline stages
 
   require(w % aligned_to == 0 || w < aligned_to)
@@ -147,7 +153,7 @@ class ExtScratchpadBank(nSharers: Int, n: Int, w: Int, aligned_to: Int, single_p
   val mask_elem = UInt((w min (aligned_to * 8)).W) // What datatype does each mask bit correspond to?
 
   val io = IO(new Bundle {
-    val in = Vec(nSharers, Flipped(new ExtScratchpadBankIO(n, w, mask_len, buffer_capacity)))
+    val in = Vec(nSharers, Flipped(new ExtScratchpadBankIO(n, w, mask_len, buffer_capacity, max_in_flight_sram)))
   })
 
   // When the scratchpad is single-ported, the writes take precedence
@@ -164,6 +170,7 @@ class ExtScratchpadBank(nSharers: Int, n: Int, w: Int, aligned_to: Int, single_p
     val wmask = Vec(mask_len, Bool())
     val fromDMA = Bool()
     val tag = UInt(log2Ceil(nSharers).W)
+    val idx = UInt(log2Ceil(max_in_flight_sram).W)
   }
   
   val circbuffer = Module(new CircularBuffer(new ExtScratchpadReqWTag(nSharers, n, w, mask_len), nSharers, buffer_capacity))
@@ -295,6 +302,7 @@ class ExtScratchpadBank(nSharers: Int, n: Int, w: Int, aligned_to: Int, single_p
     enqCandidates(i).wdata := io.in(i).write.bits.data
     enqCandidates(i).wmask := io.in(i).write.bits.mask
     enqCandidates(i).fromDMA := io.in(i).read.req.bits.fromDMA
+    enqCandidates(i).idx := io.in(i).read.req.bits.idx
     enqCandidates(i).tag := i.U
   }
 
@@ -328,46 +336,31 @@ class ExtScratchpadBank(nSharers: Int, n: Int, w: Int, aligned_to: Int, single_p
 
   val fromDMA = circbuffer.io.dataOut.fromDMA
 
-
-  val respQs = Seq.fill(nSharers) {
-    Module(new Queue(new ExtScratchpadReadResp(w), 1, true, true))
-  }
-
   val delayed_ren = RegNext(ren, false.B)
   val delayed_fromDMA = RegNext(fromDMA, false.B)
   val delayed_tag = RegNext(circbuffer.io.dataOut.tag)
+  val delayed_idx = RegNext(circbuffer.io.dataOut.idx, 0.U(log2Ceil(max_in_flight_sram).W))
 
   for (i <- 0 until nSharers) {
-    val q = respQs(i)
-    q.io.enq.valid := delayed_ren && delayed_tag === i.U
-    q.io.enq.bits.data := rdata
-    q.io.enq.bits.fromDMA := delayed_fromDMA
-
-    io.in(i).read.resp.valid := q.io.deq.valid
-    io.in(i).read.resp.bits.data := q.io.deq.bits.data
-    io.in(i).read.resp.bits.fromDMA := q.io.deq.bits.fromDMA
-    q.io.deq.ready := io.in(i).read.resp.ready
+    io.in(i).read.resp.valid := delayed_ren && delayed_tag === i.U
+    io.in(i).read.resp.bits.data := rdata
+    io.in(i).read.resp.bits.fromDMA := delayed_fromDMA
+    io.in(i).read.resp.bits.idx := delayed_idx
   }
 
-  val qWillBeEmpty = VecInit(respQs.map { q =>
-    ((q.io.count +& q.io.enq.fire) - q.io.deq.fire) === 0.U
-  })
-  val selectedQueueWillBeEmpty = if (nSharers == 1) {
-    qWillBeEmpty.head
-  } else {
-    Mux1H(UIntToOH(circbuffer.io.dataOut.tag, nSharers), qWillBeEmpty)
-  }
+  circbuffer.io.deqReady := true.B
 
-  circbuffer.io.deqReady := !circbuffer.io.dataOut.ren || selectedQueueWillBeEmpty
+  val busy = circbuffer.io.nEnqueued > 0.U
+  dontTouch(busy)
 }
 
-class ExtAccBank[T <: Data](nSharers: Int, n: Int, t: Vec[Vec[T]], acc_singleported: Boolean, acc_latency: Int, buffer_capacity: Int)
+class ExtAccBank[T <: Data](nSharers: Int, n: Int, t: Vec[Vec[T]], acc_singleported: Boolean, acc_latency: Int, buffer_capacity: Int, max_in_flight_sram: Int)
   (implicit ev: Arithmetic[T]) extends Module {
 
   import ev._
   
   val io = IO(new Bundle {
-    val in = Vec(nSharers, Flipped(new ExtAccumulatorBankIO(n, t, buffer_capacity)))
+    val in = Vec(nSharers, Flipped(new ExtAccumulatorBankIO(n, t, buffer_capacity, max_in_flight_sram)))
     val adder = new Bundle {
       val valid = Output(Bool())
       val op1 = Output(t.cloneType)
@@ -388,13 +381,14 @@ class ExtAccBank[T <: Data](nSharers: Int, n: Int, t: Vec[Vec[T]], acc_singlepor
     val ren = Bool()
     val raddr = UInt(log2Ceil(n).W)
     val full = Bool()
-    val idx = UInt(2.W)
+    val idx = UInt(log2Ceil(max_in_flight_sram).W)
     val wen = Bool()
     val waddr = UInt(log2Ceil(n).W)
     val wdata = t.cloneType
     val wmask = Vec(t.getWidth / 8, Bool()) // TODO Use aligned_to here
     val acc = Bool()
     val tag = UInt(log2Ceil(nSharers).W)
+    val fromDMA = Bool()
   }
   
   val circbuffer = Module(new CircularBuffer(new ExtAccumulatorReqWTag(nSharers, n, t), nSharers, buffer_capacity))
@@ -528,6 +522,7 @@ class ExtAccBank[T <: Data](nSharers: Int, n: Int, t: Vec[Vec[T]], acc_singlepor
     enqCandidates(i).wdata := io.in(i).write.bits.data
     enqCandidates(i).wmask := io.in(i).write.bits.mask
     enqCandidates(i).acc := io.in(i).write.bits.acc
+    enqCandidates(i).fromDMA := io.in(i).read.req.bits.fromDMA
     enqCandidates(i).tag := i.U
   }
 
@@ -698,37 +693,21 @@ class ExtAccBank[T <: Data](nSharers: Int, n: Int, t: Vec[Vec[T]], acc_singlepor
   //   }
   // }
 
-  val respQs = Seq.fill(nSharers) {
-    Module(new Queue(new ExtAccumulatorReadResp[T](t), 1, true, true))
-  }
-
   val delayed_read_valid = RegNext(circbuffer.io.deqFire() && circbuffer.io.dataOut.ren, false.B)
-  val delayed_idx = RegNext(circbuffer.io.dataOut.idx, 0.U(2.W))
+  val delayed_idx = RegNext(circbuffer.io.dataOut.idx, 0.U(log2Ceil(max_in_flight_sram).W))
   val delayed_tag = RegNext(circbuffer.io.dataOut.tag)
+  val delayed_fromDMA = RegNext(circbuffer.io.dataOut.fromDMA)
 
   for (i <- 0 until nSharers) {
-    val q = respQs(i)
-    q.io.enq.valid := delayed_read_valid && delayed_tag === i.U
-    q.io.enq.bits.data := rdata_for_read_resp
-    q.io.enq.bits.acc_bank_id := DontCare
-    q.io.enq.bits.idx := delayed_idx
-
-    io.in(i).read.resp.valid := q.io.deq.valid
-    io.in(i).read.resp.bits := q.io.deq.bits
-    q.io.deq.ready := io.in(i).read.resp.ready
-  }
-
-  val qWillBeEmpty = VecInit(respQs.map { q =>
-    ((q.io.count +& q.io.enq.fire) - q.io.deq.fire) === 0.U
-  })
-  val selectedQueueWillBeEmpty = if (nSharers == 1) {
-    qWillBeEmpty.head
-  } else {
-    Mux1H(UIntToOH(circbuffer.io.dataOut.tag, nSharers), qWillBeEmpty)
+    io.in(i).read.resp.valid := delayed_read_valid && delayed_tag === i.U
+    io.in(i).read.resp.bits.data := rdata_for_read_resp
+    io.in(i).read.resp.bits.acc_bank_id := DontCare
+    io.in(i).read.resp.bits.idx := delayed_idx
+    io.in(i).read.resp.bits.fromDMA := delayed_fromDMA
   }
 
   // circbuffer.io.deqReady := (selectedQueueWillBeEmpty && circbuffer.io.dataOut.ren) || (circbuffer.io.dataOut.wen && !pipelined_writes(0).valid)
-  circbuffer.io.deqReady := !circbuffer.io.dataOut.ren || selectedQueueWillBeEmpty
+  circbuffer.io.deqReady := true.B
 
   // io.read.req.ready := q_will_be_empty && (
   //     !pipelined_writes.map(r => r.valid && r.bits.addr === io.read.req.bits.addr).reduce(_||_)  &&
@@ -741,6 +720,9 @@ class ExtAccBank[T <: Data](nSharers: Int, n: Int, t: Vec[Vec[T]], acc_singlepor
   when (reset.asBool) {
     pipelined_writes.foreach(_.valid := false.B)
   }
+
+  val busy = circbuffer.io.nEnqueued > 0.U
+  dontTouch(busy)
 
   // assert(!(io.read.req.valid && io.write.en && io.write.acc), "reading and accumulating simultaneously is not supported")
   // assert(!(io.read.req.fire && io.write.fire && io.read.req.bits.addr === io.write.bits.addr), "reading from and writing to same address is not supported")
@@ -895,7 +877,7 @@ class SharedExtMem(
 }
 
 // made
-class SharedExtMem_4[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, U, V])
+class SharedExtMem_4[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, U, V], max_in_flight_sram: Int)
     (implicit p: Parameters, ev: Arithmetic[T]) extends Module {
   
   import config._
@@ -906,12 +888,12 @@ class SharedExtMem_4[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig
   val acc_row_t = Vec(meshColumns, Vec(tileColumns, accType))
 
   val io = IO(new Bundle {
-    val in = Vec(nSharers, Flipped(new ExtMemIO_new(sp_banks, sp_sub_banks, sp_bank_entries / sp_sub_banks, spad_w, sp_mask_len, 8, acc_banks, acc_sub_banks, acc_bank_entries / acc_sub_banks, acc_row_t, 8)))
+    val in = Vec(nSharers, Flipped(new ExtMemIO_new(sp_banks, sp_sub_banks, sp_bank_entries / sp_sub_banks, spad_w, sp_mask_len, 8, acc_banks, acc_sub_banks, acc_bank_entries / acc_sub_banks, acc_row_t, 8, max_in_flight_sram)))
   })
 
   for (i <- 0 until sp_banks) {
     for (s <- 0 until sp_sub_banks) {
-      val spad_mem = Module(new ExtScratchpadBank(nSharers, sp_bank_entries / sp_sub_banks, spad_w, aligned_to, sp_singleported, 8))
+      val spad_mem = Module(new ExtScratchpadBank(nSharers, sp_bank_entries / sp_sub_banks, spad_w, aligned_to, sp_singleported, 8, max_in_flight_sram))
       for (w <- 0 until nSharers) {
         spad_mem.io.in(w) <> io.in(w).spad(i)(s)
       }
@@ -919,7 +901,7 @@ class SharedExtMem_4[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig
   }
 
   val acc_mems = Seq.tabulate(acc_banks, acc_sub_banks) { (i, s) =>
-    val acc_mem = Module(new ExtAccBank(nSharers, acc_bank_entries / acc_sub_banks, acc_row_t, acc_singleported, acc_latency, 8))
+    val acc_mem = Module(new ExtAccBank(nSharers, acc_bank_entries / acc_sub_banks, acc_row_t, acc_singleported, acc_latency, 8, max_in_flight_sram))
 
     for (w <- 0 until nSharers) {
       acc_mem.io.in(w) <> io.in(w).acc(i)(s)

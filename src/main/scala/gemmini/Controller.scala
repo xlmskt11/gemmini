@@ -58,7 +58,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val spad_w = inputType.getWidth *  block_cols
   val sp_mask_len = (spad_w / (aligned_to * 8)) max 1
   val acc_row_t = Vec(meshColumns, Vec(tileColumns, accType))
-  val ext_mem_io = if (use_shared_ext_mem) Some(IO(new ExtMemIO_new(sp_banks, sp_sub_banks, sp_bank_entries / sp_sub_banks, spad_w, sp_mask_len, 8, acc_banks, acc_sub_banks, acc_bank_entries / acc_sub_banks, acc_row_t, 8))) else None
+  val ext_mem_io = if (use_shared_ext_mem) Some(IO(new ExtMemIO_new(sp_banks, sp_sub_banks, sp_bank_entries / sp_sub_banks, spad_w, sp_mask_len, 8, acc_banks, acc_sub_banks, acc_bank_entries / acc_sub_banks, acc_row_t, 8, (spad_read_delay+2 max 3)))) else None
   ext_mem_io.foreach(_ <> outer.spad.module.io.ext_mem.get)
 
   val tagWidth = 32

@@ -441,7 +441,7 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
         // val acc_data_len = gemmini0.spad.module.acc_mems(0).mask_elem.getWidth
 
         if (gemmini0.config.use_shared_ext_mem) {
-          val shared_mem = Module(new SharedExtMem_4(gemmini0.config))
+          val shared_mem = Module(new SharedExtMem_4(gemmini0.config, (gemmini0.config.spad_read_delay+2 max 3)))
 
           shared_mem.io.in(0) <> gemmini0.module.ext_mem_io.get
           shared_mem.io.in(1) <> gemmini1.module.ext_mem_io.get

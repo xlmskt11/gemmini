@@ -94,15 +94,23 @@ class ScratchpadWriteIO(val n: Int, val w: Int, val mask_len: Int) extends Bundl
   val data = Output(UInt(w.W))
 }
 
-class ExtSpadSubBankAdapter(n: Int, subBanks: Int, w: Int, mask_len: Int, capacity: Int) extends Module {
+class ExtSpadSubBankAdapter(n: Int, subBanks: Int, w: Int, mask_len: Int, capacity: Int, ex_max_in_flight_sram: Int, dma_max_in_flight_sram: Int) extends Module {
   require(subBanks > 0 && isPow2(subBanks))
   require(n % subBanks == 0)
 
   private val subBits = log2Ceil(subBanks)
   private val selWidth = (1 max subBits)
+  private val exPtrW = 1 max log2Ceil(ex_max_in_flight_sram)
+  private val dmaPtrW = 1 max log2Ceil(dma_max_in_flight_sram)
 
   def subIdx(addr: UInt): UInt = if (subBanks == 1) 0.U(selWidth.W) else addr(subBits - 1, 0)
   def subAddr(addr: UInt): UInt = if (subBanks == 1) addr else (addr >> subBits)
+
+  class SpadResultSlot extends Bundle {
+    val valid = Bool()
+    val reserved = Bool()
+    val data = UInt(w.W)
+  }
 
   val io = IO(new Bundle {
     val bank = new Bundle {
@@ -111,10 +119,36 @@ class ExtSpadSubBankAdapter(n: Int, subBanks: Int, w: Int, mask_len: Int, capaci
       val grant = Flipped(Decoupled(new BankExWriteGrantReq(n)))
       val remind = Flipped(Decoupled(new BankExWriteRemindReq(n)))
     }
-    val ext = Vec(subBanks, new ExtScratchpadBankIO(n / subBanks, w, mask_len, capacity))
+    val ext = Vec(subBanks, new ExtScratchpadBankIO(n / subBanks, w, mask_len, capacity, (ex_max_in_flight_sram max dma_max_in_flight_sram)))
   })
 
-  val readSelQ = Module(new Queue(UInt(selWidth.W), capacity, pipe = true, flow = false))
+  val exresultBuffer = RegInit(VecInit(Seq.fill(ex_max_in_flight_sram) {
+    0.U.asTypeOf(new SpadResultSlot)
+  }))
+  val exresultPtr = RegInit(0.U(exPtrW.W))
+  val exenqPtr = RegInit(0.U(exPtrW.W))
+  val dmaresultBuffer = RegInit(VecInit(Seq.fill(dma_max_in_flight_sram) {
+    0.U.asTypeOf(new SpadResultSlot)
+  }))
+  val dmaresultPtr = RegInit(0.U(dmaPtrW.W))
+  val dmaenqPtr = RegInit(0.U(dmaPtrW.W))
+
+  when (reset.asBool) {
+    exresultPtr := 0.U
+    exenqPtr := 0.U
+    dmaresultPtr := 0.U
+    dmaenqPtr := 0.U
+    for (i <- 0 until ex_max_in_flight_sram) {
+      exresultBuffer(i).valid := false.B
+      exresultBuffer(i).reserved := false.B
+      exresultBuffer(i).data := 0.U
+    }
+    for (i <- 0 until dma_max_in_flight_sram) {
+      dmaresultBuffer(i).valid := false.B
+      dmaresultBuffer(i).reserved := false.B
+      dmaresultBuffer(i).data := 0.U
+    }
+  }
 
   io.bank.read.req.ready := false.B
   io.bank.read.resp.valid := false.B
@@ -122,9 +156,6 @@ class ExtSpadSubBankAdapter(n: Int, subBanks: Int, w: Int, mask_len: Int, capaci
   io.bank.write.ready := false.B
   io.bank.grant.ready := false.B
   io.bank.remind.ready := false.B
-  readSelQ.io.enq.valid := false.B
-  readSelQ.io.enq.bits := 0.U
-  readSelQ.io.deq.ready := false.B
 
   for (s <- 0 until subBanks) {
     io.ext(s).read.req.valid := false.B
@@ -143,32 +174,78 @@ class ExtSpadSubBankAdapter(n: Int, subBanks: Int, w: Int, mask_len: Int, capaci
   val readSel = subIdx(io.bank.read.req.bits.addr)
   val readSelOH = if (subBanks == 1) 1.U(1.W) else UIntToOH(readSel, subBanks)
   val selectedReadReady = Mux1H(readSelOH.asBools.zip(io.ext.map(_.read.req.ready)))
+  val selectedresultbufferReady = Mux(
+    io.bank.read.req.bits.fromDMA,
+    !dmaresultBuffer(dmaenqPtr).reserved,
+    !exresultBuffer(exenqPtr).reserved
+  )
+  val selectedidx = Mux(io.bank.read.req.bits.fromDMA, dmaenqPtr, exenqPtr)
 
-  io.bank.read.req.ready := selectedReadReady && readSelQ.io.enq.ready
-  readSelQ.io.enq.valid := io.bank.read.req.valid && selectedReadReady
-  readSelQ.io.enq.bits := readSel
-
-  for (s <- 0 until subBanks) {
-    when (readSelOH(s)) {
-      io.ext(s).read.req.valid := io.bank.read.req.valid && readSelQ.io.enq.ready
-      io.ext(s).read.req.bits.addr := subAddr(io.bank.read.req.bits.addr)
-      io.ext(s).read.req.bits.fromDMA := io.bank.read.req.bits.fromDMA
+  io.bank.read.req.ready := selectedReadReady && selectedresultbufferReady
+  when (io.bank.read.req.valid && selectedReadReady && selectedresultbufferReady) {
+    when (io.bank.read.req.bits.fromDMA) {
+      dmaresultBuffer(dmaenqPtr).reserved := true.B
+      dmaresultBuffer(dmaenqPtr).valid := false.B
+      dmaenqPtr := wrappingAdd(dmaenqPtr, 1.U, dma_max_in_flight_sram)
+    } .otherwise {
+      exresultBuffer(exenqPtr).reserved := true.B
+      exresultBuffer(exenqPtr).valid := false.B
+      exenqPtr := wrappingAdd(exenqPtr, 1.U, ex_max_in_flight_sram)
     }
   }
 
-  val headSelOH = if (subBanks == 1) 1.U(1.W) else UIntToOH(readSelQ.io.deq.bits, subBanks)
-  val selectedRespValid = Mux1H(headSelOH.asBools.zip(io.ext.map(_.read.resp.valid)))
-  val selectedRespBits = Mux1H(headSelOH.asBools.zip(io.ext.map(_.read.resp.bits)))
-
-  io.bank.read.resp.valid := readSelQ.io.deq.valid && selectedRespValid
-  when (readSelQ.io.deq.valid) {
-    io.bank.read.resp.bits := selectedRespBits
-  }
-
-  readSelQ.io.deq.ready := io.bank.read.resp.fire
   for (s <- 0 until subBanks) {
-    io.ext(s).read.resp.ready := readSelQ.io.deq.valid && headSelOH(s) && io.bank.read.resp.ready
+    when (readSelOH(s)) {
+      io.ext(s).read.req.valid := io.bank.read.req.valid && selectedresultbufferReady
+      io.ext(s).read.req.bits.addr := subAddr(io.bank.read.req.bits.addr)
+      io.ext(s).read.req.bits.fromDMA := io.bank.read.req.bits.fromDMA
+      io.ext(s).read.req.bits.idx := selectedidx
+    }
   }
+
+  for (s <- 0 until subBanks) {
+    when (io.ext(s).read.resp.valid) {
+      val slotIdx = io.ext(s).read.resp.bits.idx
+      when (io.ext(s).read.resp.bits.fromDMA) {
+        assert(dmaresultBuffer(slotIdx).reserved, "DMA response arrived for unreserved slot")
+        assert(!dmaresultBuffer(slotIdx).valid, "DMA result buffer overflow")
+        dmaresultBuffer(slotIdx).valid := true.B
+        dmaresultBuffer(slotIdx).data := io.ext(s).read.resp.bits.data
+      } .otherwise {
+        assert(exresultBuffer(slotIdx).reserved, "Ex response arrived for unreserved slot")
+        assert(!exresultBuffer(slotIdx).valid, "Ex result buffer overflow")
+        exresultBuffer(slotIdx).valid := true.B
+        exresultBuffer(slotIdx).data := io.ext(s).read.resp.bits.data
+      }
+    }
+    io.ext(s).read.resp.ready := true.B
+  }
+
+  val exresultWire = Wire(Decoupled(UInt(w.W)))
+  exresultWire.valid := exresultBuffer(exresultPtr).valid
+  exresultWire.bits := exresultBuffer(exresultPtr).data
+  val dmaresultWire = Wire(Decoupled(UInt(w.W)))
+  dmaresultWire.valid := dmaresultBuffer(dmaresultPtr).valid
+  dmaresultWire.bits := dmaresultBuffer(dmaresultPtr).data
+
+  val arb = Module(new Arbiter(UInt(w.W), 2))
+  arb.io.in(0) <> exresultWire
+  arb.io.in(1) <> dmaresultWire
+
+  when (exresultWire.fire) {
+    exresultBuffer(exresultPtr).valid := false.B
+    exresultBuffer(exresultPtr).reserved := false.B
+    exresultPtr := wrappingAdd(exresultPtr, 1.U, ex_max_in_flight_sram)
+  }.elsewhen (dmaresultWire.fire) {
+    dmaresultBuffer(dmaresultPtr).valid := false.B
+    dmaresultBuffer(dmaresultPtr).reserved := false.B
+    dmaresultPtr := wrappingAdd(dmaresultPtr, 1.U, dma_max_in_flight_sram)
+  }
+
+  io.bank.read.resp.valid := arb.io.out.valid
+  io.bank.read.resp.bits.data := arb.io.out.bits
+  io.bank.read.resp.bits.fromDMA := arb.io.chosen === 1.U
+  arb.io.out.ready := io.bank.read.resp.ready
 
   val writeSel = subIdx(io.bank.write.bits.addr)
   val writeSelOH = if (subBanks == 1) 1.U(1.W) else UIntToOH(writeSel, subBanks)
@@ -209,19 +286,23 @@ class ExtSpadSubBankAdapter(n: Int, subBanks: Int, w: Int, mask_len: Int, capaci
 }
 
 class ExtAccSubBankAdapter[T <: Data: Arithmetic, U <: Data](
-  n: Int, t: Vec[Vec[T]], scale_t: U, subBanks: Int, capacity: Int
+  n: Int, t: Vec[Vec[T]], scale_t: U, subBanks: Int, capacity: Int, ex_max_in_flight_sram: Int, dma_max_in_flight_sram: Int
 ) extends Module {
   require(subBanks > 0 && isPow2(subBanks))
   require(n % subBanks == 0)
 
   private val subBits = log2Ceil(subBanks)
   private val selWidth = (1 max subBits)
+  private val exPtrW = 1 max log2Ceil(ex_max_in_flight_sram)
+  private val dmaPtrW = 1 max log2Ceil(dma_max_in_flight_sram)
 
   def subIdx(addr: UInt): UInt = if (subBanks == 1) 0.U(selWidth.W) else addr(subBits - 1, 0)
   def subAddr(addr: UInt): UInt = if (subBanks == 1) addr else (addr >> subBits)
 
-  class AccReadRespMeta extends Bundle {
-    val fromDMA = Bool()
+  class AccResultSlot extends Bundle {
+    val valid = Bool()
+    val reserved = Bool()
+    val data = t.cloneType
     val scale = scale_t.cloneType
     val igelu_qb = t.head.head.cloneType
     val igelu_qc = t.head.head.cloneType
@@ -237,11 +318,48 @@ class ExtAccSubBankAdapter[T <: Data: Arithmetic, U <: Data](
       val grant = Flipped(Decoupled(new BankExWriteGrantReq(n)))
       val remind = Flipped(Decoupled(new BankExWriteRemindReq(n)))
     }
-    val ext = Vec(subBanks, new ExtAccumulatorBankIO(n / subBanks, t, capacity))
+    val ext = Vec(subBanks, new ExtAccumulatorBankIO(n / subBanks, t, capacity, (ex_max_in_flight_sram max dma_max_in_flight_sram)))
   })
 
-  val readSelQ = Module(new Queue(UInt(selWidth.W), capacity, pipe = true, flow = false))
-  val readMetaQ = Module(new Queue(new AccReadRespMeta, capacity, pipe = true, flow = false))
+  val exresultBuffer = RegInit(VecInit(Seq.fill(ex_max_in_flight_sram) {
+    0.U.asTypeOf(new AccResultSlot)
+  }))
+  val exresultPtr = RegInit(0.U(exPtrW.W))
+  val exenqPtr = RegInit(0.U(exPtrW.W))
+  val dmaresultBuffer = RegInit(VecInit(Seq.fill(dma_max_in_flight_sram) {
+    0.U.asTypeOf(new AccResultSlot)
+  }))
+  val dmaresultPtr = RegInit(0.U(dmaPtrW.W))
+  val dmaenqPtr = RegInit(0.U(dmaPtrW.W))
+
+  when (reset.asBool) {
+    exresultPtr := 0.U
+    exenqPtr := 0.U
+    dmaresultPtr := 0.U
+    dmaenqPtr := 0.U
+    for (i <- 0 until ex_max_in_flight_sram) {
+      exresultBuffer(i).valid := false.B
+      exresultBuffer(i).reserved := false.B
+      exresultBuffer(i).data := 0.U.asTypeOf(t.cloneType)
+      exresultBuffer(i).scale := 0.U.asTypeOf(scale_t.cloneType)
+      exresultBuffer(i).igelu_qb := 0.U.asTypeOf(t.head.head.cloneType)
+      exresultBuffer(i).igelu_qc := 0.U.asTypeOf(t.head.head.cloneType)
+      exresultBuffer(i).iexp_qln2 := 0.U.asTypeOf(t.head.head.cloneType)
+      exresultBuffer(i).iexp_qln2_inv := 0.U.asTypeOf(t.head.head.cloneType)
+      exresultBuffer(i).act := 0.U
+    }
+    for (i <- 0 until dma_max_in_flight_sram) {
+      dmaresultBuffer(i).valid := false.B
+      dmaresultBuffer(i).reserved := false.B
+      dmaresultBuffer(i).data := 0.U.asTypeOf(t.cloneType)
+      dmaresultBuffer(i).scale := 0.U.asTypeOf(scale_t.cloneType)
+      dmaresultBuffer(i).igelu_qb := 0.U.asTypeOf(t.head.head.cloneType)
+      dmaresultBuffer(i).igelu_qc := 0.U.asTypeOf(t.head.head.cloneType)
+      dmaresultBuffer(i).iexp_qln2 := 0.U.asTypeOf(t.head.head.cloneType)
+      dmaresultBuffer(i).iexp_qln2_inv := 0.U.asTypeOf(t.head.head.cloneType)
+      dmaresultBuffer(i).act := 0.U
+    }
+  }
 
   io.bank.read.req.ready := false.B
   io.bank.read.resp.valid := false.B
@@ -249,13 +367,6 @@ class ExtAccSubBankAdapter[T <: Data: Arithmetic, U <: Data](
   io.bank.write.ready := false.B
   io.bank.grant.ready := false.B
   io.bank.remind.ready := false.B
-
-  readSelQ.io.enq.valid := false.B
-  readSelQ.io.enq.bits := 0.U
-  readSelQ.io.deq.ready := false.B
-  readMetaQ.io.enq.valid := false.B
-  readMetaQ.io.enq.bits := DontCare
-  readMetaQ.io.deq.ready := false.B
 
   for (s <- 0 until subBanks) {
     io.ext(s).read.req.valid := false.B
@@ -275,50 +386,92 @@ class ExtAccSubBankAdapter[T <: Data: Arithmetic, U <: Data](
   val readSel = subIdx(io.bank.read.req.bits.addr)
   val readSelOH = if (subBanks == 1) 1.U(1.W) else UIntToOH(readSel, subBanks)
   val selectedReadReady = Mux1H(readSelOH.asBools.zip(io.ext.map(_.read.req.ready)))
+  val selectedresultbufferReady = Mux(
+    io.bank.read.req.bits.fromDMA,
+    !dmaresultBuffer(dmaenqPtr).reserved,
+    !exresultBuffer(exenqPtr).reserved
+  )
+  val selectedidx = Mux(io.bank.read.req.bits.fromDMA, dmaenqPtr, exenqPtr)
 
-  io.bank.read.req.ready := selectedReadReady && readSelQ.io.enq.ready && readMetaQ.io.enq.ready
-
-  readSelQ.io.enq.valid := io.bank.read.req.valid && selectedReadReady
-  readSelQ.io.enq.bits := readSel
-  readMetaQ.io.enq.valid := io.bank.read.req.valid && selectedReadReady
-  readMetaQ.io.enq.bits.fromDMA := io.bank.read.req.bits.fromDMA
-  readMetaQ.io.enq.bits.scale := io.bank.read.req.bits.scale
-  readMetaQ.io.enq.bits.igelu_qb := io.bank.read.req.bits.igelu_qb
-  readMetaQ.io.enq.bits.igelu_qc := io.bank.read.req.bits.igelu_qc
-  readMetaQ.io.enq.bits.iexp_qln2 := io.bank.read.req.bits.iexp_qln2
-  readMetaQ.io.enq.bits.iexp_qln2_inv := io.bank.read.req.bits.iexp_qln2_inv
-  readMetaQ.io.enq.bits.act := io.bank.read.req.bits.act
-
-  for (s <- 0 until subBanks) {
-    when (readSelOH(s)) {
-      io.ext(s).read.req.valid := io.bank.read.req.valid && readSelQ.io.enq.ready && readMetaQ.io.enq.ready
-      io.ext(s).read.req.bits.addr := subAddr(io.bank.read.req.bits.addr)
-      io.ext(s).read.req.bits.full := io.bank.read.req.bits.full
-      io.ext(s).read.req.bits.idx := 0.U
+  io.bank.read.req.ready := selectedReadReady && selectedresultbufferReady
+  when (io.bank.read.req.valid && selectedReadReady && selectedresultbufferReady) {
+    when (io.bank.read.req.bits.fromDMA) {
+      dmaresultBuffer(dmaenqPtr).reserved := true.B
+      dmaresultBuffer(dmaenqPtr).valid := false.B
+      dmaresultBuffer(dmaenqPtr).scale := io.bank.read.req.bits.scale
+      dmaresultBuffer(dmaenqPtr).igelu_qb := io.bank.read.req.bits.igelu_qb
+      dmaresultBuffer(dmaenqPtr).igelu_qc := io.bank.read.req.bits.igelu_qc
+      dmaresultBuffer(dmaenqPtr).iexp_qln2 := io.bank.read.req.bits.iexp_qln2
+      dmaresultBuffer(dmaenqPtr).iexp_qln2_inv := io.bank.read.req.bits.iexp_qln2_inv
+      dmaresultBuffer(dmaenqPtr).act := io.bank.read.req.bits.act
+      dmaenqPtr := wrappingAdd(dmaenqPtr, 1.U, dma_max_in_flight_sram)
+    }.otherwise {
+      exresultBuffer(exenqPtr).reserved := true.B
+      exresultBuffer(exenqPtr).valid := false.B
+      exresultBuffer(exenqPtr).scale := io.bank.read.req.bits.scale
+      exresultBuffer(exenqPtr).igelu_qb := io.bank.read.req.bits.igelu_qb
+      exresultBuffer(exenqPtr).igelu_qc := io.bank.read.req.bits.igelu_qc
+      exresultBuffer(exenqPtr).iexp_qln2 := io.bank.read.req.bits.iexp_qln2
+      exresultBuffer(exenqPtr).iexp_qln2_inv := io.bank.read.req.bits.iexp_qln2_inv
+      exresultBuffer(exenqPtr).act := io.bank.read.req.bits.act
+      exenqPtr := wrappingAdd(exenqPtr, 1.U, ex_max_in_flight_sram)
     }
   }
 
-  val headSelOH = if (subBanks == 1) 1.U(1.W) else UIntToOH(readSelQ.io.deq.bits, subBanks)
-  val selectedRespValid = Mux1H(headSelOH.asBools.zip(io.ext.map(_.read.resp.valid)))
-  val selectedRespBits = Mux1H(headSelOH.asBools.zip(io.ext.map(_.read.resp.bits)))
-
-  io.bank.read.resp.valid := readSelQ.io.deq.valid && readMetaQ.io.deq.valid && selectedRespValid
-  when (readSelQ.io.deq.valid && readMetaQ.io.deq.valid) {
-    io.bank.read.resp.bits.data := selectedRespBits.data
-    io.bank.read.resp.bits.fromDMA := readMetaQ.io.deq.bits.fromDMA
-    io.bank.read.resp.bits.scale := readMetaQ.io.deq.bits.scale
-    io.bank.read.resp.bits.igelu_qb := readMetaQ.io.deq.bits.igelu_qb
-    io.bank.read.resp.bits.igelu_qc := readMetaQ.io.deq.bits.igelu_qc
-    io.bank.read.resp.bits.iexp_qln2 := readMetaQ.io.deq.bits.iexp_qln2
-    io.bank.read.resp.bits.iexp_qln2_inv := readMetaQ.io.deq.bits.iexp_qln2_inv
-    io.bank.read.resp.bits.act := readMetaQ.io.deq.bits.act
-    io.bank.read.resp.bits.acc_bank_id := 0.U
+  for (s <- 0 until subBanks) {
+    when (readSelOH(s)) {
+      io.ext(s).read.req.valid := io.bank.read.req.valid && selectedresultbufferReady
+      io.ext(s).read.req.bits.addr := subAddr(io.bank.read.req.bits.addr)
+      io.ext(s).read.req.bits.full := io.bank.read.req.bits.full
+      io.ext(s).read.req.bits.fromDMA := io.bank.read.req.bits.fromDMA
+      io.ext(s).read.req.bits.idx := selectedidx
+    }
   }
 
-  readSelQ.io.deq.ready := io.bank.read.resp.fire
-  readMetaQ.io.deq.ready := io.bank.read.resp.fire
   for (s <- 0 until subBanks) {
-    io.ext(s).read.resp.ready := readSelQ.io.deq.valid && readMetaQ.io.deq.valid && headSelOH(s) && io.bank.read.resp.ready
+    val slotIdx = io.ext(s).read.resp.bits.idx
+    when (io.ext(s).read.resp.valid) {
+      when (io.ext(s).read.resp.bits.fromDMA) {
+        assert(dmaresultBuffer(slotIdx).reserved, "DMA response arrived for unreserved slot")
+        assert(!dmaresultBuffer(slotIdx).valid, "DMA result buffer overflow")
+        dmaresultBuffer(slotIdx).valid := true.B
+        dmaresultBuffer(slotIdx).data := io.ext(s).read.resp.bits.data
+      }.otherwise {
+        assert(exresultBuffer(slotIdx).reserved, "Ex response arrived for unreserved slot")
+        assert(!exresultBuffer(slotIdx).valid, "Ex result buffer overflow")
+        exresultBuffer(slotIdx).valid := true.B
+        exresultBuffer(slotIdx).data := io.ext(s).read.resp.bits.data
+      }
+    }
+    io.ext(s).read.resp.ready := true.B
+  }
+
+  val exHeadValid = exresultBuffer(exresultPtr).valid
+  val dmaHeadValid = dmaresultBuffer(dmaresultPtr).valid
+  val chooseEx = exHeadValid
+  val chooseDma = !chooseEx && dmaHeadValid
+
+  io.bank.read.resp.valid := chooseEx || chooseDma
+  io.bank.read.resp.bits.data := Mux(chooseEx, exresultBuffer(exresultPtr).data, dmaresultBuffer(dmaresultPtr).data)
+  io.bank.read.resp.bits.fromDMA := chooseDma
+  io.bank.read.resp.bits.scale := Mux(chooseEx, exresultBuffer(exresultPtr).scale, dmaresultBuffer(dmaresultPtr).scale)
+  io.bank.read.resp.bits.igelu_qb := Mux(chooseEx, exresultBuffer(exresultPtr).igelu_qb, dmaresultBuffer(dmaresultPtr).igelu_qb)
+  io.bank.read.resp.bits.igelu_qc := Mux(chooseEx, exresultBuffer(exresultPtr).igelu_qc, dmaresultBuffer(dmaresultPtr).igelu_qc)
+  io.bank.read.resp.bits.iexp_qln2 := Mux(chooseEx, exresultBuffer(exresultPtr).iexp_qln2, dmaresultBuffer(dmaresultPtr).iexp_qln2)
+  io.bank.read.resp.bits.iexp_qln2_inv := Mux(chooseEx, exresultBuffer(exresultPtr).iexp_qln2_inv, dmaresultBuffer(dmaresultPtr).iexp_qln2_inv)
+  io.bank.read.resp.bits.act := Mux(chooseEx, exresultBuffer(exresultPtr).act, dmaresultBuffer(dmaresultPtr).act)
+  io.bank.read.resp.bits.acc_bank_id := 0.U
+
+  when (io.bank.read.resp.fire) {
+    when (chooseEx) {
+      exresultBuffer(exresultPtr).valid := false.B
+      exresultBuffer(exresultPtr).reserved := false.B
+      exresultPtr := wrappingAdd(exresultPtr, 1.U, ex_max_in_flight_sram)
+    }.elsewhen (chooseDma) {
+      dmaresultBuffer(dmaresultPtr).valid := false.B
+      dmaresultBuffer(dmaresultPtr).reserved := false.B
+      dmaresultPtr := wrappingAdd(dmaresultPtr, 1.U, dma_max_in_flight_sram)
+    }
   }
 
   val writeSel = subIdx(io.bank.write.bits.addr)
@@ -559,7 +712,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       val ext_mem = if (use_shared_ext_mem) {
         // changed
         // Some(new ExtSpadMemIO(sp_banks, acc_banks, acc_sub_banks))
-        Some(new ExtMemIO_new(sp_banks, sp_sub_banks, sp_bank_entries / sp_sub_banks, spad_w, sp_mask_len, 8, acc_banks, acc_sub_banks, acc_bank_entries / acc_sub_banks, acc_row_t, 8))
+        Some(new ExtMemIO_new(sp_banks, sp_sub_banks, sp_bank_entries / sp_sub_banks, spad_w, sp_mask_len, 8, acc_banks, acc_sub_banks, acc_bank_entries / acc_sub_banks, acc_row_t, 8, (spad_read_delay+2 max 3)))
       } else {
         None
       }
@@ -887,7 +1040,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     else {
       // Reading from the SRAM banks
       val spad_adapters = Seq.fill(sp_banks) {
-        Module(new ExtSpadSubBankAdapter(sp_bank_entries, sp_sub_banks, spad_w, sp_mask_len, 2))
+        Module(new ExtSpadSubBankAdapter(sp_bank_entries, sp_sub_banks, spad_w, sp_mask_len, 8, spad_read_delay+2, 3))
       }
       spad_adapters.zipWithIndex.foreach { case (adapter, i) =>
         io.ext_mem.get.spad(i) <> adapter.io.ext
@@ -1286,7 +1439,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       Some(banks)
     } else {
       val acc_adapters = Seq.fill(acc_banks) {
-        Module(new ExtAccSubBankAdapter(acc_bank_entries, acc_row_t, acc_scale_t.asInstanceOf[V], acc_sub_banks, 2))
+        Module(new ExtAccSubBankAdapter(acc_bank_entries, acc_row_t, acc_scale_t.asInstanceOf[V], acc_sub_banks, 8, spad_read_delay+2, 3))
       }
       acc_adapters.zipWithIndex.foreach { case (adapter, i) =>
         io.ext_mem.get.acc(i) <> adapter.io.ext
