@@ -214,10 +214,41 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val cntl_ready = mesh_cntl_signals_q.io.enq.ready
   val cntl_valid = mesh_cntl_signals_q.io.deq.valid
   val cntl = mesh_cntl_signals_q.io.deq.bits
-  val grant_output_counter = if (use_shared_ext_mem) Some(RegInit(0.U(log2Up(block_size).W))) else None
-  val next_mesh_row_has_data = cntl.a_fire || cntl.b_fire || cntl.d_fire
 
-  val grant_ready_for_next_row = WireInit(true.B)
+  val grant_output_counter = if (use_shared_ext_mem) Some(RegInit(0.U(log2Up(block_size).W))) else None
+  val rowAdvanceReq = WireInit(false.B)
+  val rowAdvanceFire = WireInit(false.B)
+  val rowAdvanceGrantRequired = WireInit(false.B)
+  val rowAdvanceGrantReady = WireInit(false.B)
+
+  class ExwriteGrantCtx extends Bundle {
+    val addr = local_addr_t.cloneType
+    val c_rows = UInt(log2Up(block_size + 1).W)
+    val total_rows = UInt(log2Up(block_size + 1).W)
+    val dataflow = UInt(1.W)
+    val c_addr_stride = UInt(16.W)
+    val rob_valid = Bool()
+  }
+  class ExwriteGranttag extends Bundle {
+    val addr = local_addr_t.cloneType
+    val c_rows = UInt(log2Up(block_size + 1).W)
+    val rob_valid = Bool()
+  }
+  val grantCtx = if (use_shared_ext_mem) Some(Reg(new ExwriteGrantCtx)) else None
+  val tag_delayed = if (use_shared_ext_mem) Some(Reg(Vec(2, new ExwriteGranttag))) else None
+  val grantCtxWire = if (use_shared_ext_mem) Some(Wire(Decoupled(new ExwriteGrantCtx))) else None
+  grantCtxWire.foreach { w =>
+    w.valid := false.B
+    w.bits := DontCare
+    w.ready := false.B
+  }
+
+  class ExwriteRemindEvent extends Bundle {
+    val toAcc = Bool()
+    val bank = UInt((1 max log2Ceil(sp_banks max acc_banks)).W)
+    val row = UInt((1 max log2Ceil(sp_bank_entries max acc_bank_entries)).W)
+  }
+
   if (use_shared_ext_mem) {
     io.srams.grant.get.foreach { r =>
       r.valid := false.B
@@ -236,67 +267,13 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       r.bits := DontCare
     }
 
-    val pred_total_output_rows = cntl.total_rows
-    val pred_w_address = Mux(current_dataflow === Dataflow.WS.id.U,
-      cntl.c_addr + grant_output_counter.get * c_addr_stride,
-      cntl.c_addr + (pred_total_output_rows - 1.U - grant_output_counter.get * c_addr_stride))
-    val pred_write_to_acc = pred_w_address.is_acc_addr
-    val pred_write_this_row = Mux(current_dataflow === Dataflow.WS.id.U,
-      grant_output_counter.get < cntl.c_rows,
-      pred_total_output_rows - 1.U - grant_output_counter.get < cntl.c_rows)
-    val pred_will_execute_write = cntl_valid && next_mesh_row_has_data &&
-      cntl.rob_id.valid && !cntl.c_addr.is_garbage() && pred_write_this_row
-
-    val pred_spad_bank = pred_w_address.sp_bank()
-    val pred_acc_bank = pred_w_address.acc_bank()
-    val pred_spad_row = pred_w_address.sp_row()
-    val pred_acc_row = pred_w_address.acc_row()
-
-    for (i <- 0 until sp_banks) {
-      io.srams.grant.get(i).valid := pred_will_execute_write && ex_write_to_spad.B && !pred_write_to_acc && pred_spad_bank === i.U
-      io.srams.grant.get(i).bits.addr := pred_spad_row
-    }
-    for (i <- 0 until acc_banks) {
-      io.acc.grant.get(i).valid := pred_will_execute_write && ex_write_to_acc.B && pred_write_to_acc && pred_acc_bank === i.U
-      io.acc.grant.get(i).bits.addr := pred_acc_row
-    }
-
-    val spadGrantNeed = pred_will_execute_write && ex_write_to_spad.B && !pred_write_to_acc
-    val accGrantNeed = pred_will_execute_write && ex_write_to_acc.B && pred_write_to_acc
-    val spadGrantReady = if (sp_banks == 1) io.srams.grant.get.head.ready else Mux1H(UIntToOH(pred_spad_bank, sp_banks), io.srams.grant.get.map(_.ready))
-    val accGrantReady = if (acc_banks == 1) io.acc.grant.get.head.ready else Mux1H(UIntToOH(pred_acc_bank, acc_banks), io.acc.grant.get.map(_.ready))
-
-    when (spadGrantNeed) {
-      grant_ready_for_next_row := spadGrantReady
-    }.elsewhen (accGrantNeed) {
-      grant_ready_for_next_row := accGrantReady
-    }
-
-    class ExwriteRemindEvent extends Bundle {
-      val toAcc = Bool()
-      val bank = UInt((1 max log2Ceil(sp_banks max acc_banks)).W)
-      val row = UInt((1 max log2Ceil(sp_bank_entries max acc_bank_entries)).W)
-    }
-
-    val remindEventIn = Wire(Valid(new ExwriteRemindEvent))
-    remindEventIn.valid := mesh_cntl_signals_q.io.deq.fire && pred_will_execute_write
-    remindEventIn.bits.toAcc := pred_write_to_acc
-    remindEventIn.bits.bank := Mux(pred_write_to_acc, pred_acc_bank, pred_spad_bank)
-    remindEventIn.bits.row := Mux(pred_write_to_acc, pred_acc_row, pred_spad_row)
-
-    val remindEvent = if (exwrite_remind_delay == 0) remindEventIn else ShiftRegister(remindEventIn, exwrite_remind_delay)
-
-    for (i <- 0 until sp_banks) {
-      io.srams.remind.get(i).valid := remindEvent.valid && !remindEvent.bits.toAcc && remindEvent.bits.bank === i.U
-      io.srams.remind.get(i).bits.addr := remindEvent.bits.row((1 max log2Ceil(sp_bank_entries)) - 1, 0)
-    }
-    for (i <- 0 until acc_banks) {
-      io.acc.remind.get(i).valid := remindEvent.valid && remindEvent.bits.toAcc && remindEvent.bits.bank === i.U
-      io.acc.remind.get(i).bits.addr := remindEvent.bits.row((1 max log2Ceil(acc_bank_entries)) - 1, 0)
-    }
+    grantCtxWire.get.bits.total_rows := block_size.U
+    grantCtxWire.get.bits.c_rows := cntl.c_rows
+    grantCtxWire.get.bits.rob_valid := cntl.rob_id.valid
+    grantCtxWire.get.bits.dataflow := current_dataflow
+    grantCtxWire.get.bits.c_addr_stride := c_addr_stride
+    grantCtxWire.get.bits.addr := cntl.c_addr
   }
-  // val issue_ready = if (use_shared_ext_mem) cntl_ready && grant_ready_for_next_row else cntl_ready
-
   // Instantiate the actual mesh
   val mesh = Module(new MeshWithDelays(inputType, spatialArrayOutputType, accType, mesh_tag, dataflow, tree_reduction, tile_latency, mesh_output_delay,
     tileRows, tileColumns, meshRows, meshColumns, shifter_banks, shifter_banks))
@@ -305,6 +282,13 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   mesh.io.b.valid := false.B
   mesh.io.d.valid := false.B
   mesh.io.req.valid := control_state === flush
+  if (use_shared_ext_mem) {
+    grantCtxWire.get.valid := control_state === flush
+  }
+  mesh.io.row_advance_grant_required := rowAdvanceGrantRequired
+  mesh.io.row_advance_grant_ready := rowAdvanceGrantReady
+  rowAdvanceReq := mesh.io.row_advance_req
+  rowAdvanceFire := mesh.io.row_advance_fire
 
   mesh.io.a.bits := DontCare
   mesh.io.b.bits := DontCare
@@ -926,8 +910,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   mesh_cntl_signals_q.io.deq.ready := (!cntl.a_fire || mesh.io.a.fire || !mesh.io.a.ready) &&
     (!cntl.b_fire || mesh.io.b.fire || !mesh.io.b.ready) &&
     (!cntl.d_fire || mesh.io.d.fire || !mesh.io.d.ready) &&
-    (!cntl.first || mesh.io.req.ready) &&
-    grant_ready_for_next_row
+    (!cntl.first || mesh.io.req.ready)
 
   val dataA_valid = cntl.a_garbage || cntl.a_unpadded_cols === 0.U || Mux(cntl.im2colling, im2ColValid, Mux(cntl.a_read_from_acc, accReadValid(cntl.a_bank_acc), readValid(cntl.a_bank)))
 
@@ -955,7 +938,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
   // Pop responses off the scratchpad io ports
   when (mesh_cntl_signals_q.io.deq.fire) {
-    when (cntl.a_fire && mesh.io.a.fire && !cntl.a_garbage && cntl.a_unpadded_cols > 0.U && !cntl.im2colling) {
+    when (cntl.a_fire && (mesh.io.a.fire || !mesh.io.a.ready) && !cntl.a_garbage && cntl.a_unpadded_cols > 0.U && !cntl.im2colling) {
       when (cntl.a_read_from_acc) {
         io.acc.read_resp(cntl.a_bank_acc).ready := !io.acc.read_resp(cntl.a_bank_acc).bits.fromDMA
       }.otherwise {
@@ -963,7 +946,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       }
     }
 
-    when (cntl.b_fire && mesh.io.b.fire && !cntl.b_garbage && !cntl.accumulate_zeros && cntl.b_unpadded_cols > 0.U) {
+    when (cntl.b_fire && (mesh.io.b.fire || !mesh.io.b.ready) && !cntl.b_garbage && !cntl.accumulate_zeros && cntl.b_unpadded_cols > 0.U) {
       when (cntl.b_read_from_acc) {
         io.acc.read_resp(cntl.b_bank_acc).ready := !io.acc.read_resp(cntl.b_bank_acc).bits.fromDMA
       }.otherwise {
@@ -971,7 +954,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       }
     }
 
-    when (cntl.d_fire && mesh.io.d.fire && !cntl.d_garbage && !cntl.preload_zeros && cntl.d_unpadded_cols > 0.U) {
+    when (cntl.d_fire && (mesh.io.d.fire || !mesh.io.d.ready) && !cntl.d_garbage && !cntl.preload_zeros && cntl.d_unpadded_cols > 0.U) {
       when (cntl.d_read_from_acc) {
         io.acc.read_resp(cntl.d_bank_acc).ready := !io.acc.read_resp(cntl.d_bank_acc).bits.fromDMA
       }.otherwise {
@@ -1001,6 +984,12 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     mesh.io.req.bits.tag.addr := cntl.c_addr
 
     mesh.io.req.bits.total_rows := cntl.total_rows
+
+    if (use_shared_ext_mem) {
+      grantCtxWire.get.valid := mesh_cntl_signals_q.io.deq.fire && (cntl.a_fire || cntl.b_fire || cntl.d_fire)
+      grantCtxWire.get.bits.addr := cntl.c_addr
+      grantCtxWire.get.bits.total_rows := cntl.total_rows
+    }
   }
 
   when (cntl_valid && cntl.perform_single_preload) {
@@ -1012,6 +1001,10 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     mesh.io.a.bits := Mux(a_should_be_fed_into_transposer, 0.U, dataA.asUInt).asTypeOf(Vec(meshRows, Vec(tileRows, inputType)))
     mesh.io.b.bits := Mux(b_should_be_fed_into_transposer, 0.U, dataB.asUInt).asTypeOf(Vec(meshColumns, Vec(tileColumns, inputType)))
     mesh.io.req.bits.tag.addr.make_this_garbage()
+
+    if (use_shared_ext_mem) {
+      grantCtxWire.get.bits.addr.make_this_garbage()
+    }
   }
 
   // Scratchpad writes
@@ -1079,8 +1072,77 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   }
 
   if (use_shared_ext_mem) {
-    when (mesh_cntl_signals_q.io.deq.fire && next_mesh_row_has_data && cntl.rob_id.valid) {
-      grant_output_counter.get := wrappingAdd(grant_output_counter.get, 1.U, cntl.total_rows)
+    // when (mesh.io.req.fire) {
+    //   grantCtxWire.get.ready := true.B
+    // }
+    when (mesh.io.req.fire) {
+      grantCtx.get := grantCtxWire.get.bits
+      tag_delayed.get(0).c_rows := grantCtx.get.c_rows
+      tag_delayed.get(0).rob_valid := grantCtx.get.rob_valid
+      tag_delayed.get(0).addr := grantCtx.get.addr
+      tag_delayed.get(1) := tag_delayed.get(0)
+    }
+    val tag_sel_dataflow = Mux(current_dataflow === Dataflow.WS.id.U, tag_delayed.get(0), tag_delayed.get(1))
+
+    
+    val pred_total_output_rows = grantCtx.get.total_rows
+    val pred_w_address = Mux(current_dataflow === Dataflow.WS.id.U,
+      tag_sel_dataflow.addr + grant_output_counter.get * c_addr_stride,
+      tag_sel_dataflow.addr + (pred_total_output_rows - 1.U - grant_output_counter.get * c_addr_stride))
+    val pred_write_to_acc = pred_w_address.is_acc_addr
+    val pred_write_this_row = Mux(current_dataflow === Dataflow.WS.id.U,
+      grant_output_counter.get < tag_sel_dataflow.c_rows,
+      pred_total_output_rows - 1.U - grant_output_counter.get < tag_sel_dataflow.c_rows)
+    val rowNeedsGrant = tag_sel_dataflow.rob_valid &&
+      !tag_sel_dataflow.addr.is_garbage() && pred_write_this_row
+
+    rowAdvanceGrantRequired := rowNeedsGrant
+
+    val pred_spad_bank = pred_w_address.sp_bank()
+    val pred_acc_bank = pred_w_address.acc_bank()
+    val pred_spad_row = pred_w_address.sp_row()
+    val pred_acc_row = pred_w_address.acc_row()
+
+    val spadGrantNeed = rowNeedsGrant && ex_write_to_spad.B && !pred_write_to_acc
+    val accGrantNeed = rowNeedsGrant && ex_write_to_acc.B && pred_write_to_acc
+
+    for (i <- 0 until sp_banks) {
+      io.srams.grant.get(i).valid := rowAdvanceReq && spadGrantNeed && pred_spad_bank === i.U
+      io.srams.grant.get(i).bits.addr := pred_spad_row
+    }
+    for (i <- 0 until acc_banks) {
+      io.acc.grant.get(i).valid := rowAdvanceReq && accGrantNeed && pred_acc_bank === i.U
+      io.acc.grant.get(i).bits.addr := pred_acc_row
+    }
+
+    val spadGrantReady = if (sp_banks == 1) io.srams.grant.get.head.ready else Mux1H(UIntToOH(pred_spad_bank, sp_banks), io.srams.grant.get.map(_.ready))
+    val accGrantReady = if (acc_banks == 1) io.acc.grant.get.head.ready else Mux1H(UIntToOH(pred_acc_bank, acc_banks), io.acc.grant.get.map(_.ready))
+
+    when (rowAdvanceReq && spadGrantNeed) {
+      rowAdvanceGrantReady := spadGrantReady
+    }.elsewhen (rowAdvanceReq && accGrantNeed) {
+      rowAdvanceGrantReady := accGrantReady
+    }
+
+    val remindEventIn = Wire(Valid(new ExwriteRemindEvent))
+    remindEventIn.valid := rowAdvanceFire && rowNeedsGrant
+    remindEventIn.bits.toAcc := pred_write_to_acc
+    remindEventIn.bits.bank := Mux(pred_write_to_acc, pred_acc_bank, pred_spad_bank)
+    remindEventIn.bits.row := Mux(pred_write_to_acc, pred_acc_row, pred_spad_row)
+
+    val remindEvent = if (exwrite_remind_delay == 0) remindEventIn else ShiftRegister(remindEventIn, exwrite_remind_delay)
+
+    for (i <- 0 until sp_banks) {
+      io.srams.remind.get(i).valid := remindEvent.valid && !remindEvent.bits.toAcc && remindEvent.bits.bank === i.U
+      io.srams.remind.get(i).bits.addr := remindEvent.bits.row((1 max log2Ceil(sp_bank_entries)) - 1, 0)
+    }
+    for (i <- 0 until acc_banks) {
+      io.acc.remind.get(i).valid := remindEvent.valid && remindEvent.bits.toAcc && remindEvent.bits.bank === i.U
+      io.acc.remind.get(i).bits.addr := remindEvent.bits.row((1 max log2Ceil(acc_bank_entries)) - 1, 0)
+    }
+
+    when (rowAdvanceFire && tag_sel_dataflow.rob_valid) {
+      grant_output_counter.get := wrappingAdd(grant_output_counter.get, 1.U, pred_total_output_rows)
     }
   }
 

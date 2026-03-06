@@ -65,6 +65,14 @@ class MeshWithDelays[T <: Data: Arithmetic, U <: TagQueueTag with Data]
     val resp = Valid(new MeshWithDelaysResp(outputType, meshColumns, tileColumns, block_size, tagType.cloneType))
 
     val tags_in_progress = Output(Vec(tagqlen, tagType))
+
+    // Row-advance grant handshake from ExecuteController.
+    // When a row is ready to advance into the spatial array, ExecuteController can pause that advance
+    // until shared-ext-mem write reservation is granted.
+    val row_advance_grant_required = Input(Bool())
+    val row_advance_grant_ready = Input(Bool())
+    val row_advance_req = Output(Bool())
+    val row_advance_fire = Output(Bool())
   })
 
   def shifted[T <: Data](x: Vec[Vec[T]], banks: Int, reverse: Boolean = false) = {
@@ -108,8 +116,13 @@ class MeshWithDelays[T <: Data: Arithmetic, U <: TagQueueTag with Data]
   val in_prop = Reg(UInt(1.W)) // TODO inelegant
 
   val input_next_row_into_spatial_array = req.valid && ((a_written && b_written && d_written) || req.bits.flush > 0.U)
+  val wait_for_row_advance_grant = io.row_advance_grant_required && !io.row_advance_grant_ready
+  val input_next_row_into_spatial_array_granted = input_next_row_into_spatial_array && !wait_for_row_advance_grant
 
-  val last_fire = fire_counter === total_fires - 1.U && input_next_row_into_spatial_array
+  io.row_advance_req := input_next_row_into_spatial_array && io.row_advance_grant_required
+  io.row_advance_fire := input_next_row_into_spatial_array_granted
+
+  val last_fire = fire_counter === total_fires - 1.U && input_next_row_into_spatial_array_granted
 
   when (io.req.fire) {
     req.push(io.req.bits)
@@ -120,7 +133,7 @@ class MeshWithDelays[T <: Data: Arithmetic, U <: TagQueueTag with Data]
     req.bits.flush := req.bits.flush - 1.U
   }
 
-  when (input_next_row_into_spatial_array) {
+  when (input_next_row_into_spatial_array_granted) {
     a_written := false.B
     b_written := false.B
     d_written := false.B
@@ -140,13 +153,13 @@ class MeshWithDelays[T <: Data: Arithmetic, U <: TagQueueTag with Data]
     d_written := true.B
   }
 
-  io.a.ready := !a_written || input_next_row_into_spatial_array || io.req.ready
-  io.b.ready := !b_written || input_next_row_into_spatial_array || io.req.ready
-  io.d.ready := !d_written || input_next_row_into_spatial_array || io.req.ready
+  io.a.ready := !a_written || input_next_row_into_spatial_array_granted || io.req.ready
+  io.b.ready := !b_written || input_next_row_into_spatial_array_granted || io.req.ready
+  io.d.ready := !d_written || input_next_row_into_spatial_array_granted || io.req.ready
 
-  assert(req.valid || !input_next_row_into_spatial_array)
+  assert(req.valid || !input_next_row_into_spatial_array_granted)
 
-  val pause = !req.valid || !input_next_row_into_spatial_array
+  val pause = !req.valid || !input_next_row_into_spatial_array_granted
 
   // Transposer
   val a_is_from_transposer = Mux(req.bits.pe_control.dataflow === Dataflow.OS.id.U, !req.bits.a_transpose, req.bits.a_transpose)

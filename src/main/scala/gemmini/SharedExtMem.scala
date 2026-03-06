@@ -272,8 +272,13 @@ class ExtScratchpadBank(nSharers: Int, n: Int, w: Int, aligned_to: Int, single_p
     io.in(i).write.ready := exwriteCandidate(i) || canTakeNonExWrite
     io.in(i).read.req.ready := canTakeRead
   }
-  val gSpaceNextRaw = gSpace - grantedCount + 1.U
-  gSpace := Mux(gSpaceNextRaw >= buffer_capacity.U, buffer_capacity.U, gSpaceNextRaw)
+  when (gSpace === buffer_capacity.U) {
+    gSpace := gSpace - grantedCount
+  }.otherwise {
+    gSpace := gSpace - grantedCount + 1.U
+  }
+  // val gSpaceNextRaw = gSpace - grantedCount + 1.U
+  // gSpace := Mux(gSpaceNextRaw >= buffer_capacity.U, buffer_capacity.U, gSpaceNextRaw)
   comingRegs(comingPtr) := remindedCount
   comingPtr := wrappingAdd(comingPtr, 1.U, comingWindow)
 
@@ -498,8 +503,13 @@ class ExtAccBank[T <: Data](nSharers: Int, n: Int, t: Vec[Vec[T]], acc_singlepor
     io.in(i).write.ready := exwriteCandidate(i) || canTakeNonExWrite
     io.in(i).read.req.ready := canTakeRead
   }
-  val gSpaceNextRaw = gSpace - grantedCount + 1.U
-  gSpace := Mux(gSpaceNextRaw >= buffer_capacity.U, buffer_capacity.U, gSpaceNextRaw)
+  when (gSpace === buffer_capacity.U) {
+    gSpace := gSpace - grantedCount
+  }.otherwise {
+    gSpace := gSpace - grantedCount + 1.U
+  }
+  // val gSpaceNextRaw = gSpace - grantedCount + 1.U
+  // gSpace := Mux(gSpaceNextRaw >= buffer_capacity.U, buffer_capacity.U, gSpaceNextRaw)
   comingRegs(comingPtr) := remindedCount
   comingPtr := wrappingAdd(comingPtr, 1.U, comingWindow)
 
@@ -717,7 +727,8 @@ class ExtAccBank[T <: Data](nSharers: Int, n: Int, t: Vec[Vec[T]], acc_singlepor
     Mux1H(UIntToOH(circbuffer.io.dataOut.tag, nSharers), qWillBeEmpty)
   }
 
-  circbuffer.io.deqReady := (selectedQueueWillBeEmpty && circbuffer.io.dataOut.ren) || (circbuffer.io.dataOut.wen && !pipelined_writes(0).valid)
+  // circbuffer.io.deqReady := (selectedQueueWillBeEmpty && circbuffer.io.dataOut.ren) || (circbuffer.io.dataOut.wen && !pipelined_writes(0).valid)
+  circbuffer.io.deqReady := !circbuffer.io.dataOut.ren || selectedQueueWillBeEmpty
 
   // io.read.req.ready := q_will_be_empty && (
   //     !pipelined_writes.map(r => r.valid && r.bits.addr === io.read.req.bits.addr).reduce(_||_)  &&

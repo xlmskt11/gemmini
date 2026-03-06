@@ -887,7 +887,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     else {
       // Reading from the SRAM banks
       val spad_adapters = Seq.fill(sp_banks) {
-        Module(new ExtSpadSubBankAdapter(sp_bank_entries, sp_sub_banks, spad_w, sp_mask_len, 8))
+        Module(new ExtSpadSubBankAdapter(sp_bank_entries, sp_sub_banks, spad_w, sp_mask_len, 2))
       }
       spad_adapters.zipWithIndex.foreach { case (adapter, i) =>
         io.ext_mem.get.spad(i) <> adapter.io.ext
@@ -1286,7 +1286,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       Some(banks)
     } else {
       val acc_adapters = Seq.fill(acc_banks) {
-        Module(new ExtAccSubBankAdapter(acc_bank_entries, acc_row_t, acc_scale_t.asInstanceOf[V], acc_sub_banks, 8))
+        Module(new ExtAccSubBankAdapter(acc_bank_entries, acc_row_t, acc_scale_t.asInstanceOf[V], acc_sub_banks, 2))
       }
       acc_adapters.zipWithIndex.foreach { case (adapter, i) =>
         io.ext_mem.get.acc(i) <> adapter.io.ext
