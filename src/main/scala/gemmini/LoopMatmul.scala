@@ -935,9 +935,12 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
 
   // Wire up unrolled command output
   val is_loop_run_cmd = cmd.bits.cmd.inst.funct === LOOP_WS
-  // changed
-  // val is_loop_config_cmd = cmd.bits.cmd.inst.funct >= LOOP_WS_CONFIG_BOUNDS && cmd.bits.cmd.inst.funct <= LOOP_WS_CONFIG_STRIDES_DC
-  val is_loop_config_cmd = (cmd.bits.cmd.inst.funct >= LOOP_WS_CONFIG_BOUNDS && cmd.bits.cmd.inst.funct <= LOOP_WS_CONFIG_STRIDES_DC) || (cmd.bits.cmd.inst.funct >= LOOP_WS_CONFIG_MV_BOUNDS_1 && cmd.bits.cmd.inst.funct <= LOOP_WS_CONFIG_SPADDR)
+  val shared_loop_config_cmd = if (use_shared_res_entries) {
+    cmd.bits.cmd.inst.funct >= LOOP_WS_CONFIG_MV_BOUNDS_1 && cmd.bits.cmd.inst.funct <= LOOP_WS_CONFIG_SPADDR
+  } else {
+    false.B
+  }
+  val is_loop_config_cmd = (cmd.bits.cmd.inst.funct >= LOOP_WS_CONFIG_BOUNDS && cmd.bits.cmd.inst.funct <= LOOP_WS_CONFIG_STRIDES_DC) || shared_loop_config_cmd
   val is_loop_cmd = is_loop_run_cmd || is_loop_config_cmd
 
   io.out.bits.cmd := Mux(loop_configured, unrolled_cmd.bits, cmd.bits.cmd)
@@ -950,6 +953,12 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   cmd.ready := Mux(is_loop_cmd, !loop_being_configured.configured, !loop_configured && io.out.ready)
   arb.io.out.ready := io.out.ready
 
+  def sharedResLoopBlocked(loopId: UInt): Bool = if (use_shared_res_entries) {
+    loopId === ldB.io.loop_id && io.ext_loop_ws.get.loop_full && !ldB.io.idle
+  } else {
+    false.B
+  }
+
   // Wire up overloaded signals
   ldA.io.rob_overloaded := ld_utilization >= max_lds.U
   ldB.io.rob_overloaded := ld_utilization >= max_lds.U
@@ -959,13 +968,13 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
 
   // Wire up iterator inputs
   ex.io.lda_completed := (ldA.io.loop_id =/= ex.io.loop_id) || ldA.io.idle
-  ex.io.ldb_completed := (ldB.io.loop_id =/= ex.io.loop_id) || ldB.io.idle
   ex.io.ldd_completed := (ldD.io.loop_id =/= ex.io.loop_id) || ldD.io.idle
   ex.io.ld_ka := ldA.io.k
-  // changed
-  ex.io.ld_kb := ldB.io.k
-  ex.io.ld_j := ldB.io.j
   if (use_shared_res_entries) {
+    ex.io.ldb_completed := DontCare
+    ex.io.ld_kb := DontCare
+    ex.io.ld_j := DontCare
+
     io.ext_loop_ws.get.ldb.k := ldB.io.k
     io.ext_loop_ws.get.ldb.j := ldB.io.j
     io.ext_loop_ws.get.ldb.k_offset := ldB.io.laddrK_offset
@@ -991,15 +1000,15 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
     io.ext_loop_ws.get.ex.group_list := ex.io.group_list
     io.ext_loop_ws.get.ex.idle := ex.io.idle
     ex.io.ldb_ahead := io.ext_loop_ws.get.ldb_ahead
-  } else {
-    ex.io.ldb_ahead := DontCare
-  }
-  if (use_shared_res_entries) {
     io.ext_loop_ws.get.stc.idle := stC.io.idle
     io.ext_loop_ws.get.stc.group_id := stC.io.group_id
-    
+  } else {
+    ex.io.ldb_completed := (ldB.io.loop_id =/= ex.io.loop_id) || ldB.io.idle
+    ex.io.ld_kb := ldB.io.k
+    ex.io.ld_j := ldB.io.j
+
+    ex.io.ldb_ahead := DontCare
   }
-  // end
   stC.io.ex_i := ex.io.i
 
   val loops_configured = RegInit(0.U(16.W))
@@ -1009,24 +1018,26 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   when(cmd.valid && is_loop_cmd && !loop_being_configured.configured) {
 
     switch (cmd.bits.cmd.inst.funct) {
-      // made
       is (LOOP_WS_CONFIG_SPADDR) {
-        loop_being_configured.sp_addr_end := cmd.bits.cmd.rs2(iterator_bitwidth + log2Up(max_addr+1) - 1, iterator_bitwidth)
-        loop_being_configured.sp_addr_start := cmd.bits.cmd.rs2(log2Up(max_addr)-1, 0)   
+        if (use_shared_res_entries) {
+          loop_being_configured.sp_addr_end := cmd.bits.cmd.rs2(iterator_bitwidth + log2Up(max_addr+1) - 1, iterator_bitwidth)
+          loop_being_configured.sp_addr_start := cmd.bits.cmd.rs2(log2Up(max_addr)-1, 0)
 
-        loop_being_configured.acc_addr_start := cmd.bits.cmd.rs1(log2Up(max_acc_addr)-1, 0)
+          loop_being_configured.acc_addr_start := cmd.bits.cmd.rs1(log2Up(max_acc_addr)-1, 0)
+        }
       }
       is (LOOP_WS_CONFIG_MV_BOUNDS_1) {
-        loop_being_configured.mv_K := cmd.bits.cmd.rs2(iterator_bitwidth * 3 - 1, iterator_bitwidth * 2)
-        loop_being_configured.mv_pad_K := cmd.bits.cmd.rs2(iterator_bitwidth * 2 - 1, iterator_bitwidth)
-        loop_being_configured.ex_I := cmd.bits.cmd.rs2(iterator_bitwidth - 1, 0)
+        if (use_shared_res_entries) {
+          loop_being_configured.mv_K := cmd.bits.cmd.rs2(iterator_bitwidth * 3 - 1, iterator_bitwidth * 2)
+          loop_being_configured.mv_pad_K := cmd.bits.cmd.rs2(iterator_bitwidth * 2 - 1, iterator_bitwidth)
+          loop_being_configured.ex_I := cmd.bits.cmd.rs2(iterator_bitwidth - 1, 0)
 
-        loop_being_configured.group_list := cmd.bits.cmd.rs1(iterator_bitwidth * 3 + nSharers - 1, iterator_bitwidth * 3)
-        loop_being_configured.group_id := cmd.bits.cmd.rs1(iterator_bitwidth * 2 + group_w - 1, iterator_bitwidth * 2)
-        loop_being_configured.laddrRB_offset := cmd.bits.cmd.rs1(iterator_bitwidth * 2 - 1, iterator_bitwidth)
-        loop_being_configured.laddrRA_offset := cmd.bits.cmd.rs1(iterator_bitwidth - 1, 0)
+          loop_being_configured.group_list := cmd.bits.cmd.rs1(iterator_bitwidth * 3 + nSharers - 1, iterator_bitwidth * 3)
+          loop_being_configured.group_id := cmd.bits.cmd.rs1(iterator_bitwidth * 2 + group_w - 1, iterator_bitwidth * 2)
+          loop_being_configured.laddrRB_offset := cmd.bits.cmd.rs1(iterator_bitwidth * 2 - 1, iterator_bitwidth)
+          loop_being_configured.laddrRA_offset := cmd.bits.cmd.rs1(iterator_bitwidth - 1, 0)
+        }
       }
-      // made end
       is (LOOP_WS_CONFIG_BOUNDS) {
         loop_being_configured.max_k := cmd.bits.cmd.rs2(iterator_bitwidth * 3 - 1, iterator_bitwidth * 2)
         loop_being_configured.max_j := cmd.bits.cmd.rs2(iterator_bitwidth * 2 - 1, iterator_bitwidth)
@@ -1074,33 +1085,29 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   }
 
   // Wire up request signals
-  val ld_d_addr_start = RegInit(0.U(log2Up(max_acc_addr).W))
-  val ex_c_addr_start = RegInit(0.U(log2Up(max_acc_addr).W))
-  val st_c_addr_start = RegInit(0.U(log2Up(max_acc_addr).W))
+  val ld_d_addr_start = if (use_shared_res_entries) None else Some(RegInit(0.U(log2Up(max_acc_addr).W)))
+  val ex_c_addr_start = if (use_shared_res_entries) None else Some(RegInit(0.U(log2Up(max_acc_addr).W)))
+  val st_c_addr_start = if (use_shared_res_entries) None else Some(RegInit(0.U(log2Up(max_acc_addr).W)))
 
   val loop_requesting_ldA_id = Mux(head_loop.lda_started, tail_loop_id, head_loop_id)
   val loop_requesting_ldA = loops(loop_requesting_ldA_id)
   ldA.io.req.bits.max_k := loop_requesting_ldA.max_k
-  ldA.io.req.bits.max_i := loop_requesting_ldA.ex_I
+  ldA.io.req.bits.max_i := (if (use_shared_res_entries) loop_requesting_ldA.ex_I else loop_requesting_ldA.max_i)
   ldA.io.req.bits.pad_k := loop_requesting_ldA.pad_k
   ldA.io.req.bits.pad_i := loop_requesting_ldA.pad_i
-  // made
   ldA.io.req.bits.max_fi := loop_requesting_ldA.max_i
-  ldA.io.req.bits.laddrR_offset := loop_requesting_ldA.laddrRA_offset
-  // end
   ldA.io.req.bits.dram_addr := loop_requesting_ldA.a_dram_addr
   ldA.io.req.bits.dram_stride := loop_requesting_ldA.a_dram_stride
   ldA.io.req.bits.transpose := loop_requesting_ldA.a_transpose
-  // changed
-  // ldA.io.req.bits.addr_start := loop_requesting_ldA.a_addr_start
+  val ldACanStart = !loop_requesting_ldA.lda_started && loop_requesting_ldA.configured
   if (use_shared_res_entries) {
+    ldA.io.req.bits.laddrR_offset := loop_requesting_ldA.laddrRA_offset
     ldA.io.req.bits.addr_start := loop_requesting_ldA.sp_addr_start
-    ldA.io.req.valid := !loop_requesting_ldA.lda_started && loop_requesting_ldA.configured &&
-      loop_requesting_ldA.ldb_started &&
-      !(loop_requesting_ldA_id === ldB.io.loop_id && io.ext_loop_ws.get.loop_full && !ldB.io.idle)
+    ldA.io.req.valid := ldACanStart && loop_requesting_ldA.ldb_started && !sharedResLoopBlocked(loop_requesting_ldA_id)
   } else {
+    ldA.io.req.bits.laddrR_offset := 0.U
     ldA.io.req.bits.addr_start := loop_requesting_ldA.a_addr_start
-    ldA.io.req.valid := !loop_requesting_ldA.lda_started && loop_requesting_ldA.configured
+    ldA.io.req.valid := ldACanStart
   }
   ldA.io.req.bits.loop_id := loop_requesting_ldA_id
 
@@ -1113,24 +1120,23 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   val loop_requesting_ldB = loops(loop_requesting_ldB_id)
   ldB.io.req.bits.max_j := loop_requesting_ldB.max_j
   ldB.io.req.bits.pad_j := loop_requesting_ldB.pad_j
-  // changed
-  // ldB.io.req.bits.max_k := loop_requesting_ldB.max_k
-  // ldB.io.req.bits.pad_k := loop_requesting_ldB.pad_k
-  ldB.io.req.bits.max_k := loop_requesting_ldB.mv_K
-  ldB.io.req.bits.pad_k := loop_requesting_ldB.mv_pad_K
-  ldB.io.req.bits.max_fk := loop_requesting_ldB.max_k // made
-  ldB.io.req.bits.laddrR_offset := loop_requesting_ldB.laddrRB_offset // made
-  ldB.io.req.bits.group_id := loop_requesting_ldB.group_id // made
-  ldB.io.req.bits.group_list := loop_requesting_ldB.group_list // made
-  // end
+  ldB.io.req.bits.max_fk := loop_requesting_ldB.max_k
   ldB.io.req.bits.dram_addr := loop_requesting_ldB.b_dram_addr
   ldB.io.req.bits.dram_stride := loop_requesting_ldB.b_dram_stride
   ldB.io.req.bits.transpose := loop_requesting_ldB.b_transpose
-  // changed
-  // ldB.io.req.bits.addr_end := loop_requesting_ldB.b_addr_end
   if (use_shared_res_entries) {
+    ldB.io.req.bits.max_k := loop_requesting_ldB.mv_K
+    ldB.io.req.bits.pad_k := loop_requesting_ldB.mv_pad_K
+    ldB.io.req.bits.laddrR_offset := loop_requesting_ldB.laddrRB_offset
+    ldB.io.req.bits.group_id := loop_requesting_ldB.group_id
+    ldB.io.req.bits.group_list := loop_requesting_ldB.group_list
     ldB.io.req.bits.addr_end := loop_requesting_ldB.sp_addr_end
   } else {
+    ldB.io.req.bits.max_k := loop_requesting_ldB.max_k
+    ldB.io.req.bits.pad_k := loop_requesting_ldB.pad_k
+    ldB.io.req.bits.laddrR_offset := 0.U
+    ldB.io.req.bits.group_id := 0.U
+    ldB.io.req.bits.group_list := 0.U
     ldB.io.req.bits.addr_end := loop_requesting_ldB.b_addr_end
   }
   ldB.io.req.bits.loop_id := loop_requesting_ldB_id
@@ -1146,70 +1152,64 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   val loop_requesting_ex = loops(loop_requesting_ex_id)
   ex.io.req.bits.max_j := loop_requesting_ex.max_j
   ex.io.req.bits.max_k := loop_requesting_ex.max_k
-  ex.io.req.bits.max_i := loop_requesting_ex.ex_I
-  ex.io.req.bits.max_fi := loop_requesting_ex.max_i // made
+  ex.io.req.bits.max_i := (if (use_shared_res_entries) loop_requesting_ex.ex_I else loop_requesting_ex.max_i)
+  ex.io.req.bits.max_fi := loop_requesting_ex.max_i
   ex.io.req.bits.pad_j := loop_requesting_ex.pad_j
   ex.io.req.bits.pad_k := loop_requesting_ex.pad_k
   ex.io.req.bits.pad_i := loop_requesting_ex.pad_i
   ex.io.req.bits.accumulate := loop_requesting_ex.ex_accumulate
-  // changed
-  // ex.io.req.bits.a_addr_start := loop_requesting_ex.a_addr_start
-  // ex.io.req.bits.b_addr_end := loop_requesting_ex.b_addr_end
-  // ex.io.req.bits.c_addr_start := ex_c_addr_start
+  val exCanStart = !loop_requesting_ex.ex_started && loop_requesting_ex.lda_started &&
+    loop_requesting_ex.ldb_started && loop_requesting_ex.ldd_started && loop_requesting_ex.configured
   if (use_shared_res_entries) {
     ex.io.req.bits.a_addr_start := loop_requesting_ex.sp_addr_start
     ex.io.req.bits.b_addr_end := loop_requesting_ex.sp_addr_end
     ex.io.req.bits.c_addr_start := loop_requesting_ex.acc_addr_start
-    ex.io.req.valid := !loop_requesting_ex.ex_started && loop_requesting_ex.lda_started &&
-      loop_requesting_ex.ldb_started && loop_requesting_ex.ldd_started && loop_requesting_ex.configured &&
-      !(loop_requesting_ex_id === ldB.io.loop_id && io.ext_loop_ws.get.loop_full && !ldB.io.idle)
+    ex.io.req.bits.laddrI_ex_offset := loop_requesting_ex.laddrRA_offset
+    ex.io.req.bits.group_id := loop_requesting_ex.group_id
+    ex.io.req.bits.group_list := loop_requesting_ex.group_list
+    ex.io.req.valid := exCanStart && !sharedResLoopBlocked(loop_requesting_ex_id)
   } else {
     ex.io.req.bits.a_addr_start := loop_requesting_ex.a_addr_start
     ex.io.req.bits.b_addr_end := loop_requesting_ex.b_addr_end
-    ex.io.req.bits.c_addr_start := ex_c_addr_start
-    ex.io.req.valid := !loop_requesting_ex.ex_started && loop_requesting_ex.lda_started &&
-      loop_requesting_ex.ldb_started && loop_requesting_ex.ldd_started && loop_requesting_ex.configured
+    ex.io.req.bits.c_addr_start := ex_c_addr_start.get
+    ex.io.req.bits.laddrI_ex_offset := 0.U
+    ex.io.req.bits.group_id := 0.U
+    ex.io.req.bits.group_list := 0.U
+    ex.io.req.valid := exCanStart
   }
   ex.io.req.bits.a_tranpose := loop_requesting_ex.a_transpose
   ex.io.req.bits.b_tranpose := loop_requesting_ex.b_transpose
-  // made
-  ex.io.req.bits.laddrI_ex_offset := loop_requesting_ex.laddrRA_offset
-  ex.io.req.bits.group_id := loop_requesting_ex.group_id
-  ex.io.req.bits.group_list := loop_requesting_ex.group_list
-  // end
   ex.io.req.bits.loop_id := loop_requesting_ex_id
 
   when (ex.io.req.fire) {
     loop_requesting_ex.running := true.B
     loop_requesting_ex.ex_started := true.B
 
-    when (loop_requesting_ex.c_dram_addr =/= 0.U) {
-      ex_c_addr_start := floorAdd(ex_c_addr_start, (max_acc_addr / concurrent_loops).U, max_acc_addr.U)
+    if (!use_shared_res_entries) {
+      when (loop_requesting_ex.c_dram_addr =/= 0.U) {
+        ex_c_addr_start.get := floorAdd(ex_c_addr_start.get, (max_acc_addr / concurrent_loops).U, max_acc_addr.U)
+      }
     }
   }
 
   val loop_requesting_ldD_id = Mux(head_loop.ldd_started, tail_loop_id, head_loop_id)
   val loop_requesting_ldD = loops(loop_requesting_ldD_id)
   ldD.io.req.bits.max_j := loop_requesting_ldD.max_j
-  ldD.io.req.bits.max_i := loop_requesting_ldD.ex_I
+  ldD.io.req.bits.max_i := (if (use_shared_res_entries) loop_requesting_ldD.ex_I else loop_requesting_ldD.max_i)
   ldD.io.req.bits.pad_j := loop_requesting_ldD.pad_j
   ldD.io.req.bits.pad_i := loop_requesting_ldD.pad_i
-  // made
-  ldD.io.req.bits.laddrI_offset := loop_requesting_ldD.laddrRA_offset
-  // end
   ldD.io.req.bits.dram_addr := loop_requesting_ldD.d_dram_addr
   ldD.io.req.bits.dram_stride := loop_requesting_ldD.d_dram_stride
   ldD.io.req.bits.low_d := loop_requesting_ldD.low_d
-  // changed
-  // ldD.io.req.bits.addr_start := ld_d_addr_start
+  val ldDCanStart = !loop_requesting_ldD.ldd_started && loop_requesting_ldD.configured
   if (use_shared_res_entries) {
+    ldD.io.req.bits.laddrI_offset := loop_requesting_ldD.laddrRA_offset
     ldD.io.req.bits.addr_start := loop_requesting_ldD.acc_addr_start
-    ldD.io.req.valid := !loop_requesting_ldD.ldd_started && loop_requesting_ldD.configured &&
-      loop_requesting_ldD.ldb_started &&
-      !(loop_requesting_ldD_id === ldB.io.loop_id && io.ext_loop_ws.get.loop_full && !ldB.io.idle)
+    ldD.io.req.valid := ldDCanStart && loop_requesting_ldD.ldb_started && !sharedResLoopBlocked(loop_requesting_ldD_id)
   } else {
-    ldD.io.req.bits.addr_start := ld_d_addr_start
-    ldD.io.req.valid := !loop_requesting_ldD.ldd_started && loop_requesting_ldD.configured
+    ldD.io.req.bits.laddrI_offset := 0.U
+    ldD.io.req.bits.addr_start := ld_d_addr_start.get
+    ldD.io.req.valid := ldDCanStart
   }
   ldD.io.req.bits.loop_id := loop_requesting_ldD_id
 
@@ -1217,8 +1217,10 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
     loop_requesting_ldD.running := true.B
     loop_requesting_ldD.ldd_started := true.B
 
-    when (loop_requesting_ldD.c_dram_addr =/= 0.U) {
-      ld_d_addr_start := floorAdd(ld_d_addr_start, (max_acc_addr / concurrent_loops).U, max_acc_addr.U)
+    if (!use_shared_res_entries) {
+      when (loop_requesting_ldD.c_dram_addr =/= 0.U) {
+        ld_d_addr_start.get := floorAdd(ld_d_addr_start.get, (max_acc_addr / concurrent_loops).U, max_acc_addr.U)
+      }
     }
   }
 
@@ -1226,26 +1228,24 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   val loop_requesting_st = loops(loop_requesting_st_id)
   stC.io.req.bits.max_k := loop_requesting_st.max_k
   stC.io.req.bits.max_j := loop_requesting_st.max_j
-  stC.io.req.bits.max_i := loop_requesting_st.ex_I
+  stC.io.req.bits.max_i := (if (use_shared_res_entries) loop_requesting_st.ex_I else loop_requesting_st.max_i)
   stC.io.req.bits.pad_j := loop_requesting_st.pad_j
   stC.io.req.bits.pad_i := loop_requesting_st.pad_i
-  // made
-  stC.io.req.bits.laddrI_offset := loop_requesting_st.laddrRA_offset
-  stC.io.req.bits.group_id := loop_requesting_st.group_id
-  // end
   stC.io.req.bits.dram_addr := loop_requesting_st.c_dram_addr
   stC.io.req.bits.dram_stride := loop_requesting_st.c_dram_stride
   stC.io.req.bits.full_c := loop_requesting_st.full_c
   stC.io.req.bits.act := loop_requesting_st.act
-  // changed
-  // stC.io.req.bits.addr_start := st_c_addr_start
+  val stCanStart = !loop_requesting_st.st_started && loop_requesting_st.ex_started && loop_requesting_st.configured
   if (use_shared_res_entries) {
+    stC.io.req.bits.laddrI_offset := loop_requesting_st.laddrRA_offset
+    stC.io.req.bits.group_id := loop_requesting_st.group_id
     stC.io.req.bits.addr_start := loop_requesting_st.acc_addr_start
-    stC.io.req.valid := !loop_requesting_st.st_started && loop_requesting_st.ex_started && loop_requesting_st.configured &&
-    !(loop_requesting_st_id === ldB.io.loop_id && io.ext_loop_ws.get.loop_full && !ldB.io.idle)
+    stC.io.req.valid := stCanStart && !sharedResLoopBlocked(loop_requesting_st_id)
   } else {
-    stC.io.req.bits.addr_start := st_c_addr_start
-    stC.io.req.valid := !loop_requesting_st.st_started && loop_requesting_st.ex_started && loop_requesting_st.configured
+    stC.io.req.bits.laddrI_offset := 0.U
+    stC.io.req.bits.group_id := 0.U
+    stC.io.req.bits.addr_start := st_c_addr_start.get
+    stC.io.req.valid := stCanStart
   }
   stC.io.req.bits.loop_id := loop_requesting_st_id
 
@@ -1253,8 +1253,10 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
     loop_requesting_st.running := true.B
     loop_requesting_st.st_started := true.B
 
-    when (loop_requesting_st.c_dram_addr =/= 0.U) {
-      st_c_addr_start := floorAdd(st_c_addr_start, (max_acc_addr / concurrent_loops).U, max_acc_addr.U)
+    if (!use_shared_res_entries) {
+      when (loop_requesting_st.c_dram_addr =/= 0.U) {
+        st_c_addr_start.get := floorAdd(st_c_addr_start.get, (max_acc_addr / concurrent_loops).U, max_acc_addr.U)
+      }
     }
   }
 
@@ -1288,8 +1290,10 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   when (reset.asBool) {
     loops.zipWithIndex.foreach { case (l, i) =>
       l.reset()
-      l.a_addr_start := (i * (max_addr / concurrent_loops)).U
-      l.b_addr_end := ((i+1) * (max_addr / concurrent_loops)).U
+      if (!use_shared_res_entries) {
+        l.a_addr_start := (i * (max_addr / concurrent_loops)).U
+        l.b_addr_end := ((i+1) * (max_addr / concurrent_loops)).U
+      }
     }
   }
 }

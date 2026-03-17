@@ -51,8 +51,8 @@ class AccumulatorMemIO [T <: Data: Arithmetic, U <: Data](n: Int, t: Vec[Vec[T]]
   val write = Flipped(Decoupled(new AccumulatorWriteReq(n, t)))
 
   // changed
-  // val ext_mem = if (use_shared_ext_mem) Some(Vec(acc_sub_banks, new ExtMemIO)) else None
-  val ext_mem = if (use_shared_ext_mem) Some(Vec(acc_sub_banks, new ExtMemIO_4)) else None
+  val ext_mem = if (use_shared_ext_mem) Some(Vec(acc_sub_banks, new ExtMemIO)) else None
+  // val ext_mem = if (use_shared_ext_mem) Some(Vec(acc_sub_banks, new ExtMemIO_4)) else None
 
   val adder = new Bundle {
     val valid = Output(Bool())
@@ -135,8 +135,6 @@ class AccumulatorMem[T <: Data, U <: Data](
 
   val mask_len = t.getWidth / 8
   val mask_elem = UInt((t.getWidth / mask_len).W)
-
-  val rvalid = WireInit(false.B)
 
   if (!acc_singleported && !is_dummy) {
     require(!use_shared_ext_mem)

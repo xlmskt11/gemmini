@@ -26,7 +26,7 @@ class LoadController[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig
 
     val counter = new CounterEventIO()
 
-    val profile = new ProfileEventIO(ROB_ID_WIDTH)
+    val profile = if (use_profiler) Some(new ProfileEventIO(ROB_ID_WIDTH)) else None
   })
 
   val waiting_for_command :: waiting_for_dma_req_ready :: sending_rows :: Nil = Enum(3)
@@ -96,6 +96,7 @@ class LoadController[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig
   val cmd_tracker = Module(new DMACommandTracker(nCmds, maxBytesInMatRequest, deps_t))
 
   io.busy := cmd.valid || cmd_tracker.io.busy
+  dontTouch(io.busy)
 
   // DMA IO wiring
   io.dma.req.valid := (control_state === waiting_for_command && cmd.valid && DoLoad && cmd_tracker.io.alloc.ready) ||
@@ -188,8 +189,10 @@ class LoadController[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig
   }
 
   // Profiler
-  ProfileEventIO.init(io.profile)
-  io.profile.connectEventSignal(ProfileEvent.LD_CTRL_EXECUTE, cmd.fire, cmd.bits.rob_id.bits)
+  if (use_profiler) {
+    ProfileEventIO.init(io.profile.get)
+    io.profile.get.connectEventSignal(ProfileEvent.LD_CTRL_EXECUTE, cmd.fire, cmd.bits.rob_id.bits)
+  }
 
   // Assertions
   assert(!(cmd_tracker.io.alloc.fire() && cmd_tracker.io.alloc.bits.bytes_to_read === 0.U), "A single mvin instruction must load more than 0 bytes")

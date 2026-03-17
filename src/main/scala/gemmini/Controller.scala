@@ -34,11 +34,23 @@ class Gemmini[T <: Data : Arithmetic, U <: Data, V <: Data](val config: GemminiA
 
   val xLen = p(XLen)
   val spad = LazyModule(new Scratchpad(config))
-  val profilers = LazyModule(new Profiler(config, new GemminiCmd(config.reservation_station_entries)))
+  val profilers = if (config.use_profiler) {
+    Some(LazyModule(new Profiler(config, new GemminiCmd(config.reservation_station_entries))))
+  } else {
+    None
+  }
 
   override lazy val module = new GemminiModule(this)
-  override val tlNode = if (config.use_dedicated_tl_port) spad.id_node else profilers.id_node
-  override val atlNode = if (config.use_dedicated_tl_port) profilers.id_node else spad.id_node
+  override val tlNode = if (config.use_dedicated_tl_port) {
+    spad.id_node
+  } else {
+    profilers.map(_.id_node).getOrElse(TLIdentityNode())
+  }
+  override val atlNode = if (config.use_dedicated_tl_port) {
+    profilers.map(_.id_node).getOrElse(TLIdentityNode())
+  } else {
+    spad.id_node
+  }
 
   val node = if (config.use_dedicated_tl_port) tlNode else atlNode
 }
@@ -58,7 +70,10 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val spad_w = inputType.getWidth *  block_cols
   val sp_mask_len = (spad_w / (aligned_to * 8)) max 1
   val acc_row_t = Vec(meshColumns, Vec(tileColumns, accType))
-  val ext_mem_io = if (use_shared_ext_mem) Some(IO(new ExtMemIO_new(sp_banks, sp_sub_banks, sp_bank_entries / sp_sub_banks, spad_w, sp_mask_len, 8, acc_banks, acc_sub_banks, acc_bank_entries / acc_sub_banks, acc_row_t, 8, (spad_read_delay+2 max 3)))) else None
+  val ext_mem_io = if (use_shared_ext_mem) Some(IO(new ExtMemIO_new(
+    sp_banks, sp_sub_banks, sp_bank_entries / sp_sub_banks, spad_w, sp_mask_len,
+    acc_banks, acc_sub_banks, acc_bank_entries / acc_sub_banks, acc_row_t
+  ))) else None
   ext_mem_io.foreach(_ <> outer.spad.module.io.ext_mem.get)
 
   val tagWidth = 32
@@ -73,8 +88,11 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   counters.io.event_io.collect(spad.module.io.counter)
 
   // Profiler
-  ProfileEventIO.init(profilers.module.io.profile_io.event_io)
-  profilers.module.io.profiler_dram_addr := 0.U
+  if (use_profiler) {
+    val profiler = profilers.get
+    ProfileEventIO.init(profiler.module.io.profile_io.event_io)
+    profiler.module.io.profiler_dram_addr := 0.U
+  }
 
   // TLB
   implicit val edge = outer.spad.id_node.edges.out.head
@@ -137,14 +155,17 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val ext_deps_io = if (use_shared_res_entries) Some(IO(new EntriesForDeps(local_addr_t, reservation_station_entries_ld, reservation_station_entries_ex, reservation_station_entries_st, res_max_per_type))) else None
   ext_deps_io.foreach(_ <> reservation_station.io.ext_deps.get)
   counters.io.event_io.collect(reservation_station.io.counter)
-  
-  profilers.module.io.profile_io.issue_cmd <> reservation_station.io.profile.issue_cmd
-  profilers.module.io.profile_io.event_io.collect(reservation_station.io.profile.event_io)
-  profilers.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ROB_ALLOC, reservation_station.io.profile.issue_cmd.fire(), reservation_station.io.profile.issue_cmd.rob_id)
-  profilers.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ROB_ISSUE_LD, reservation_station.io.issue.ld.fire(), reservation_station.io.issue.ld.rob_id)
-  profilers.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ROB_ISSUE_EX, reservation_station.io.issue.ex.fire(), reservation_station.io.issue.ex.rob_id)
-  profilers.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ROB_ISSUE_ST, reservation_station.io.issue.st.fire(), reservation_station.io.issue.st.rob_id)
-  profilers.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ROB_COMPLETE, reservation_station.io.completed.fire, reservation_station.io.completed.bits)
+
+  if (use_profiler) {
+    val profiler = profilers.get
+    profiler.module.io.profile_io.issue_cmd <> reservation_station.io.profile.get.issue_cmd
+    profiler.module.io.profile_io.event_io.collect(reservation_station.io.profile.get.event_io)
+    profiler.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ROB_ALLOC, reservation_station.io.profile.get.issue_cmd.fire(), reservation_station.io.profile.get.issue_cmd.rob_id)
+    profiler.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ROB_ISSUE_LD, reservation_station.io.issue.ld.fire(), reservation_station.io.issue.ld.rob_id)
+    profiler.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ROB_ISSUE_EX, reservation_station.io.issue.ex.fire(), reservation_station.io.issue.ex.rob_id)
+    profiler.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ROB_ISSUE_ST, reservation_station.io.issue.st.fire(), reservation_station.io.issue.st.rob_id)
+    profiler.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ROB_COMPLETE, reservation_station.io.completed.fire, reservation_station.io.completed.bits)
+  }
 
   when (io.cmd.valid && io.cmd.bits.inst.funct === CLKGATE_EN && !io.busy) {
     clock_en_reg := io.cmd.bits.rs1(0)
@@ -225,19 +246,22 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   counters.io.event_io.collect(store_controller.io.counter)
   counters.io.event_io.collect(ex_controller.io.counter)
 
-  profilers.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ENTER_LD_CTRL, load_controller.io.cmd.fire, load_controller.io.cmd.bits.rob_id.bits)
-  profilers.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ENTER_EX_CTRL, ex_controller.io.cmd.fire, ex_controller.io.cmd.bits.rob_id.bits)
-  profilers.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ENTER_ST_CTRL, store_controller.io.cmd.fire, store_controller.io.cmd.bits.rob_id.bits)
-  profilers.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.LEAVE_LD_CTRL, load_controller.io.completed.fire, load_controller.io.completed.bits)
-  profilers.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.LEAVE_EX_CTRL, ex_controller.io.completed.fire, ex_controller.io.completed.bits)
-  profilers.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.LEAVE_ST_CTRL, store_controller.io.completed.fire, store_controller.io.completed.bits)
-  // profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.ENTER_DMA_READ, load_controller.io.dma.req.fire, load_controller.io.dma.req.bits.cmd_id)
-  // profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.LEAVE_DMA_READ, load_controller.io.dma.resp.fire, load_controller.io.dma.req.bits.cmd_id)
-  // profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.ENTER_DMA_WRITE, store_controller.io.dma.req.fire, store_controller.io.dma.req.bits.cmd_id)
-  // profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.LEAVE_DMA_WRITE, store_controller.io.dma.resp.fire, store_controller.io.dma.resp.bits.cmd_id)
-  profilers.module.io.profile_io.event_io.collect(load_controller.io.profile)
-  profilers.module.io.profile_io.event_io.collect(ex_controller.io.profile)
-  profilers.module.io.profile_io.event_io.collect(store_controller.io.profile)
+  if (use_profiler) {
+    val profiler = profilers.get
+    profiler.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ENTER_LD_CTRL, load_controller.io.cmd.fire, load_controller.io.cmd.bits.rob_id.bits)
+    profiler.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ENTER_EX_CTRL, ex_controller.io.cmd.fire, ex_controller.io.cmd.bits.rob_id.bits)
+    profiler.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.ENTER_ST_CTRL, store_controller.io.cmd.fire, store_controller.io.cmd.bits.rob_id.bits)
+    profiler.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.LEAVE_LD_CTRL, load_controller.io.completed.fire, load_controller.io.completed.bits)
+    profiler.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.LEAVE_EX_CTRL, ex_controller.io.completed.fire, ex_controller.io.completed.bits)
+    profiler.module.io.profile_io.event_io.connectEventSignal(ProfileEvent.LEAVE_ST_CTRL, store_controller.io.completed.fire, store_controller.io.completed.bits)
+    // profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.ENTER_DMA_READ, load_controller.io.dma.req.fire, load_controller.io.dma.req.bits.cmd_id)
+    // profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.LEAVE_DMA_READ, load_controller.io.dma.resp.fire, load_controller.io.dma.req.bits.cmd_id)
+    // profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.ENTER_DMA_WRITE, store_controller.io.dma.req.fire, store_controller.io.dma.req.bits.cmd_id)
+    // profilers.io.profile_io.event_io.connectEventSignal(ProfileEvent.LEAVE_DMA_WRITE, store_controller.io.dma.resp.fire, store_controller.io.dma.resp.bits.cmd_id)
+    profiler.module.io.profile_io.event_io.collect(load_controller.io.profile.get)
+    profiler.module.io.profile_io.event_io.collect(ex_controller.io.profile.get)
+    profiler.module.io.profile_io.event_io.collect(store_controller.io.profile.get)
+  }
 
   /*
   tiler.io.issue.load.ready := false.B
@@ -302,8 +326,6 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   if (use_shared_ext_mem) {
     ex_controller.io.srams.grant.get <> spad.module.io.exwrite_grant.get.spad
     ex_controller.io.acc.grant.get <> spad.module.io.exwrite_grant.get.acc
-    ex_controller.io.srams.remind.get <> spad.module.io.exwrite_remind.get.spad
-    ex_controller.io.acc.remind.get <> spad.module.io.exwrite_remind.get.acc
   }
 
   // Im2Col unit
@@ -445,7 +467,9 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     }
 
     .elsewhen (is_profiler_paddr){
-      profilers.module.io.profiler_dram_addr := loop_cmd.bits.cmd.rs1
+      if (use_profiler) {
+        profilers.get.module.io.profiler_dram_addr := loop_cmd.bits.cmd.rs1
+      }
       loop_cmd.ready := true.B
     }
 

@@ -96,6 +96,10 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              clock_gate: Boolean = false,
                                                                              use_shared_res_entries: Boolean = false,
                                                                              nSharers: Int = 4,
+                                                                             use_profiler: Boolean = false,
+                                                                            //  sub_bank_buffer_cap: Int = 4,
+                                                                            //  ex_max_in_flight_sram: Int = 2, // spad_read_delay + 1
+                                                                            //  dma_max_in_flight_sram: Int = 2,
 
                                                                              headerFileName: String = "gemmini_params.h"
                                                        ) {

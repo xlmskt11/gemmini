@@ -117,6 +117,10 @@ class MeshWithDelays[T <: Data: Arithmetic, U <: TagQueueTag with Data]
 
   val input_next_row_into_spatial_array = req.valid && ((a_written && b_written && d_written) || req.bits.flush > 0.U)
   val wait_for_row_advance_grant = io.row_advance_grant_required && !io.row_advance_grant_ready
+  dontTouch(wait_for_row_advance_grant)
+  dontTouch(input_next_row_into_spatial_array)
+  val wating_for_grant = wait_for_row_advance_grant && input_next_row_into_spatial_array
+  dontTouch(wating_for_grant)
   val input_next_row_into_spatial_array_granted = input_next_row_into_spatial_array && !wait_for_row_advance_grant
 
   io.row_advance_req := input_next_row_into_spatial_array && io.row_advance_grant_required

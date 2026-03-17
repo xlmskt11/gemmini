@@ -92,8 +92,8 @@ class CircularBuffer[T <: Data](t: T, nSharers: Int, capacity: Int) extends Modu
   val enqPtr = RegInit(0.U(log2Ceil(capacity).W))
   val deqPtr = RegInit(0.U(log2Ceil(capacity).W))
 
-  val expandedInput = Wire(Vec(capacity, Valid(t)))
-  for (i <- 0 until capacity) {
+  val expandedInput = Wire(Vec(nSharers, Valid(t)))
+  for (i <- 0 until nSharers) {
     if (i < nSharers) {
       expandedInput(i) := MakeValid(i.U < io.enqValid, io.enqData(i))
     } else {
@@ -101,10 +101,16 @@ class CircularBuffer[T <: Data](t: T, nSharers: Int, capacity: Int) extends Modu
     }
   }
 
-  val rotatedInput = RotateVectorLeft(expandedInput, enqPtr)
-  for (i <- 0 until capacity) {
-    buffer(i) := Mux(rotatedInput(i).valid, rotatedInput(i).bits, buffer(i))
+  // val rotatedInput = RotateVectorLeft(expandedInput, enqPtr)
+  private val ptrWidth = 1 max log2Ceil(capacity)
+  for (i <- 0 until nSharers) {
+    when(i.U < io.enqValid) {
+      buffer((enqPtr + i.U)(ptrWidth - 1, 0)) := Mux(expandedInput(i).valid, expandedInput(i).bits, buffer((enqPtr + i.U)(ptrWidth - 1, 0)))
+    }
   }
+  // for (i <- 0 until nSharers) {
+  //   buffer(i) := Mux(rotatedInput(i).valid, rotatedInput(i).bits, buffer(i))
+  // }
 
   var nEnqueued = RegInit(0.U(io.nEnqueued.getWidth.W))
   enqPtr    := Mux(io.flush, 0.U, enqPtr + io.enqValid)
@@ -115,8 +121,64 @@ class CircularBuffer[T <: Data](t: T, nSharers: Int, capacity: Int) extends Modu
   io.nSpace := capacity.U - nEnqueued
   io.deqValid := nEnqueued > 0.U
 
-  val outputBufferView = RotateVectorRight(buffer, deqPtr)
-  io.dataOut := outputBufferView(0)
+  io.dataOut := buffer(deqPtr)
+}
+
+class CircularBuffer2[T <: Data](t: T, nSharers: Int, capacity: Int) extends Module {
+  // For the time being, restrict to powers of 2
+  assert(isPow2(nSharers))
+  assert(isPow2(capacity))
+  val io = IO(new Bundle {
+    val enqValid = Input(UInt(log2Ceil(nSharers + 1).W))
+    val enqData = Input(Vec(nSharers, t))
+
+    val nEnqueued = Output(UInt(log2Ceil(capacity + 1).W))
+    val nSpace = Output(UInt(log2Ceil(capacity + 1).W))
+
+    val dataOut = Output(t)
+    val deqReady = Input(Bool())
+    val deqValid = Output(Bool())
+
+    def deqFire(dummy: Int = 0): Bool = deqReady && deqValid
+
+    val flush = Input(Bool())
+  })
+  dontTouch(io)
+
+  private val ptrWidth = 1 max log2Ceil(capacity)
+  private def wrapPtr(ptr: UInt, step: UInt): UInt =
+    if (capacity == 1) 0.U(ptrWidth.W) else (ptr + step)(ptrWidth - 1, 0)
+
+  // Note first assert below should be sufficient it allows enqueueing items when buffer
+  // is full or close to full provided deqReady >= enqValid.
+  // The second assert is more conservative, and will never allow enqueueing more items
+  // than there is space in the buffer, under any circumstances. May be removed if
+  // desire for more is greater than the need to be more conservative.
+  val deqFire = io.deqFire()
+  val queued = RegInit(0.U(io.nEnqueued.getWidth.W))
+  assert(queued +& io.enqValid -& deqFire.asUInt <= capacity.U)
+  // assert(io.enqValid <= (capacity.U -& io.nEnqueued))
+
+//   assert(io.deqReady <= io.nEnqueued)
+
+  val buffer = RegInit(VecInit.fill(capacity)(0.U.asTypeOf(t)))
+  val enqPtr = RegInit(0.U(ptrWidth.W))
+  val deqPtr = RegInit(0.U(ptrWidth.W))
+
+  for (i <- 0 until nSharers) {
+    when(i.U < io.enqValid) {
+      buffer(wrapPtr(enqPtr, i.U)) := io.enqData(i)
+    }
+  }
+
+  enqPtr := Mux(io.flush, 0.U, wrapPtr(enqPtr, io.enqValid))
+  deqPtr := Mux(io.flush, 0.U, wrapPtr(deqPtr, deqFire.asUInt))
+  queued := Mux(io.flush, 0.U, queued + io.enqValid - deqFire.asUInt)
+
+  io.nEnqueued := queued
+  io.nSpace := capacity.U - queued
+  io.deqValid := queued =/= 0.U
+  io.dataOut := buffer(deqPtr)
 }
 
 

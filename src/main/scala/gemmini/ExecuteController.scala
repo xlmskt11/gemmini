@@ -26,7 +26,6 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       val read = Vec(sp_banks, new ScratchpadReadIO(sp_bank_entries, sp_width))
       val write = Vec(sp_banks, new ScratchpadWriteIO(sp_bank_entries, sp_width, (sp_width / (aligned_to * 8)) max 1))
       val grant = if (use_shared_ext_mem) Some(Vec(sp_banks, Decoupled(new BankExWriteGrantReq(sp_bank_entries)))) else None
-      val remind = if (use_shared_ext_mem) Some(Vec(sp_banks, Decoupled(new BankExWriteRemindReq(sp_bank_entries)))) else None
     }
 
     val acc = new Bundle {
@@ -42,7 +41,6 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       // val write = Vec(acc_banks, new AccumulatorWriteIO(acc_bank_entries, Vec(meshColumns, Vec(tileColumns, accType))))
       val write = Vec(acc_banks, Decoupled(new AccumulatorWriteReq(acc_bank_entries, Vec(meshColumns, Vec(tileColumns, accType)))))
       val grant = if (use_shared_ext_mem) Some(Vec(acc_banks, Decoupled(new BankExWriteGrantReq(acc_bank_entries)))) else None
-      val remind = if (use_shared_ext_mem) Some(Vec(acc_banks, Decoupled(new BankExWriteRemindReq(acc_bank_entries)))) else None
     }
 
     val completed = Valid(UInt(log2Up(reservation_station_entries).W))
@@ -50,24 +48,10 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
     val counter = new CounterEventIO()
 
-    val profile = new ProfileEventIO(ROB_ID_WIDTH)
+    val profile = if (use_profiler) Some(new ProfileEventIO(ROB_ID_WIDTH)) else None
   })
 
   val block_size = meshRows*tileRows
-  val exwrite_reservation_cycles = ((meshRows + meshColumns - 1) * (tile_latency + 1) + mesh_output_delay) max 1
-  val exwrite_buffer_capacity = 8
-  val exwrite_remind_lead_cycles = 2 * exwrite_buffer_capacity
-  val exwrite_remind_delay = (exwrite_reservation_cycles - exwrite_remind_lead_cycles) max 0
-
-  private def spSubBankIdx(addr: UInt): UInt = {
-    val subBits = log2Ceil(sp_sub_banks)
-    if (sp_sub_banks == 1) 0.U((1 max subBits).W) else addr(subBits - 1, 0)
-  }
-
-  private def accSubBankIdx(addr: UInt): UInt = {
-    val subBits = log2Ceil(acc_sub_banks)
-    if (acc_sub_banks == 1) 0.U((1 max subBits).W) else addr(subBits - 1, 0)
-  }
 
   val mesh_tag = new Bundle with TagQueueTag {
     val rob_id = UDValid(UInt(log2Up(reservation_station_entries).W))
@@ -205,7 +189,11 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val pending_completed_rob_ids = Reg(Vec(2, UDValid(UInt(log2Up(reservation_station_entries).W))))
 
   // made
-  val profile_comp_rob_ids = Reg(Vec(2, UDValid(UInt(log2Up(reservation_station_entries).W))))
+  val profile_comp_rob_ids = if (use_profiler) {
+    Some(Reg(Vec(2, UDValid(UInt(log2Up(reservation_station_entries).W)))))
+  } else {
+    None
+  }
 
   // Instantiate a queue which queues up signals which must be fed into the mesh
   val mesh_cntl_signals_q = Module(new Queue(new ComputeCntlSignals, spad_read_delay+1,
@@ -243,26 +231,12 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     w.ready := false.B
   }
 
-  class ExwriteRemindEvent extends Bundle {
-    val toAcc = Bool()
-    val bank = UInt((1 max log2Ceil(sp_banks max acc_banks)).W)
-    val row = UInt((1 max log2Ceil(sp_bank_entries max acc_bank_entries)).W)
-  }
-
   if (use_shared_ext_mem) {
     io.srams.grant.get.foreach { r =>
       r.valid := false.B
       r.bits := DontCare
     }
     io.acc.grant.get.foreach { r =>
-      r.valid := false.B
-      r.bits := DontCare
-    }
-    io.srams.remind.get.foreach { r =>
-      r.valid := false.B
-      r.bits := DontCare
-    }
-    io.acc.remind.get.foreach { r =>
       r.valid := false.B
       r.bits := DontCare
     }
@@ -329,6 +303,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val matmul_in_progress = mesh.io.tags_in_progress.map(_.rob_id.valid).reduce(_ || _)
 
   io.busy := cmd.valid(0) || matmul_in_progress
+  dontTouch(io.busy)
 
   // SRAM scratchpad
   // Fire counters which resolve same-bank accesses
@@ -687,7 +662,9 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
           control_state := compute
 
-          profile_comp_rob_ids(0) := cmd.bits(0).rob_id
+          if (use_profiler) {
+            profile_comp_rob_ids.get(0) := cmd.bits(0).rob_id
+          }
         }
 
         // Overlap compute and preload
@@ -702,8 +679,10 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
           control_state := compute
 
-          profile_comp_rob_ids(0) := cmd.bits(0).rob_id
-          profile_comp_rob_ids(1) := cmd.bits(1).rob_id
+          if (use_profiler) {
+            profile_comp_rob_ids.get(0) := cmd.bits(0).rob_id
+            profile_comp_rob_ids.get(1) := cmd.bits(1).rob_id
+          }
         }
 
         // Single mul
@@ -716,7 +695,9 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
           control_state := compute
 
-          profile_comp_rob_ids(0) := cmd.bits(0).rob_id
+          if (use_profiler) {
+            profile_comp_rob_ids.get(0) := cmd.bits(0).rob_id
+          }
         }
 
         // Flush
@@ -907,10 +888,11 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val accReadValid = VecInit(io.acc.read_resp.map(bank => ex_read_from_acc.B && bank.valid && !bank.bits.fromDMA))
   val im2ColValid = io.im2col.resp.valid
 
-  mesh_cntl_signals_q.io.deq.ready := (!cntl.a_fire || mesh.io.a.fire || !mesh.io.a.ready) &&
+  val anyFire = cntl.a_fire || cntl.b_fire || cntl.d_fire
+  mesh_cntl_signals_q.io.deq.ready := ((!cntl.a_fire || mesh.io.a.fire || !mesh.io.a.ready) &&
     (!cntl.b_fire || mesh.io.b.fire || !mesh.io.b.ready) &&
     (!cntl.d_fire || mesh.io.d.fire || !mesh.io.d.ready) &&
-    (!cntl.first || mesh.io.req.ready)
+    (!cntl.first || mesh.io.req.ready)) && (!anyFire || mesh.io.a.ready || mesh.io.b.ready || mesh.io.d.ready)
 
   val dataA_valid = cntl.a_garbage || cntl.a_unpadded_cols === 0.U || Mux(cntl.im2colling, im2ColValid, Mux(cntl.a_read_from_acc, accReadValid(cntl.a_bank_acc), readValid(cntl.a_bank)))
 
@@ -1124,23 +1106,6 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       rowAdvanceGrantReady := accGrantReady
     }
 
-    val remindEventIn = Wire(Valid(new ExwriteRemindEvent))
-    remindEventIn.valid := rowAdvanceFire && rowNeedsGrant
-    remindEventIn.bits.toAcc := pred_write_to_acc
-    remindEventIn.bits.bank := Mux(pred_write_to_acc, pred_acc_bank, pred_spad_bank)
-    remindEventIn.bits.row := Mux(pred_write_to_acc, pred_acc_row, pred_spad_row)
-
-    val remindEvent = if (exwrite_remind_delay == 0) remindEventIn else ShiftRegister(remindEventIn, exwrite_remind_delay)
-
-    for (i <- 0 until sp_banks) {
-      io.srams.remind.get(i).valid := remindEvent.valid && !remindEvent.bits.toAcc && remindEvent.bits.bank === i.U
-      io.srams.remind.get(i).bits.addr := remindEvent.bits.row((1 max log2Ceil(sp_bank_entries)) - 1, 0)
-    }
-    for (i <- 0 until acc_banks) {
-      io.acc.remind.get(i).valid := remindEvent.valid && remindEvent.bits.toAcc && remindEvent.bits.bank === i.U
-      io.acc.remind.get(i).bits.addr := remindEvent.bits.row((1 max log2Ceil(acc_bank_entries)) - 1, 0)
-    }
-
     when (rowAdvanceFire && tag_sel_dataflow.rob_valid) {
       grant_output_counter.get := wrappingAdd(grant_output_counter.get, 1.U, pred_total_output_rows)
     }
@@ -1211,18 +1176,20 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
 
   // Profiler
-  when(profile_comp_rob_ids(0).valid) {
-    profile_cmd := profile_comp_rob_ids(0).pop()
-  }.elsewhen(profile_comp_rob_ids(1).valid && !profile_comp_rob_ids(0).valid) {
-    profile_cmd := profile_comp_rob_ids(1).pop()
-  }
+  if (use_profiler) {
+    when(profile_comp_rob_ids.get(0).valid) {
+      profile_cmd := profile_comp_rob_ids.get(0).pop()
+    }.elsewhen(profile_comp_rob_ids.get(1).valid && !profile_comp_rob_ids.get(0).valid) {
+      profile_cmd := profile_comp_rob_ids.get(1).pop()
+    }
 
-  when (reset.asBool) {
-    profile_comp_rob_ids.foreach(_.valid := false.B)
-  }
+    when (reset.asBool) {
+      profile_comp_rob_ids.get.foreach(_.valid := false.B)
+    }
 
-  ProfileEventIO.init(io.profile)
-  io.profile.connectEventSignal(ProfileEvent.EX_CTRL_EXECUTE, profile_comp_rob_ids.map(_.valid).reduce(_||_), profile_cmd)
+    ProfileEventIO.init(io.profile.get)
+    io.profile.get.connectEventSignal(ProfileEvent.EX_CTRL_EXECUTE, profile_comp_rob_ids.get.map(_.valid).reduce(_||_), profile_cmd)
+  }
 
   if (use_firesim_simulation_counters) {
     val ex_flush_cycle = control_state === flushing || control_state === flush

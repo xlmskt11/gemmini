@@ -113,7 +113,11 @@ class LoopConvLdBias(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwi
     Mux(ochs < (max_block_len_acc * block_size).U, ochs, (max_block_len_acc * block_size).U)
   }
 
-  val skip = req.dram_addr === 0.U || req.ex_ochs === 0.U
+  val skip = if (use_shared_res_entries) {
+    req.dram_addr === 0.U || req.ex_ochs === 0.U
+  } else {
+    req.dram_addr === 0.U || ochs === 0.U
+  }
 
   // Iterators
   val b = Reg(UInt(large_iterator_bitwidth.W))
@@ -182,11 +186,7 @@ class LoopConvLdBias(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwi
 
   // changed
   // command_p.io.in.valid := state =/= idle && !io.wait_for_prev_loop && !skip
-  if (use_shared_res_entries) {
-    command_p.io.in.valid := state =/= idle && !io.wait_for_prev_loop && !skip
-  } else {
-    command_p.io.in.valid := state =/= idle && !io.wait_for_prev_loop && !skip
-  }
+  command_p.io.in.valid := state =/= idle && !io.wait_for_prev_loop && !skip
   command_p.io.in.bits.cmd := Mux(state === config, config_cmd, mvin_cmd)
   command_p.io.in.bits.dram_addr := dram_addr
   command_p.io.in.bits.spad_addr := spad_addr
@@ -404,7 +404,11 @@ class LoopConvLdInput(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitw
   io.req.ready := state === idle && !command_p.io.busy
   io.idle := state === idle && !command_p.io.busy
   io.loop_id := req.loop_id
-  io.group_list := req.group_list // made
+  if (use_shared_res_entries) {
+    io.group_list := req.group_list
+  } else {
+    io.group_list := 0.U
+  }
 
   // changed
   // command_p.io.in.valid := state =/= idle && !io.wait_for_prev_loop
@@ -434,10 +438,20 @@ class LoopConvLdInput(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitw
     io.cmd.bits.rs2 := mvin_cmd_rs2.asUInt
   }
 
-  io.group_id := req.group_id // made
+  if (use_shared_res_entries) {
+    io.group_id := req.group_id
+  } else {
+    io.group_id := 0.U
+  }
 
   // Sending outputs
-  when (req.mv_kchs === 0.U && !io.loop_full) {
+  val skipEmptySharedInputLoad = if (use_shared_res_entries) {
+    req.mv_kchs === 0.U && !io.loop_full
+  } else {
+    false.B
+  }
+
+  when (skipEmptySharedInputLoad) {
     state := idle
   }.elsewhen (command_p.io.in.fire) {
     when (state === config) {
@@ -666,7 +680,13 @@ class LoopConvLdWeight(block_size: Int, coreMaxAddrBits: Int, large_iterator_bit
   }
 
   // Sending outputs
-  when (req.ex_ochs === 0.U) {
+  val skipEmptySharedWeightLoad = if (use_shared_res_entries) {
+    req.ex_ochs === 0.U
+  } else {
+    false.B
+  }
+
+  when (skipEmptySharedWeightLoad) {
     state := idle
   }.elsewhen(command_p.io.in.fire) {
     when (state === config) {
@@ -892,9 +912,13 @@ class LoopConvExecute(block_size: Int, large_iterator_bitwidth: Int, small_itera
   io.req.ready := state === idle && !command_p.io.busy
   io.idle := state === idle && !command_p.io.busy
   io.loop_id := req.loop_id
-
-  io.group_id := req.group_id // made
-  io.group_list := req.group_list // made
+  if (use_shared_res_entries) {
+    io.group_id := req.group_id
+    io.group_list := req.group_list
+  } else {
+    io.group_id := 0.U
+    io.group_list := 0.U
+  }
 
   // changed
   // command_p.io.in.valid := state =/= idle && !skip_iteration && ld_ahead
@@ -957,7 +981,13 @@ class LoopConvExecute(block_size: Int, large_iterator_bitwidth: Int, small_itera
   }
 
   // Sending outputs
-  when (req.ex_ochs === 0.U) {
+  val skipEmptySharedExecute = if (use_shared_res_entries) {
+    req.ex_ochs === 0.U
+  } else {
+    false.B
+  }
+
+  when (skipEmptySharedExecute) {
     state := idle
   }.elsewhen (command_p.io.in.fire || skip_iteration) {
     when (state === config) {
@@ -1182,8 +1212,11 @@ class LoopConvSt(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwidth:
   io.req.ready := state === idle && !command_p.io.busy
   io.idle := state === idle && !command_p.io.busy
   io.loop_id := req.loop_id
-
-  io.group_id := req.group_id // made
+  if (use_shared_res_entries) {
+    io.group_id := req.group_id
+  } else {
+    io.group_id := 0.U
+  }
 
   command_p.io.in.valid := state =/= idle && !skip && io.ex_completed
   command_p.io.in.bits.cmd := MuxLookup(state.asUInt, mvout_cmd, Seq(
@@ -1458,19 +1491,6 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   val ex = Module(new LoopConvExecute(block_size, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth, max_addr, max_acc_addr, concurrent_loops, latency, config_ex_rs1_t, preload_rs1_t, preload_rs2_t, compute_rs1_t, compute_rs2_t, use_shared_res_entries, group_w, nSharers))
   val st = Module(new LoopConvSt(block_size, coreMaxAddrBits, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth, max_acc_addr, input_w, concurrent_loops, latency, config_mvout_rs2_t, mvout_rs2_t, use_shared_res_entries, group_w))
 
-  private def ceilDivByDim(x: UInt): UInt = {
-    val width = if (x.getWidth > 0) x.getWidth else large_iterator_bitwidth
-    val extendedWidth = width + 1
-    val blockMinusOne = (block_size - 1).U(extendedWidth.W)
-    val blockSizeUInt = block_size.U(extendedWidth.W)
-    (x.pad(extendedWidth) + blockMinusOne) / blockSizeUInt
-  }
-
-  private def inputBlocksNeeded(trans3120: Bool, batches: UInt, inChBlocks: UInt): UInt = {
-    val batchBlocks = ceilDivByDim(batches)
-    Mux(trans3120, batchBlocks, inChBlocks)
-  }
-
   // Create command queue
   val cmd = Queue(io.in)
 
@@ -1500,8 +1520,12 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
 
   // Wire up unrolled command output
   val is_loop_run_cmd = cmd.bits.cmd.inst.funct === LOOP_CONV_WS
-  // changed
-  val is_loop_config_cmd = (cmd.bits.cmd.inst.funct >= LOOP_CONV_WS_CONFIG_1 && cmd.bits.cmd.inst.funct <= LOOP_CONV_WS_CONFIG_6) || (cmd.bits.cmd.inst.funct >= LOOP_CONV_WS_CONFIG_MV_BOUNDS_1 && cmd.bits.cmd.inst.funct <= LOOP_CONV_WS_CONFIG_SPADDR)
+  val shared_loop_config_cmd = if (use_shared_res_entries) {
+    cmd.bits.cmd.inst.funct >= LOOP_CONV_WS_CONFIG_MV_BOUNDS_1 && cmd.bits.cmd.inst.funct <= LOOP_CONV_WS_CONFIG_SPADDR
+  } else {
+    false.B
+  }
+  val is_loop_config_cmd = (cmd.bits.cmd.inst.funct >= LOOP_CONV_WS_CONFIG_1 && cmd.bits.cmd.inst.funct <= LOOP_CONV_WS_CONFIG_6) || shared_loop_config_cmd
   val is_loop_cmd = is_loop_run_cmd || is_loop_config_cmd
 
   io.out.bits.cmd := Mux(loop_configured, unrolled_cmd.bits, cmd.bits.cmd)
@@ -1549,10 +1573,16 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
     io.ext_loop_conv_ws.get.ldinput.group_list := ld_input.io.group_list
     ex.io.lda_ahead := io.ext_loop_conv_ws.get.lda_ahead
   } else {
-    ld_input.io.loop_full := DontCare
-    ex.io.lda_ahead := DontCare
+    ld_input.io.loop_full := false.B
+    ex.io.lda_ahead := false.B
   }
   // end
+
+  def sharedResLoopBlocked(loopId: UInt): Bool = if (use_shared_res_entries) {
+    loopId === ld_input.io.loop_id && io.ext_loop_conv_ws.get.loop_full && !ld_input.io.idle
+  } else {
+    false.B
+  }
 
   // Create config registers
   when(cmd.valid && is_loop_cmd && !loop_being_configured.configured) {
@@ -1560,19 +1590,23 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
     switch (cmd.bits.cmd.inst.funct) {
       // made
       is (LOOP_CONV_WS_CONFIG_SPADDR) {
-        loop_being_configured.sp_addr_end := cmd.bits.cmd.rs2(large_iterator_bitwidth + log2Up(max_addr+1) - 1, large_iterator_bitwidth)
-        loop_being_configured.sp_addr_start := cmd.bits.cmd.rs2(log2Up(max_addr)-1, 0)
+        if (use_shared_res_entries) {
+          loop_being_configured.sp_addr_end := cmd.bits.cmd.rs2(large_iterator_bitwidth + log2Up(max_addr+1) - 1, large_iterator_bitwidth)
+          loop_being_configured.sp_addr_start := cmd.bits.cmd.rs2(log2Up(max_addr)-1, 0)
 
-        loop_being_configured.acc_addr_start := cmd.bits.cmd.rs1(log2Up(max_acc_addr)-1, 0)
+          loop_being_configured.acc_addr_start := cmd.bits.cmd.rs1(log2Up(max_acc_addr)-1, 0)
+        }
       }
       is (LOOP_CONV_WS_CONFIG_MV_BOUNDS_1) {
-        loop_being_configured.mv_kchs := cmd.bits.cmd.rs2(large_iterator_bitwidth * 2 - 1, large_iterator_bitwidth)
-        loop_being_configured.ex_ochs := cmd.bits.cmd.rs2(large_iterator_bitwidth - 1, 0)
+        if (use_shared_res_entries) {
+          loop_being_configured.mv_kchs := cmd.bits.cmd.rs2(large_iterator_bitwidth * 2 - 1, large_iterator_bitwidth)
+          loop_being_configured.ex_ochs := cmd.bits.cmd.rs2(large_iterator_bitwidth - 1, 0)
 
-        loop_being_configured.group_list := cmd.bits.cmd.rs1(large_iterator_bitwidth * 3 + nSharers - 1, large_iterator_bitwidth * 3)
-        loop_being_configured.group_id := cmd.bits.cmd.rs1(large_iterator_bitwidth * 2 + group_w - 1, large_iterator_bitwidth * 2)
-        loop_being_configured.laddrkchs_offset := cmd.bits.cmd.rs1(large_iterator_bitwidth * 2 - 1, large_iterator_bitwidth)
-        loop_being_configured.laddrochs_offset := cmd.bits.cmd.rs1(large_iterator_bitwidth - 1, 0)
+          loop_being_configured.group_list := cmd.bits.cmd.rs1(large_iterator_bitwidth * 3 + nSharers - 1, large_iterator_bitwidth * 3)
+          loop_being_configured.group_id := cmd.bits.cmd.rs1(large_iterator_bitwidth * 2 + group_w - 1, large_iterator_bitwidth * 2)
+          loop_being_configured.laddrkchs_offset := cmd.bits.cmd.rs1(large_iterator_bitwidth * 2 - 1, large_iterator_bitwidth)
+          loop_being_configured.laddrochs_offset := cmd.bits.cmd.rs1(large_iterator_bitwidth - 1, 0)
+        }
       }
       // made end
       is (LOOP_CONV_WS_CONFIG_1) {
@@ -1664,28 +1698,30 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   }
 
   // Wire up request signals
-  val ld_bias_addr_start = RegInit(0.U(log2Up(max_acc_addr).W))
-  val ex_c_addr_start = RegInit(0.U(log2Up(max_acc_addr).W))
-  val st_addr_start = RegInit(0.U(log2Up(max_acc_addr).W))
+  val ld_bias_addr_start = if (use_shared_res_entries) None else Some(RegInit(0.U(log2Up(max_acc_addr).W)))
+  val ex_c_addr_start = if (use_shared_res_entries) None else Some(RegInit(0.U(log2Up(max_acc_addr).W)))
+  val st_addr_start = if (use_shared_res_entries) None else Some(RegInit(0.U(log2Up(max_acc_addr).W)))
 
   val loop_requesting_ld_bias_id = Mux(head_loop.ld_bias_started, tail_loop_id, head_loop_id)
   val loop_requesting_ld_bias = loops(loop_requesting_ld_bias_id)
   ld_bias.io.req.bits.outer_bounds := loop_requesting_ld_bias.outer_bounds
   ld_bias.io.req.bits.inner_bounds := loop_requesting_ld_bias.inner_bounds
   ld_bias.io.req.bits.derived_params := loop_requesting_ld_bias.derived_params()
-  ld_bias.io.req.bits.addr_start := ld_bias_addr_start
   ld_bias.io.req.bits.dram_addr := loop_requesting_ld_bias.bias_dram_addr
   ld_bias.io.req.bits.no_bias := loop_requesting_ld_bias.no_bias
   ld_bias.io.req.bits.loop_id := loop_requesting_ld_bias_id
-  ld_bias.io.req.bits.laddrochs_offset := loop_requesting_ld_bias.laddrochs_offset // made
-  ld_bias.io.req.bits.ex_ochs := loop_requesting_ld_bias.ex_ochs // made
   if (use_shared_res_entries) {
-    ld_bias.io.req.bits.addr_start := loop_requesting_ld_bias.acc_addr_start // made
+    ld_bias.io.req.bits.addr_start := loop_requesting_ld_bias.acc_addr_start
+    ld_bias.io.req.bits.laddrochs_offset := loop_requesting_ld_bias.laddrochs_offset
+    ld_bias.io.req.bits.ex_ochs := loop_requesting_ld_bias.ex_ochs
     ld_bias.io.req.valid := !loop_requesting_ld_bias.ld_bias_started && loop_requesting_ld_bias.configured &&
       loop_requesting_ld_bias.ld_input_started &&
-      !(loop_requesting_ld_bias_id === ld_input.io.loop_id && io.ext_loop_conv_ws.get.loop_full && !ld_input.io.idle) // made
+      !sharedResLoopBlocked(loop_requesting_ld_bias_id)
   } else {
-    ld_bias.io.req.valid := !loop_requesting_ld_bias.ld_bias_started && loop_requesting_ld_bias.configured 
+    ld_bias.io.req.bits.addr_start := ld_bias_addr_start.get
+    ld_bias.io.req.bits.laddrochs_offset := 0.U
+    ld_bias.io.req.bits.ex_ochs := 0.U
+    ld_bias.io.req.valid := !loop_requesting_ld_bias.ld_bias_started && loop_requesting_ld_bias.configured
   }
 
   when (ld_bias.io.req.fire) {
@@ -1693,8 +1729,10 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
     loop_requesting_ld_bias.ld_bias_started := true.B
 
     // when (loop_requesting_ld_bias.bias_dram_addr =/= 0.U) {
-    when (loop_requesting_ld_bias.output_dram_addr =/= 0.U) {
-      ld_bias_addr_start := floorAdd(ld_bias_addr_start, (max_acc_addr / concurrent_loops).U, max_acc_addr.U)
+    if (!use_shared_res_entries) {
+      when (loop_requesting_ld_bias.output_dram_addr =/= 0.U) {
+        ld_bias_addr_start.get := floorAdd(ld_bias_addr_start.get, (max_acc_addr / concurrent_loops).U, max_acc_addr.U)
+      }
     }
   }
 
@@ -1703,19 +1741,24 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   ld_input.io.req.bits.outer_bounds := loop_requesting_ld_input.outer_bounds
   ld_input.io.req.bits.inner_bounds := loop_requesting_ld_input.inner_bounds
   ld_input.io.req.bits.derived_params := loop_requesting_ld_input.derived_params()
-  ld_input.io.req.bits.addr_start := loop_requesting_ld_input.a_addr_start
   ld_input.io.req.bits.dram_addr := loop_requesting_ld_input.input_dram_addr
   ld_input.io.req.bits.downsample := loop_requesting_ld_input.downsample
   ld_input.io.req.bits.max_pixels_per_row := loop_requesting_ld_input.max_pixels_per_row
   ld_input.io.req.bits.input_dilated := loop_requesting_ld_input.input_dilated
   ld_input.io.req.bits.trans_input_3120 := loop_requesting_ld_input.trans_input_3120
   ld_input.io.req.bits.loop_id := loop_requesting_ld_input_id
-  ld_input.io.req.bits.laddrkchs_offset := loop_requesting_ld_input.laddrkchs_offset // made
-  ld_input.io.req.bits.mv_kchs := loop_requesting_ld_input.mv_kchs // made
-  ld_input.io.req.bits.group_id := loop_requesting_ld_input.group_id // made
-  ld_input.io.req.bits.group_list := loop_requesting_ld_input.group_list // made
   if (use_shared_res_entries) {
-    ld_input.io.req.bits.addr_start := loop_requesting_ld_input.sp_addr_start // made
+    ld_input.io.req.bits.addr_start := loop_requesting_ld_input.sp_addr_start
+    ld_input.io.req.bits.laddrkchs_offset := loop_requesting_ld_input.laddrkchs_offset
+    ld_input.io.req.bits.mv_kchs := loop_requesting_ld_input.mv_kchs
+    ld_input.io.req.bits.group_id := loop_requesting_ld_input.group_id
+    ld_input.io.req.bits.group_list := loop_requesting_ld_input.group_list
+  } else {
+    ld_input.io.req.bits.addr_start := loop_requesting_ld_input.a_addr_start
+    ld_input.io.req.bits.laddrkchs_offset := 0.U
+    ld_input.io.req.bits.mv_kchs := 0.U
+    ld_input.io.req.bits.group_id := 0.U
+    ld_input.io.req.bits.group_list := 0.U
   }
 
   ld_input.io.req.valid := !loop_requesting_ld_input.ld_input_started && loop_requesting_ld_input.configured
@@ -1730,24 +1773,26 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   ld_weights.io.req.bits.outer_bounds := loop_requesting_ld_weights.outer_bounds
   ld_weights.io.req.bits.inner_bounds := loop_requesting_ld_weights.inner_bounds
   ld_weights.io.req.bits.derived_params := loop_requesting_ld_weights.derived_params()
-  ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.b_addr_end
   ld_weights.io.req.bits.dram_addr := loop_requesting_ld_weights.weights_dram_addr
   ld_weights.io.req.bits.trans_weight_1203 := loop_requesting_ld_weights.trans_weight_1203
   ld_weights.io.req.bits.trans_weight_0132 := loop_requesting_ld_weights.trans_weight_0132
   ld_weights.io.req.bits.dw := loop_requesting_ld_weights.dw
   ld_weights.io.req.bits.loop_id := loop_requesting_ld_weights_id
-  ld_weights.io.req.bits.laddrochs_offset := loop_requesting_ld_weights.laddrochs_offset // made
-  ld_weights.io.req.bits.ex_ochs := loop_requesting_ld_weights.ex_ochs // made
   if (use_shared_res_entries) {
     // val ldInputBlocks = inputBlocksNeeded(loop_requesting_ld_weights.trans_input_3120,
     //   loop_requesting_ld_weights.inner_bounds.batches, loop_requesting_ld_weights.derived_params().in_channels_per_bank)
     // ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.sp_addr_start + loop_requesting_ld_weights.derived_params().input_spad_stride * ldInputBlocks
     // ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.sp_addr_start + loop_requesting_ld_weights.derived_params().input_spad_stride * Mux(loop_requesting_ld_weights.trans_input_3120, loop_requesting_ld_weights.inner_bounds.batches >> log2Up(block_size), loop_requesting_ld_weights.derived_params().in_channels_per_bank)
     ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.sp_addr_end
+    ld_weights.io.req.bits.laddrochs_offset := loop_requesting_ld_weights.laddrochs_offset
+    ld_weights.io.req.bits.ex_ochs := loop_requesting_ld_weights.ex_ochs
     ld_weights.io.req.valid := !loop_requesting_ld_weights.ld_weights_started && loop_requesting_ld_weights.configured &&
       loop_requesting_ld_weights.ld_input_started &&
-      !(loop_requesting_ld_weights_id === ld_input.io.loop_id && io.ext_loop_conv_ws.get.loop_full && !ld_input.io.idle) // made
+      !sharedResLoopBlocked(loop_requesting_ld_weights_id)
   } else {
+    ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.b_addr_end
+    ld_weights.io.req.bits.laddrochs_offset := 0.U
+    ld_weights.io.req.bits.ex_ochs := 0.U
     ld_weights.io.req.valid := !loop_requesting_ld_weights.ld_weights_started && loop_requesting_ld_weights.configured
   }
 
@@ -1761,9 +1806,6 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   ex.io.req.bits.outer_bounds := loop_requesting_ex.outer_bounds
   ex.io.req.bits.inner_bounds := loop_requesting_ex.inner_bounds
   ex.io.req.bits.derived_params := loop_requesting_ex.derived_params()
-  ex.io.req.bits.a_addr_start := loop_requesting_ex.a_addr_start
-  ex.io.req.bits.b_addr_end := loop_requesting_ex.b_addr_end
-  ex.io.req.bits.c_addr_start := ex_c_addr_start
   ex.io.req.bits.wrot180 := loop_requesting_ex.wrot180
   ex.io.req.bits.downsample := loop_requesting_ex.downsample
   ex.io.req.bits.max_pixels_per_row := loop_requesting_ex.max_pixels_per_row
@@ -1771,22 +1813,29 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   ex.io.req.bits.trans_weight_0132 := loop_requesting_ex.trans_weight_0132
   ex.io.req.bits.trans_input_3120 := loop_requesting_ex.trans_input_3120
   ex.io.req.bits.loop_id := loop_requesting_ex_id
-  ex.io.req.bits.laddrochs_offset := loop_requesting_ex.laddrochs_offset // made
-  ex.io.req.bits.ex_ochs := loop_requesting_ex.ex_ochs // made
-  ex.io.req.bits.group_id := loop_requesting_ex.group_id // made
-  ex.io.req.bits.group_list := loop_requesting_ex.group_list // made
   if (use_shared_res_entries) {
-    ex.io.req.bits.a_addr_start := loop_requesting_ex.sp_addr_start // made
+    ex.io.req.bits.a_addr_start := loop_requesting_ex.sp_addr_start
     // val exInputBlocks = inputBlocksNeeded(loop_requesting_ex.trans_input_3120,
     //   loop_requesting_ex.inner_bounds.batches, loop_requesting_ex.derived_params().in_channels_per_bank)
     // ex.io.req.bits.b_addr_end := loop_requesting_ex.sp_addr_start + loop_requesting_ex.derived_params().input_spad_stride * exInputBlocks // made
     // ex.io.req.bits.b_addr_end := loop_requesting_ex.sp_addr_start + loop_requesting_ex.derived_params().input_spad_stride * Mux(loop_requesting_ex.trans_input_3120, loop_requesting_ex.inner_bounds.batches >> log2Up(block_size), loop_requesting_ex.derived_params().in_channels_per_bank) // made
     ex.io.req.bits.b_addr_end := loop_requesting_ex.sp_addr_end
-    ex.io.req.bits.c_addr_start := loop_requesting_ex.acc_addr_start // made
+    ex.io.req.bits.c_addr_start := loop_requesting_ex.acc_addr_start
+    ex.io.req.bits.laddrochs_offset := loop_requesting_ex.laddrochs_offset
+    ex.io.req.bits.ex_ochs := loop_requesting_ex.ex_ochs
+    ex.io.req.bits.group_id := loop_requesting_ex.group_id
+    ex.io.req.bits.group_list := loop_requesting_ex.group_list
     ex.io.req.valid := !loop_requesting_ex.ex_started && loop_requesting_ex.ld_bias_started &&
       loop_requesting_ex.ld_input_started && loop_requesting_ex.ld_weights_started && loop_requesting_ex.configured &&
-      !(loop_requesting_ex_id === ld_input.io.loop_id && io.ext_loop_conv_ws.get.loop_full && !ld_input.io.idle) // made
+      !sharedResLoopBlocked(loop_requesting_ex_id)
   } else {
+    ex.io.req.bits.a_addr_start := loop_requesting_ex.a_addr_start
+    ex.io.req.bits.b_addr_end := loop_requesting_ex.b_addr_end
+    ex.io.req.bits.c_addr_start := ex_c_addr_start.get
+    ex.io.req.bits.laddrochs_offset := 0.U
+    ex.io.req.bits.ex_ochs := 0.U
+    ex.io.req.bits.group_id := 0.U
+    ex.io.req.bits.group_list := 0.U
     ex.io.req.valid := !loop_requesting_ex.ex_started && loop_requesting_ex.ld_bias_started &&
       loop_requesting_ex.ld_input_started && loop_requesting_ex.ld_weights_started && loop_requesting_ex.configured
   }
@@ -1795,8 +1844,10 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
     loop_requesting_ex.running := true.B
     loop_requesting_ex.ex_started := true.B
 
-    when (loop_requesting_ex.output_dram_addr =/= 0.U) {
-      ex_c_addr_start := floorAdd(ex_c_addr_start, (max_acc_addr / concurrent_loops).U, max_acc_addr.U)
+    if (!use_shared_res_entries) {
+      when (loop_requesting_ex.output_dram_addr =/= 0.U) {
+        ex_c_addr_start.get := floorAdd(ex_c_addr_start.get, (max_acc_addr / concurrent_loops).U, max_acc_addr.U)
+      }
     }
   }
 
@@ -1805,21 +1856,23 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   st.io.req.bits.outer_bounds := loop_requesting_st.outer_bounds
   st.io.req.bits.inner_bounds := loop_requesting_st.inner_bounds
   st.io.req.bits.derived_params := loop_requesting_st.derived_params()
-  st.io.req.bits.addr_start := st_addr_start
   st.io.req.bits.dram_addr := loop_requesting_st.output_dram_addr
   st.io.req.bits.no_pool := loop_requesting_st.no_pool
   st.io.req.bits.activation := loop_requesting_st.activation
   st.io.req.bits.trans_output_1203 := loop_requesting_st.trans_output_1203
   st.io.req.bits.loop_id := loop_requesting_st_id
-  // made
-  st.io.req.bits.ex_ochs := loop_requesting_st.ex_ochs
-  st.io.req.bits.laddrochs_offset := loop_requesting_st.laddrochs_offset
-  st.io.req.bits.group_id := loop_requesting_st.group_id
   if (use_shared_res_entries) {
     st.io.req.bits.addr_start := loop_requesting_st.acc_addr_start
+    st.io.req.bits.ex_ochs := loop_requesting_st.ex_ochs
+    st.io.req.bits.laddrochs_offset := loop_requesting_st.laddrochs_offset
+    st.io.req.bits.group_id := loop_requesting_st.group_id
     st.io.req.valid := !loop_requesting_st.st_started && loop_requesting_st.ex_started && loop_requesting_st.configured &&
-      !(loop_requesting_st_id === ld_input.io.loop_id && io.ext_loop_conv_ws.get.loop_full && !ld_input.io.idle) // made
+      !sharedResLoopBlocked(loop_requesting_st_id)
   } else {
+    st.io.req.bits.addr_start := st_addr_start.get
+    st.io.req.bits.ex_ochs := 0.U
+    st.io.req.bits.laddrochs_offset := 0.U
+    st.io.req.bits.group_id := 0.U
     st.io.req.valid := !loop_requesting_st.st_started && loop_requesting_st.ex_started && loop_requesting_st.configured
   }
   // made end
@@ -1828,8 +1881,10 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
     loop_requesting_st.running := true.B
     loop_requesting_st.st_started := true.B
 
-    when (loop_requesting_st.output_dram_addr =/= 0.U) {
-      st_addr_start := floorAdd(st_addr_start, (max_acc_addr / concurrent_loops).U, max_acc_addr.U)
+    if (!use_shared_res_entries) {
+      when (loop_requesting_st.output_dram_addr =/= 0.U) {
+        st_addr_start.get := floorAdd(st_addr_start.get, (max_acc_addr / concurrent_loops).U, max_acc_addr.U)
+      }
     }
   }
 
@@ -1863,8 +1918,10 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   when (reset.asBool) {
     loops.zipWithIndex.foreach { case (l, i) =>
       l.reset()
-      l.a_addr_start := (i * (max_addr / concurrent_loops)).U
-      l.b_addr_end := ((i+1) * (max_addr / concurrent_loops)).U
+      if (!use_shared_res_entries) {
+        l.a_addr_start := (i * (max_addr / concurrent_loops)).U
+        l.b_addr_end := ((i+1) * (max_addr / concurrent_loops)).U
+      }
     }
   }
 }

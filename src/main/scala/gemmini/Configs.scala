@@ -275,9 +275,9 @@ object GemminiConfigs {
   val chipConfig = defaultConfig.copy(sp_capacity=CapacityInKilobytes(64), acc_capacity=CapacityInKilobytes(32), dataflow=Dataflow.BOTH,
     acc_scale_args=Some(defaultConfig.acc_scale_args.get.copy(latency=4)),
     acc_singleported=false,
-    acc_sub_banks=8,
+    acc_sub_banks=4,
     sp_singleported=true,
-    sp_sub_banks=8,
+    sp_sub_banks=4,
     mesh_output_delay = 2,
     ex_read_from_acc=false,
     ex_write_to_spad=false,
@@ -355,7 +355,7 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
   mesh_cols: Int = 16,
   sp_kB: Int = 64,
   acc_kB: Int = 32,
-  gemminiConfig: GemminiArrayConfig[T,U,V] = GemminiConfigs.chipConfig
+  gemminiConfig: GemminiArrayConfig[T,U,V] = GemminiConfigs.firesimConfig
 ) extends Config((site, here, up) => {
   case BuildRoCC => {
     var gemmini0: Gemmini[T,U,V] = null
@@ -441,7 +441,9 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
         // val acc_data_len = gemmini0.spad.module.acc_mems(0).mask_elem.getWidth
 
         if (gemmini0.config.use_shared_ext_mem) {
-          val shared_mem = Module(new SharedExtMem_4(gemmini0.config, (gemmini0.config.spad_read_delay+2 max 3)))
+          val shared_mem = Module(new SharedExtMem_4(
+            gemmini0.config
+          ))
 
           shared_mem.io.in(0) <> gemmini0.module.ext_mem_io.get
           shared_mem.io.in(1) <> gemmini1.module.ext_mem_io.get
