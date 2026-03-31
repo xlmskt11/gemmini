@@ -1078,8 +1078,6 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
           loop_being_configured.mv_pad_K.get := cmd.bits.cmd.rs2(iterator_bitwidth * 2 - 1, iterator_bitwidth)
           loop_being_configured.ex_I.get := cmd.bits.cmd.rs2(iterator_bitwidth - 1, 0)
 
-          loop_being_configured.group_list.get := cmd.bits.cmd.rs1(iterator_bitwidth * 3 + nSharers - 1, iterator_bitwidth * 3)
-          loop_being_configured.group_id.get := cmd.bits.cmd.rs1(iterator_bitwidth * 2 + group_w - 1, iterator_bitwidth * 2)
           loop_being_configured.laddrRB_offset.get := cmd.bits.cmd.rs1(iterator_bitwidth * 2 - 1, iterator_bitwidth)
           loop_being_configured.laddrRA_offset.get := cmd.bits.cmd.rs1(iterator_bitwidth - 1, 0)
         }
@@ -1122,6 +1120,10 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
 
         loop_being_configured.a_transpose := cmd.bits.cmd.rs2(0)
         loop_being_configured.b_transpose := cmd.bits.cmd.rs2(1)
+        if (use_shared_res_entries) {
+          loop_being_configured.group_list.get := cmd.bits.cmd.rs1(iterator_bitwidth * 3 + nSharers - 1, iterator_bitwidth * 3)
+          loop_being_configured.group_id.get := cmd.bits.cmd.rs1(iterator_bitwidth * 2 + group_w - 1, iterator_bitwidth * 2)
+        }
 
         loop_being_configured.configured := true.B
 

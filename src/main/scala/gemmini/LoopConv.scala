@@ -1579,8 +1579,6 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
           loop_being_configured.mv_kchs.get := cmd.bits.cmd.rs2(large_iterator_bitwidth * 2 - 1, large_iterator_bitwidth)
           loop_being_configured.ex_ochs.get := cmd.bits.cmd.rs2(large_iterator_bitwidth - 1, 0)
 
-          loop_being_configured.group_list.get := cmd.bits.cmd.rs1(large_iterator_bitwidth * 3 + nSharers - 1, large_iterator_bitwidth * 3)
-          loop_being_configured.group_id.get := cmd.bits.cmd.rs1(large_iterator_bitwidth * 2 + group_w - 1, large_iterator_bitwidth * 2)
           loop_being_configured.laddrkchs_offset.get := cmd.bits.cmd.rs1(large_iterator_bitwidth * 2 - 1, large_iterator_bitwidth)
           loop_being_configured.laddrochs_offset.get := cmd.bits.cmd.rs1(large_iterator_bitwidth - 1, 0)
         }
@@ -1660,6 +1658,10 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
         loop_being_configured.trans_weight_0132 := has_training_convs.B && cmd.bits.cmd.rs1(4)
         loop_being_configured.trans_input_3120 := has_training_convs.B && cmd.bits.cmd.rs1(5)
         loop_being_configured.dw := has_dw_convs.B && cmd.bits.cmd.rs1(6)
+        if (use_shared_res_entries) {
+          loop_being_configured.group_list.get := cmd.bits.cmd.rs1(large_iterator_bitwidth * 3 + nSharers - 1, large_iterator_bitwidth * 3)
+          loop_being_configured.group_id.get := cmd.bits.cmd.rs1(large_iterator_bitwidth * 2 + group_w - 1, large_iterator_bitwidth * 2)
+        }
 
         loop_being_configured.no_pool := !has_max_pool.B || cmd.bits.cmd.rs2(0)
         loop_being_configured.activation := cmd.bits.cmd.rs2(4,3)
