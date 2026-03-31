@@ -33,7 +33,7 @@ class MeshWithDelays[T <: Data: Arithmetic, U <: TagQueueTag with Data]
   (inputType: T, val outputType: T, accType: T,
    tagType: U, df: Dataflow.Value, tree_reduction: Boolean, tile_latency: Int, output_delay: Int,
    tileRows: Int, tileColumns: Int, meshRows: Int, meshColumns: Int,
-   leftBanks: Int, upBanks: Int, outBanks: Int = 1, n_simultaneous_matmuls: Int = -1)
+   leftBanks: Int, upBanks: Int, outBanks: Int = 1, n_simultaneous_matmuls: Int = -1, use_shared_ext_mem: Boolean = false)
   extends Module {
 
   val A_TYPE = Vec(meshRows, Vec(tileRows, inputType))
@@ -66,13 +66,10 @@ class MeshWithDelays[T <: Data: Arithmetic, U <: TagQueueTag with Data]
 
     val tags_in_progress = Output(Vec(tagqlen, tagType))
 
-    // Row-advance grant handshake from ExecuteController.
-    // When a row is ready to advance into the spatial array, ExecuteController can pause that advance
-    // until shared-ext-mem write reservation is granted.
-    val row_advance_grant_required = Input(Bool())
-    val row_advance_grant_ready = Input(Bool())
-    val row_advance_req = Output(Bool())
-    val row_advance_fire = Output(Bool())
+    val row_advance_grant_required = if (use_shared_ext_mem) Some(Input(Bool())) else None
+    val row_advance_grant_ready = if (use_shared_ext_mem) Some(Input(Bool())) else None
+    val row_advance_req = if (use_shared_ext_mem) Some(Output(Bool())) else None
+    val row_advance_fire = if (use_shared_ext_mem) Some(Output(Bool())) else None
   })
 
   def shifted[T <: Data](x: Vec[Vec[T]], banks: Int, reverse: Boolean = false) = {
@@ -116,15 +113,22 @@ class MeshWithDelays[T <: Data: Arithmetic, U <: TagQueueTag with Data]
   val in_prop = Reg(UInt(1.W)) // TODO inelegant
 
   val input_next_row_into_spatial_array = req.valid && ((a_written && b_written && d_written) || req.bits.flush > 0.U)
-  val wait_for_row_advance_grant = io.row_advance_grant_required && !io.row_advance_grant_ready
-  dontTouch(wait_for_row_advance_grant)
-  dontTouch(input_next_row_into_spatial_array)
-  val wating_for_grant = wait_for_row_advance_grant && input_next_row_into_spatial_array
-  dontTouch(wating_for_grant)
+  val wait_for_row_advance_grant = if (use_shared_ext_mem) {
+    val wait_for_grant = io.row_advance_grant_required.get && !io.row_advance_grant_ready.get
+    dontTouch(wait_for_grant)
+    dontTouch(input_next_row_into_spatial_array)
+    val waiting_for_grant = wait_for_grant && input_next_row_into_spatial_array
+    dontTouch(waiting_for_grant)
+    wait_for_grant
+  } else {
+    false.B
+  }
   val input_next_row_into_spatial_array_granted = input_next_row_into_spatial_array && !wait_for_row_advance_grant
 
-  io.row_advance_req := input_next_row_into_spatial_array && io.row_advance_grant_required
-  io.row_advance_fire := input_next_row_into_spatial_array_granted
+  if (use_shared_ext_mem) {
+    io.row_advance_req.get := input_next_row_into_spatial_array && io.row_advance_grant_required.get
+    io.row_advance_fire.get := input_next_row_into_spatial_array_granted
+  }
 
   val last_fire = fire_counter === total_fires - 1.U && input_next_row_into_spatial_array_granted
 

@@ -58,8 +58,6 @@ class LoopConvDerivedParams(val large_iterator_bitwidth: Int, val small_iterator
   val out_channels_per_bank = UInt(small_iterator_bitwidth.W) // TODO this won't work for systolic arrays above 256 in size
   val in_channels_per_bank = UInt(small_iterator_bitwidth.W) // TODO this won't work for systolic arrays above 256 in size
 
-  val batches_per_bank = UInt(small_iterator_bitwidth.W) // made
-
   val bias_spad_stride = UInt(large_iterator_bitwidth.W)
   val input_spad_stride = UInt(large_iterator_bitwidth.W)
   val weight_spad_stride = UInt(large_iterator_bitwidth.W)
@@ -67,11 +65,9 @@ class LoopConvDerivedParams(val large_iterator_bitwidth: Int, val small_iterator
   // val ex_overwrite = Bool()
 }
 
-class LoopConvLdBiasReq(val coreMaxAddrBits: Int, val large_iterator_bitwidth: Int, val small_iterator_bitwidth: Int, val tiny_iterator_bitwidth: Int, val max_acc_addr: Int, val concurrent_loops: Int)  extends Bundle {
-  // made
-  val laddrochs_offset = UInt(large_iterator_bitwidth.W)
-  val ex_ochs = UInt(large_iterator_bitwidth.W)
-  // made end
+class LoopConvLdBiasReq(val coreMaxAddrBits: Int, val large_iterator_bitwidth: Int, val small_iterator_bitwidth: Int, val tiny_iterator_bitwidth: Int, val max_acc_addr: Int, val concurrent_loops: Int, val use_shared_res_entries: Boolean)  extends Bundle {
+  val laddrochs_offset = if (use_shared_res_entries) Some(UInt(large_iterator_bitwidth.W)) else None
+  val ex_ochs = if (use_shared_res_entries) Some(UInt(large_iterator_bitwidth.W)) else None
   val outer_bounds = new LoopConvOuterBounds(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
   val inner_bounds = new LoopConvInnerBounds(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
   val derived_params = new LoopConvDerivedParams(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
@@ -86,7 +82,7 @@ class LoopConvLdBias(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwi
                      config_mvin_rs1_t: ConfigMvinRs1, mvin_rs2_t: MvinRs2, use_shared_res_entries: Boolean)(implicit p: Parameters) extends Module {
   val MVIN_SCALE_IDENTITY = 0x3f800000.U // TODO get this from configs somehow
   val io = IO(new Bundle {
-    val req = Flipped(Decoupled(new LoopConvLdBiasReq(coreMaxAddrBits, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth: Int, max_acc_addr, concurrent_loops)))
+    val req = Flipped(Decoupled(new LoopConvLdBiasReq(coreMaxAddrBits, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth: Int, max_acc_addr, concurrent_loops, use_shared_res_entries)))
     val cmd = Decoupled(Output(new RoCCCommand))
 
     val idle = Output(Bool())
@@ -102,21 +98,21 @@ class LoopConvLdBias(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwi
   import State._
   val state = RegInit(idle)
 
-  val req = Reg(new LoopConvLdBiasReq(coreMaxAddrBits, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth: Int, max_acc_addr, concurrent_loops))
+  val req = Reg(new LoopConvLdBiasReq(coreMaxAddrBits, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth: Int, max_acc_addr, concurrent_loops, use_shared_res_entries))
   import req.inner_bounds._
   import req.derived_params._
 
   // Derived parameters
   val max_ochs_per_mvin = if (use_shared_res_entries) {
-    Mux(req.ex_ochs < (max_block_len_acc * block_size).U, req.ex_ochs, (max_block_len_acc * block_size).U)
+    Mux(req.ex_ochs.get < (max_block_len_acc * block_size).U, req.ex_ochs.get, (max_block_len_acc * block_size).U)
   } else {
     Mux(ochs < (max_block_len_acc * block_size).U, ochs, (max_block_len_acc * block_size).U)
   }
 
   val skip = if (use_shared_res_entries) {
-    req.dram_addr === 0.U || req.ex_ochs === 0.U
+    req.dram_addr === 0.U || req.ex_ochs.get === 0.U
   } else {
-    req.dram_addr === 0.U || ochs === 0.U
+    req.dram_addr === 0.U
   }
 
   // Iterators
@@ -128,7 +124,7 @@ class LoopConvLdBias(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwi
   // changed
   // val acc_addr_start = req.addr_start
   val acc_addr_start = if (use_shared_res_entries) {
-    req.addr_start +& (req.laddrochs_offset / block_size.U(och.getWidth.W)) * batches * orows * ocols
+    req.addr_start +& (req.laddrochs_offset.get / block_size.U(och.getWidth.W)) * batches * orows * ocols
   } else {
     req.addr_start
   }
@@ -142,7 +138,7 @@ class LoopConvLdBias(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwi
   // Sizes
   val I = Mux(ocols - ocol > block_size.U, block_size.U, ocols - ocol)
   val J = if (use_shared_res_entries) {
-    Mux(req.ex_ochs - och > max_ochs_per_mvin, max_ochs_per_mvin, req.ex_ochs - och)
+    Mux(req.ex_ochs.get - och > max_ochs_per_mvin, max_ochs_per_mvin, req.ex_ochs.get - och)
   } else {
     Mux(ochs - och > max_ochs_per_mvin, max_ochs_per_mvin, ochs - och)
   }
@@ -215,7 +211,7 @@ class LoopConvLdBias(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwi
       state := ld
     }.otherwise {
       val next_och = if (use_shared_res_entries) {
-        floorAdd(och, max_ochs_per_mvin, req.ex_ochs)
+        floorAdd(och, max_ochs_per_mvin, req.ex_ochs.get)
       } else {
         floorAdd(och, max_ochs_per_mvin, ochs)
       }
@@ -244,13 +240,11 @@ class LoopConvLdBias(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwi
   }
 }
 
-class LoopConvLdInputReq(val coreMaxAddrBits: Int, val large_iterator_bitwidth: Int, val small_iterator_bitwidth: Int, val tiny_iterator_bitwidth: Int, val max_acc_addr: Int, val concurrent_loops: Int, use_shared_res_entries: Boolean, group_w: Int, nSharers: Int)  extends Bundle {
-  // made
-  val mv_kchs = UInt(large_iterator_bitwidth.W)
-  val laddrkchs_offset = UInt(large_iterator_bitwidth.W)
-  val group_id = UInt(group_w.W)
-  val group_list = UInt(nSharers.W)
-  // made end
+class LoopConvLdInputReq(val coreMaxAddrBits: Int, val large_iterator_bitwidth: Int, val small_iterator_bitwidth: Int, val tiny_iterator_bitwidth: Int, val max_acc_addr: Int, val concurrent_loops: Int, val use_shared_res_entries: Boolean, val group_w: Int, val nSharers: Int)  extends Bundle {
+  val mv_kchs = if (use_shared_res_entries) Some(UInt(large_iterator_bitwidth.W)) else None
+  val laddrkchs_offset = if (use_shared_res_entries) Some(UInt(large_iterator_bitwidth.W)) else None
+  val group_id = if (use_shared_res_entries) Some(UInt(group_w.W)) else None
+  val group_list = if (use_shared_res_entries) Some(UInt(nSharers.W)) else None
   val outer_bounds = new LoopConvOuterBounds(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
   val inner_bounds = new LoopConvInnerBounds(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
   val derived_params = new LoopConvDerivedParams(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
@@ -279,9 +273,9 @@ class LoopConvLdInput(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitw
 
     val loop_id = Output(UInt(log2Up(concurrent_loops).W))
 
-    val group_id = Output(UInt(group_w.W)) // made
-    val group_list = Output(UInt(nSharers.W)) // made
-    val loop_full = Input(Bool()) // made
+    val group_id = if (use_shared_res_entries) Some(Output(UInt(group_w.W))) else None
+    val group_list = if (use_shared_res_entries) Some(Output(UInt(nSharers.W))) else None
+    val loop_full = if (use_shared_res_entries) Some(Input(Bool())) else None
   })
 
   object State extends ChiselEnum {
@@ -301,7 +295,7 @@ class LoopConvLdInput(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitw
   // changed
   // val max_ichs_per_mvin = Mux(ichs < (max_block_len * block_size).U, ichs, (max_block_len * block_size).U).zext
   val max_ichs_per_mvin = if (use_shared_res_entries) {
-    Mux(req.mv_kchs < (max_block_len * block_size).U, req.mv_kchs, (max_block_len * block_size).U).zext
+    Mux(req.mv_kchs.get < (max_block_len * block_size).U, req.mv_kchs.get, (max_block_len * block_size).U).zext
   } else {
     Mux(ichs < (max_block_len * block_size).U, ichs, (max_block_len * block_size).U).zext
   }
@@ -326,7 +320,11 @@ class LoopConvLdInput(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitw
     (((b * in_dim * in_dim +& irow*in_dim +& icol) * in_channels +& ich) * (input_w/8).U).asUInt)
   val dram_addr = Mux(is_zeros, 0.U, req.dram_addr + LoopConv.castDramOffset(dram_offset))
 
-  val spad_addr_offset = Mux(req.trans_input_3120, req.laddrkchs_offset * (irows >> req.downsample) * (icols >> req.downsample), (req.laddrkchs_offset >> log2Up(block_size)) * input_spad_stride) // made
+  val spad_addr_offset = if (use_shared_res_entries) {
+    Some(Mux(req.trans_input_3120, req.laddrkchs_offset.get * (irows >> req.downsample) * (icols >> req.downsample), (req.laddrkchs_offset.get >> log2Up(block_size)) * input_spad_stride))
+  } else {
+    None
+  }
   // changed
   // val spad_addr = Mux(req.trans_input_3120,
   // // To prevent Verilator errors, we replace some "/ block_size.U" calls here with ">> log2Up(block_size)"
@@ -335,8 +333,8 @@ class LoopConvLdInput(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitw
   val spad_addr = if (use_shared_res_entries) {
     Mux(req.trans_input_3120,
     // To prevent Verilator errors, we replace some "/ block_size.U" calls here with ">> log2Up(block_size)"
-    req.addr_start.zext +& spad_addr_offset.zext +& (b >> log2Up(block_size)) * input_spad_stride +& ich * (irows >> req.downsample) * (icols >> req.downsample) +& (irow_padded >> req.downsample) * (icols >> req.downsample) +& (icol_padded >> req.downsample),
-    req.addr_start.zext +& spad_addr_offset.zext +& (ich >> log2Up(block_size)) * input_spad_stride +& b * (irows >> req.downsample) * (icols >> req.downsample) +& (irow_padded >> req.downsample) * (icols >> req.downsample) +& (icol_padded >> req.downsample))
+    req.addr_start.zext +& spad_addr_offset.get.zext +& (b >> log2Up(block_size)) * input_spad_stride +& ich * (irows >> req.downsample) * (icols >> req.downsample) +& (irow_padded >> req.downsample) * (icols >> req.downsample) +& (icol_padded >> req.downsample),
+    req.addr_start.zext +& spad_addr_offset.get.zext +& (ich >> log2Up(block_size)) * input_spad_stride +& b * (irows >> req.downsample) * (icols >> req.downsample) +& (irow_padded >> req.downsample) * (icols >> req.downsample) +& (icol_padded >> req.downsample))
   } else {
     Mux(req.trans_input_3120,
     // To prevent Verilator errors, we replace some "/ block_size.U" calls here with ">> log2Up(block_size)"
@@ -362,7 +360,7 @@ class LoopConvLdInput(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitw
   val K = if (use_shared_res_entries) {
     Mux(req.trans_input_3120,
     Mux(batches.zext -& b > max_chs_per_mvin, max_chs_per_mvin, batches.zext -& b),
-    Mux(req.mv_kchs.zext -& ich > max_chs_per_mvin, max_chs_per_mvin, req.mv_kchs.zext -& ich))
+    Mux(req.mv_kchs.get.zext -& ich > max_chs_per_mvin, max_chs_per_mvin, req.mv_kchs.get.zext -& ich))
   } else {
     Mux(req.trans_input_3120,
     Mux(batches.zext -& b > max_chs_per_mvin, max_chs_per_mvin, batches.zext -& b),
@@ -405,15 +403,13 @@ class LoopConvLdInput(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitw
   io.idle := state === idle && !command_p.io.busy
   io.loop_id := req.loop_id
   if (use_shared_res_entries) {
-    io.group_list := req.group_list
-  } else {
-    io.group_list := 0.U
+    io.group_list.get := req.group_list.get
   }
 
   // changed
   // command_p.io.in.valid := state =/= idle && !io.wait_for_prev_loop
   if (use_shared_res_entries) {
-    command_p.io.in.valid := state =/= idle && !io.wait_for_prev_loop && !io.loop_full && req.mv_kchs =/= 0.U
+    command_p.io.in.valid := state =/= idle && !io.wait_for_prev_loop && !io.loop_full.get && req.mv_kchs.get =/= 0.U
   } else {
     command_p.io.in.valid := state =/= idle && !io.wait_for_prev_loop
   }
@@ -439,14 +435,12 @@ class LoopConvLdInput(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitw
   }
 
   if (use_shared_res_entries) {
-    io.group_id := req.group_id
-  } else {
-    io.group_id := 0.U
+    io.group_id.get := req.group_id.get
   }
 
   // Sending outputs
   val skipEmptySharedInputLoad = if (use_shared_res_entries) {
-    req.mv_kchs === 0.U && !io.loop_full
+    req.mv_kchs.get === 0.U && !io.loop_full.get
   } else {
     false.B
   }
@@ -463,7 +457,7 @@ class LoopConvLdInput(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitw
       // changed
       // val next_ich = sFloorAdd(ich, ich_it, ichs.zext, 0.S)
       val next_ich = if (use_shared_res_entries) {
-        sFloorAdd(ich, ich_it, req.mv_kchs.zext, 0.S)
+        sFloorAdd(ich, ich_it, req.mv_kchs.get.zext, 0.S)
       } else {
         sFloorAdd(ich, ich_it, ichs.zext, 0.S)
       }
@@ -495,11 +489,9 @@ class LoopConvLdInput(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitw
   }
 }
 
-class LoopConvLdWeightReq(val coreMaxAddrBits: Int, val large_iterator_bitwidth: Int, val small_iterator_bitwidth: Int, val tiny_iterator_bitwidth: Int, val max_addr: Int, val concurrent_loops: Int)  extends Bundle {
-  // made
-  val ex_ochs = UInt(large_iterator_bitwidth.W)
-  val laddrochs_offset = UInt(large_iterator_bitwidth.W)
-  // made end
+class LoopConvLdWeightReq(val coreMaxAddrBits: Int, val large_iterator_bitwidth: Int, val small_iterator_bitwidth: Int, val tiny_iterator_bitwidth: Int, val max_addr: Int, val concurrent_loops: Int, val use_shared_res_entries: Boolean)  extends Bundle {
+  val ex_ochs = if (use_shared_res_entries) Some(UInt(large_iterator_bitwidth.W)) else None
+  val laddrochs_offset = if (use_shared_res_entries) Some(UInt(large_iterator_bitwidth.W)) else None
   val outer_bounds = new LoopConvOuterBounds(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
   val inner_bounds = new LoopConvInnerBounds(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
   val derived_params = new LoopConvDerivedParams(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
@@ -518,7 +510,7 @@ class LoopConvLdWeight(block_size: Int, coreMaxAddrBits: Int, large_iterator_bit
   val MVIN_SCALE_IDENTITY = 0x3f800000.U // TODO get this from configs somehow
 
   val io = IO(new Bundle {
-    val req = Flipped(Decoupled(new LoopConvLdWeightReq(coreMaxAddrBits, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth, max_addr, concurrent_loops)))
+    val req = Flipped(Decoupled(new LoopConvLdWeightReq(coreMaxAddrBits, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth, max_addr, concurrent_loops, use_shared_res_entries)))
     val cmd = Decoupled(Output(new RoCCCommand))
 
     val idle = Output(Bool())
@@ -534,7 +526,7 @@ class LoopConvLdWeight(block_size: Int, coreMaxAddrBits: Int, large_iterator_bit
   import State._
   val state = RegInit(idle)
 
-  val req = Reg(new LoopConvLdWeightReq(coreMaxAddrBits, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth, max_addr, concurrent_loops))
+  val req = Reg(new LoopConvLdWeightReq(coreMaxAddrBits, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth, max_addr, concurrent_loops, use_shared_res_entries))
   import req.outer_bounds._
   import req.inner_bounds._
   import req.derived_params._
@@ -544,7 +536,7 @@ class LoopConvLdWeight(block_size: Int, coreMaxAddrBits: Int, large_iterator_bit
     // changed
     // val max_ochs_per_mvin = Mux(ochs < (max_block_len * block_size).U, ochs, (max_block_len * block_size).U)
     val max_ochs_per_mvin = if (use_shared_res_entries) {
-      Mux(req.ex_ochs < (max_block_len * block_size).U, req.ex_ochs, (max_block_len * block_size).U)
+      Mux(req.ex_ochs.get < (max_block_len * block_size).U, req.ex_ochs.get, (max_block_len * block_size).U)
     } else {
       Mux(ochs < (max_block_len * block_size).U, ochs, (max_block_len * block_size).U)
     }
@@ -569,7 +561,7 @@ class LoopConvLdWeight(block_size: Int, coreMaxAddrBits: Int, large_iterator_bit
   // changed
   // val addr_start = req.addr_end - B_rows
   val addr_start = if (use_shared_res_entries) {
-    req.addr_end + Mux(req.trans_weight_0132, req.laddrochs_offset, (req.laddrochs_offset / block_size.U(och.getWidth.W)) * krows * kcols * kchs)
+    req.addr_end - B_rows + Mux(req.trans_weight_0132, req.laddrochs_offset.get, (req.laddrochs_offset.get / block_size.U(och.getWidth.W)) * krows * kcols * kchs)
   } else {
     req.addr_end - B_rows
   }
@@ -595,7 +587,7 @@ class LoopConvLdWeight(block_size: Int, coreMaxAddrBits: Int, large_iterator_bit
   val J = if (use_shared_res_entries) {
     Mux(req.trans_weight_0132,
     Mux(kchs - kch > max_chs_per_mvin, max_chs_per_mvin, kchs - kch),
-    Mux(req.ex_ochs - och > max_chs_per_mvin, max_chs_per_mvin, req.ex_ochs - och))
+    Mux(req.ex_ochs.get - och > max_chs_per_mvin, max_chs_per_mvin, req.ex_ochs.get - och))
   } else {
     Mux(req.trans_weight_0132,
     Mux(kchs - kch > max_chs_per_mvin, max_chs_per_mvin, kchs - kch),
@@ -607,7 +599,7 @@ class LoopConvLdWeight(block_size: Int, coreMaxAddrBits: Int, large_iterator_bit
   //   Mux(kchs - kch > block_size.U, block_size.U, kchs - kch))
   val K = if (use_shared_res_entries) {
     Mux(req.trans_weight_0132,
-    Mux(req.ex_ochs - och > block_size.U, block_size.U, req.ex_ochs - och),
+    Mux(req.ex_ochs.get - och > block_size.U, block_size.U, req.ex_ochs.get - och),
     Mux(kchs - kch > block_size.U, block_size.U, kchs - kch))
   } else {
     Mux(req.trans_weight_0132,
@@ -655,7 +647,7 @@ class LoopConvLdWeight(block_size: Int, coreMaxAddrBits: Int, large_iterator_bit
   // changed
   // command_p.io.in.valid := state =/= idle && !io.wait_for_prev_loop
   if (use_shared_res_entries) {
-    command_p.io.in.valid := state =/= idle && !io.wait_for_prev_loop && req.ex_ochs =/= 0.U
+    command_p.io.in.valid := state =/= idle && !io.wait_for_prev_loop && req.ex_ochs.get =/= 0.U
   } else {
     command_p.io.in.valid := state =/= idle && !io.wait_for_prev_loop
   }
@@ -681,7 +673,7 @@ class LoopConvLdWeight(block_size: Int, coreMaxAddrBits: Int, large_iterator_bit
 
   // Sending outputs
   val skipEmptySharedWeightLoad = if (use_shared_res_entries) {
-    req.ex_ochs === 0.U
+    req.ex_ochs.get === 0.U
   } else {
     false.B
   }
@@ -701,7 +693,7 @@ class LoopConvLdWeight(block_size: Int, coreMaxAddrBits: Int, large_iterator_bit
       // changed
       // val next_och = floorAdd(och, och_it, ochs, next_krow === 0.U && next_kcol === 0.U && next_kch === 0.U)
       val next_och = if (use_shared_res_entries) {
-        floorAdd(och, och_it, req.ex_ochs, next_krow === 0.U && next_kcol === 0.U && next_kch === 0.U)
+        floorAdd(och, och_it, req.ex_ochs.get, next_krow === 0.U && next_kcol === 0.U && next_kch === 0.U)
       } else {
         floorAdd(och, och_it, ochs, next_krow === 0.U && next_kcol === 0.U && next_kch === 0.U)
       }
@@ -727,13 +719,10 @@ class LoopConvLdWeight(block_size: Int, coreMaxAddrBits: Int, large_iterator_bit
   }
 }
 
-class LoopConvExecuteReq(val large_iterator_bitwidth: Int, val small_iterator_bitwidth: Int, val tiny_iterator_bitwidth: Int, val max_addr: Int, val max_acc_addr: Int, val concurrent_loops: Int, val group_w: Int, val nSharers: Int)  extends Bundle {
-  // made
-  val ex_ochs = UInt(large_iterator_bitwidth.W)
-  val laddrochs_offset = UInt(large_iterator_bitwidth.W)
-  val group_id = UInt(group_w.W)
-  val group_list = UInt(nSharers.W)
-  // made end
+class LoopConvExecuteReq(val large_iterator_bitwidth: Int, val small_iterator_bitwidth: Int, val tiny_iterator_bitwidth: Int, val max_addr: Int, val max_acc_addr: Int, val concurrent_loops: Int, val use_shared_res_entries: Boolean, val group_w: Int, val nSharers: Int)  extends Bundle {
+  val ex_ochs = if (use_shared_res_entries) Some(UInt(large_iterator_bitwidth.W)) else None
+  val laddrochs_offset = if (use_shared_res_entries) Some(UInt(large_iterator_bitwidth.W)) else None
+  val group_id = if (use_shared_res_entries) Some(UInt(group_w.W)) else None
   val outer_bounds = new LoopConvOuterBounds(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
   val inner_bounds = new LoopConvInnerBounds(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
   val derived_params = new LoopConvDerivedParams(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
@@ -754,10 +743,10 @@ class LoopConvExecute(block_size: Int, large_iterator_bitwidth: Int, small_itera
                       config_ex_rs1_t: ConfigExRs1, preload_rs1_t: PreloadRs, preload_rs2_t: PreloadRs,
                       compute_rs1_t: ComputeRs, compute_rs2_t: ComputeRs, use_shared_res_entries: Boolean, group_w: Int, nSharers: Int)(implicit p: Parameters) extends Module {
   val io = IO(new Bundle {
-    val req = Flipped(Decoupled(new LoopConvExecuteReq(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth, max_addr, max_acc_addr, concurrent_loops, group_w, nSharers)))
+    val req = Flipped(Decoupled(new LoopConvExecuteReq(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth, max_addr, max_acc_addr, concurrent_loops, use_shared_res_entries, group_w, nSharers)))
     val cmd = Decoupled(Output(new RoCCCommand))
 
-    val lda_completed = Input(Bool())
+    val lda_completed = if (!use_shared_res_entries) Some(Input(Bool())) else None
     val ldb_completed = Input(Bool())
     val ldd_completed = Input(Bool())
 
@@ -766,9 +755,8 @@ class LoopConvExecute(block_size: Int, large_iterator_bitwidth: Int, small_itera
 
     val loop_id = Output(UInt(log2Up(concurrent_loops).W))
 
-    val group_id = Output(UInt(group_w.W)) // made
-    val group_list = Output(UInt(nSharers.W)) // made
-    val lda_ahead = Input(Bool()) // made
+    val group_id = if (use_shared_res_entries) Some(Output(UInt(group_w.W))) else None
+    val lda_ahead = if (use_shared_res_entries) Some(Input(Bool())) else None
   })
 
   object State extends ChiselEnum {
@@ -778,7 +766,7 @@ class LoopConvExecute(block_size: Int, large_iterator_bitwidth: Int, small_itera
   val state = RegInit(idle)
 
   val req = Reg(new LoopConvExecuteReq(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth,
-    max_addr, max_acc_addr, concurrent_loops, group_w, nSharers))
+    max_addr, max_acc_addr, concurrent_loops, use_shared_res_entries, group_w, nSharers))
   import req.outer_bounds._
   import req.inner_bounds._
   import req.derived_params._
@@ -802,7 +790,7 @@ class LoopConvExecute(block_size: Int, large_iterator_bitwidth: Int, small_itera
   // changed
   // val b_addr_start = req.b_addr_end - B_rows
   val b_addr_start = if (use_shared_res_entries) {
-    req.b_addr_end +& Mux(req.trans_weight_0132, req.laddrochs_offset, (req.laddrochs_offset / block_size.U(och.getWidth.W)) * krows * kcols * kchs)
+    req.b_addr_end - B_rows +& Mux(req.trans_weight_0132, req.laddrochs_offset.get, (req.laddrochs_offset.get / block_size.U(och.getWidth.W)) * krows * kcols * kchs)
   } else {
     req.b_addr_end - B_rows
   }
@@ -810,7 +798,7 @@ class LoopConvExecute(block_size: Int, large_iterator_bitwidth: Int, small_itera
   // changed
   // val c_addr_start = /*(BigInt(3) << 30).U |*/ req.c_addr_start
   val c_addr_start = if (use_shared_res_entries) {
-    req.c_addr_start +& (req.laddrochs_offset / block_size.U(och.getWidth.W)) * batches * orows * ocols
+    req.c_addr_start +& (req.laddrochs_offset.get / block_size.U(och.getWidth.W)) * batches * orows * ocols
   } else {
     req.c_addr_start
   }
@@ -831,7 +819,7 @@ class LoopConvExecute(block_size: Int, large_iterator_bitwidth: Int, small_itera
   // changed
   // val J = Mux(ochs - och > block_size.U, block_size.U, ochs - och)
   val J = if (use_shared_res_entries) {
-    Mux(req.ex_ochs - och > block_size.U, block_size.U, req.ex_ochs - och)
+    Mux(req.ex_ochs.get - och > block_size.U, block_size.U, req.ex_ochs.get - och)
   } else {
     Mux(ochs - och > block_size.U, block_size.U, ochs - och)
   }
@@ -903,9 +891,9 @@ class LoopConvExecute(block_size: Int, large_iterator_bitwidth: Int, small_itera
   // changed
   // val ld_ahead = io.lda_completed && io.ldb_completed && io.ldd_completed
   val ld_ahead = if (use_shared_res_entries) {
-    io.lda_ahead && io.ldb_completed && io.ldd_completed
+    io.lda_ahead.get && io.ldb_completed && io.ldd_completed
   } else {
-    io.lda_completed && io.ldb_completed && io.ldd_completed
+    io.lda_completed.get && io.ldb_completed && io.ldd_completed
   }
 
   // Inputs and outputs
@@ -913,17 +901,13 @@ class LoopConvExecute(block_size: Int, large_iterator_bitwidth: Int, small_itera
   io.idle := state === idle && !command_p.io.busy
   io.loop_id := req.loop_id
   if (use_shared_res_entries) {
-    io.group_id := req.group_id
-    io.group_list := req.group_list
-  } else {
-    io.group_id := 0.U
-    io.group_list := 0.U
+    io.group_id.get := req.group_id.get
   }
 
   // changed
   // command_p.io.in.valid := state =/= idle && !skip_iteration && ld_ahead
   if (use_shared_res_entries) {
-    command_p.io.in.valid := state =/= idle && !skip_iteration && ld_ahead && req.ex_ochs =/= 0.U
+    command_p.io.in.valid := state =/= idle && !skip_iteration && ld_ahead && req.ex_ochs.get =/= 0.U
   } else {
     command_p.io.in.valid := state =/= idle && !skip_iteration && ld_ahead
   }
@@ -982,7 +966,7 @@ class LoopConvExecute(block_size: Int, large_iterator_bitwidth: Int, small_itera
 
   // Sending outputs
   val skipEmptySharedExecute = if (use_shared_res_entries) {
-    req.ex_ochs === 0.U
+    req.ex_ochs.get === 0.U
   } else {
     false.B
   }
@@ -1011,7 +995,7 @@ class LoopConvExecute(block_size: Int, large_iterator_bitwidth: Int, small_itera
       // val next_och = floorAdd(och, block_size.U, ochs, next_krow === 0.U &&
       //   next_kcol === 0.U && next_kch === 0.U && next_b === 0.U && next_orow === 0.U && next_ocol === 0.U)
       val next_och = if (use_shared_res_entries) {
-        floorAdd(och, block_size.U, req.ex_ochs, next_krow === 0.U &&
+        floorAdd(och, block_size.U, req.ex_ochs.get, next_krow === 0.U &&
         next_kcol === 0.U && next_kch === 0.U && next_b === 0.U && next_orow === 0.U && next_ocol === 0.U)
       } else {
         floorAdd(och, block_size.U, ochs, next_krow === 0.U &&
@@ -1053,12 +1037,10 @@ class LoopConvExecute(block_size: Int, large_iterator_bitwidth: Int, small_itera
   }
 }
 
-class LoopConvStReq(val coreMaxAddrBits: Int, val large_iterator_bitwidth: Int, val small_iterator_bitwidth: Int, val tiny_iterator_bitwidth: Int, val max_acc_addr: Int, val concurrent_loops: Int, val group_w: Int)  extends Bundle {
-  // made
-  val ex_ochs = UInt(large_iterator_bitwidth.W)
-  val laddrochs_offset = UInt(large_iterator_bitwidth.W)
-  val group_id = UInt(group_w.W)
-  // made end
+class LoopConvStReq(val coreMaxAddrBits: Int, val large_iterator_bitwidth: Int, val small_iterator_bitwidth: Int, val tiny_iterator_bitwidth: Int, val max_acc_addr: Int, val concurrent_loops: Int, val use_shared_res_entries: Boolean, val group_w: Int)  extends Bundle {
+  val ex_ochs = if (use_shared_res_entries) Some(UInt(large_iterator_bitwidth.W)) else None
+  val laddrochs_offset = if (use_shared_res_entries) Some(UInt(large_iterator_bitwidth.W)) else None
+  val group_id = if (use_shared_res_entries) Some(UInt(group_w.W)) else None
   val outer_bounds = new LoopConvOuterBounds(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
   val inner_bounds = new LoopConvInnerBounds(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
   val derived_params = new LoopConvDerivedParams(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
@@ -1074,7 +1056,7 @@ class LoopConvSt(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwidth:
   val ACC_SCALE_NO_CHANGE = ~(0.U(32.W)) // TODO get this from ISA description somehow
 
   val io = IO(new Bundle {
-    val req = Flipped(Decoupled(new LoopConvStReq(coreMaxAddrBits, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth: Int, max_acc_addr, concurrent_loops, group_w)))
+    val req = Flipped(Decoupled(new LoopConvStReq(coreMaxAddrBits, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth: Int, max_acc_addr, concurrent_loops, use_shared_res_entries, group_w)))
     val cmd = Decoupled(Output(new RoCCCommand))
 
     val ex_completed = Input(Bool())
@@ -1084,7 +1066,7 @@ class LoopConvSt(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwidth:
 
     val loop_id = Output(UInt(log2Up(concurrent_loops).W))
 
-    val group_id = Output(UInt(group_w.W)) // made
+    val group_id = if (use_shared_res_entries) Some(Output(UInt(group_w.W))) else None
   })
 
   object State extends ChiselEnum {
@@ -1093,7 +1075,7 @@ class LoopConvSt(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwidth:
   import State._
   val state = RegInit(idle)
 
-  val req = Reg(new LoopConvStReq(coreMaxAddrBits, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth: Int, max_acc_addr, concurrent_loops, group_w))
+  val req = Reg(new LoopConvStReq(coreMaxAddrBits, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth: Int, max_acc_addr, concurrent_loops, use_shared_res_entries, group_w))
   import req.outer_bounds._
   import req.inner_bounds._
   import req.derived_params._
@@ -1107,7 +1089,7 @@ class LoopConvSt(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwidth:
   // changed
   // val acc_addr_start = req.addr_start
   val acc_addr_start = if (use_shared_res_entries) {
-    req.addr_start +& (req.laddrochs_offset / block_size.U(och.getWidth.W)) * batches * orows * ocols
+    req.addr_start +& (req.laddrochs_offset.get / block_size.U(och.getWidth.W)) * batches * orows * ocols
   } else {
     req.addr_start
   }
@@ -1116,7 +1098,7 @@ class LoopConvSt(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwidth:
   // changed
   // val skip = req.dram_addr === 0.U
   val skip = if (use_shared_res_entries) {
-    req.dram_addr === 0.U || req.ex_ochs === 0.U
+    req.dram_addr === 0.U || req.ex_ochs.get === 0.U
   } else {
     req.dram_addr === 0.U
   }
@@ -1136,7 +1118,7 @@ class LoopConvSt(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwidth:
   // changed
   // val J = Mux(ochs - och > block_size.U, block_size.U, ochs - och)
   val J = if (use_shared_res_entries) {
-    Mux(req.ex_ochs - och > block_size.U, block_size.U, req.ex_ochs - och)
+    Mux(req.ex_ochs.get - och > block_size.U, block_size.U, req.ex_ochs.get - och)
   } else {
     Mux(ochs - och > block_size.U, block_size.U, ochs - och)
   }
@@ -1213,9 +1195,7 @@ class LoopConvSt(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwidth:
   io.idle := state === idle && !command_p.io.busy
   io.loop_id := req.loop_id
   if (use_shared_res_entries) {
-    io.group_id := req.group_id
-  } else {
-    io.group_id := 0.U
+    io.group_id.get := req.group_id.get
   }
 
   command_p.io.in.valid := state =/= idle && !skip && io.ex_completed
@@ -1266,7 +1246,7 @@ class LoopConvSt(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwidth:
       // changed
       // val next_och = floorAdd(och, block_size.U, ochs)
       val next_och = if (use_shared_res_entries) {
-        floorAdd(och, block_size.U, req.ex_ochs)
+        floorAdd(och, block_size.U, req.ex_ochs.get)
       } else {
         floorAdd(och, block_size.U, ochs)
       }
@@ -1289,7 +1269,7 @@ class LoopConvSt(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwidth:
       // changed
       // val next_och = floorAdd(och, block_size.U, ochs)
       val next_och = if (use_shared_res_entries) {
-        floorAdd(och, block_size.U, req.ex_ochs)
+        floorAdd(och, block_size.U, req.ex_ochs.get)
       } else {
         floorAdd(och, block_size.U, ochs)
       }
@@ -1315,21 +1295,17 @@ class LoopConvSt(block_size: Int, coreMaxAddrBits: Int, large_iterator_bitwidth:
   }
 }
 
-class LoopConvState(val block_size: Int, val large_iterator_bitwidth: Int, val small_iterator_bitwidth: Int, val tiny_iterator_bitwidth: Int, val coreMaxAddrBits: Int, val max_addr: Int, val max_acc_addr: Int, val group_w: Int, val nSharers: Int) extends Bundle {
-  // made
-  val sp_addr_start = UInt(log2Up(max_addr).W)
-  val sp_addr_end = UInt(log2Up(max_addr+1).W)
-  val acc_addr_start = UInt(log2Up(max_acc_addr).W)
+class LoopConvState(val block_size: Int, val large_iterator_bitwidth: Int, val small_iterator_bitwidth: Int, val tiny_iterator_bitwidth: Int, val coreMaxAddrBits: Int, val max_addr: Int, val max_acc_addr: Int, val use_shared_res_entries: Boolean, val group_w: Int, val nSharers: Int) extends Bundle {
+  val acc_addr_start = if (use_shared_res_entries) Some(UInt(log2Up(max_acc_addr).W)) else None
 
-  val mv_kchs = UInt(large_iterator_bitwidth.W)
-  val ex_ochs = UInt(large_iterator_bitwidth.W)
+  val mv_kchs = if (use_shared_res_entries) Some(UInt(large_iterator_bitwidth.W)) else None
+  val ex_ochs = if (use_shared_res_entries) Some(UInt(large_iterator_bitwidth.W)) else None
 
-  val laddrochs_offset = UInt(large_iterator_bitwidth.W)
-  val laddrkchs_offset = UInt(large_iterator_bitwidth.W)
+  val laddrochs_offset = if (use_shared_res_entries) Some(UInt(large_iterator_bitwidth.W)) else None
+  val laddrkchs_offset = if (use_shared_res_entries) Some(UInt(large_iterator_bitwidth.W)) else None
 
-  val group_id = UInt(group_w.W)
-  val group_list = UInt(nSharers.W)
-  // made end
+  val group_id = if (use_shared_res_entries) Some(UInt(group_w.W)) else None
+  val group_list = if (use_shared_res_entries) Some(UInt(nSharers.W)) else None
 
   val outer_bounds = new LoopConvOuterBounds(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
   val inner_bounds = new LoopConvInnerBounds(large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth)
@@ -1406,8 +1382,6 @@ class LoopConvState(val block_size: Int, val large_iterator_bitwidth: Int, val s
     result.out_channels_per_bank := result.ochs / block_size.U(result.ochs.getWidth.W) +& (result.ochs % block_size.U =/= 0.U)
     result.in_channels_per_bank := result.ichs / block_size.U(result.ochs.getWidth.W) +& (result.ichs % block_size.U =/= 0.U)
 
-    result.batches_per_bank := batches / block_size.U(result.ochs.getWidth.W) +& (batches % block_size.U =/= 0.U) // made
-
     result.bias_spad_stride := batches * orows * ocols
     result.input_spad_stride := Mux(trans_input_3120,
       result.ichs * (result.irows >> downsample) * (result.icols >> downsample),
@@ -1472,7 +1446,7 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   })
 
   // Create states
-  val loops = Reg(Vec(concurrent_loops, new LoopConvState(block_size, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth, coreMaxAddrBits, max_addr, max_acc_addr, group_w, nSharers)))
+  val loops = Reg(Vec(concurrent_loops, new LoopConvState(block_size, large_iterator_bitwidth, small_iterator_bitwidth, tiny_iterator_bitwidth, coreMaxAddrBits, max_addr, max_acc_addr, use_shared_res_entries, group_w, nSharers)))
   val head_loop_id = RegInit(0.U(log2Up(concurrent_loops).W))
   val tail_loop_id = (~head_loop_id).asUInt // This is the loop that we always try to configure if available
   val head_loop = loops(head_loop_id)
@@ -1539,9 +1513,17 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   arb.io.out.ready := io.out.ready
 
   // Wire up waiting-for-loads signals
+  val lda_ready_for_ex = if (use_shared_res_entries) {
+    io.ext_loop_conv_ws.get.lda_ahead
+  } else {
+    loops(ex.io.loop_id).ld_input_completed
+  }
   val ex_is_waiting_for_loads = loops(ex.io.loop_id).ex_started && !loops(ex.io.loop_id).ex_completed &&
-    !(loops(ex.io.loop_id).ld_input_completed && loops(ex.io.loop_id).ld_weights_completed &&
+    !(lda_ready_for_ex && loops(ex.io.loop_id).ld_weights_completed &&
       loops(ex.io.loop_id).ld_bias_completed)
+  // val ex_is_waiting_for_loads = loops(ex.io.loop_id).ex_started && !loops(ex.io.loop_id).ex_completed &&
+  //   !(loops(ex.io.loop_id).ld_input_completed && loops(ex.io.loop_id).ld_weights_completed &&
+  //     loops(ex.io.loop_id).ld_bias_completed)
 
   ld_bias.io.wait_for_prev_loop := ex_is_waiting_for_loads && ld_bias.io.loop_id =/= ex.io.loop_id
   ld_weights.io.wait_for_prev_loop := ex_is_waiting_for_loads && ld_weights.io.loop_id =/= ex.io.loop_id
@@ -1555,28 +1537,23 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   st.io.rob_overloaded := st_utilization >= max_sts.U
 
   // Wire up iterator inputs
-  ex.io.lda_completed := (ld_input.io.loop_id =/= ex.io.loop_id) || ld_input.io.idle
   ex.io.ldb_completed := (ld_weights.io.loop_id =/= ex.io.loop_id) || ld_weights.io.idle
   ex.io.ldd_completed := (ld_bias.io.loop_id =/= ex.io.loop_id) || ld_bias.io.idle
   st.io.ex_completed := (ex.io.loop_id =/= st.io.loop_id) || ex.io.idle
 
-  // made
   if (use_shared_res_entries) {
-    io.ext_loop_conv_ws.get.ldinput.group_id := ld_input.io.group_id
+    io.ext_loop_conv_ws.get.ldinput.group_id := ld_input.io.group_id.get
     io.ext_loop_conv_ws.get.ldinput.idle := ld_input.io.idle
-    io.ext_loop_conv_ws.get.ex.group_id := ex.io.group_id
+    io.ext_loop_conv_ws.get.ex.group_id := ex.io.group_id.get
     io.ext_loop_conv_ws.get.ex.idle := ex.io.idle
-    io.ext_loop_conv_ws.get.ex.group_list := ex.io.group_list
-    io.ext_loop_conv_ws.get.st.group_id := st.io.group_id
+    io.ext_loop_conv_ws.get.st.group_id := st.io.group_id.get
     io.ext_loop_conv_ws.get.st.idle := st.io.idle
-    ld_input.io.loop_full := io.ext_loop_conv_ws.get.loop_full
-    io.ext_loop_conv_ws.get.ldinput.group_list := ld_input.io.group_list
-    ex.io.lda_ahead := io.ext_loop_conv_ws.get.lda_ahead
+    ld_input.io.loop_full.get := io.ext_loop_conv_ws.get.loop_full
+    io.ext_loop_conv_ws.get.ldinput.group_list := ld_input.io.group_list.get
+    ex.io.lda_ahead.get := io.ext_loop_conv_ws.get.lda_ahead
   } else {
-    ld_input.io.loop_full := false.B
-    ex.io.lda_ahead := false.B
+    ex.io.lda_completed.get := (ld_input.io.loop_id =/= ex.io.loop_id) || ld_input.io.idle
   }
-  // end
 
   def sharedResLoopBlocked(loopId: UInt): Bool = if (use_shared_res_entries) {
     loopId === ld_input.io.loop_id && io.ext_loop_conv_ws.get.loop_full && !ld_input.io.idle
@@ -1591,21 +1568,21 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
       // made
       is (LOOP_CONV_WS_CONFIG_SPADDR) {
         if (use_shared_res_entries) {
-          loop_being_configured.sp_addr_end := cmd.bits.cmd.rs2(large_iterator_bitwidth + log2Up(max_addr+1) - 1, large_iterator_bitwidth)
-          loop_being_configured.sp_addr_start := cmd.bits.cmd.rs2(log2Up(max_addr)-1, 0)
+          loop_being_configured.b_addr_end := cmd.bits.cmd.rs2(large_iterator_bitwidth + log2Up(max_addr+1) - 1, large_iterator_bitwidth)
+          loop_being_configured.a_addr_start := cmd.bits.cmd.rs2(log2Up(max_addr)-1, 0)
 
-          loop_being_configured.acc_addr_start := cmd.bits.cmd.rs1(log2Up(max_acc_addr)-1, 0)
+          loop_being_configured.acc_addr_start.get := cmd.bits.cmd.rs1(log2Up(max_acc_addr)-1, 0)
         }
       }
       is (LOOP_CONV_WS_CONFIG_MV_BOUNDS_1) {
         if (use_shared_res_entries) {
-          loop_being_configured.mv_kchs := cmd.bits.cmd.rs2(large_iterator_bitwidth * 2 - 1, large_iterator_bitwidth)
-          loop_being_configured.ex_ochs := cmd.bits.cmd.rs2(large_iterator_bitwidth - 1, 0)
+          loop_being_configured.mv_kchs.get := cmd.bits.cmd.rs2(large_iterator_bitwidth * 2 - 1, large_iterator_bitwidth)
+          loop_being_configured.ex_ochs.get := cmd.bits.cmd.rs2(large_iterator_bitwidth - 1, 0)
 
-          loop_being_configured.group_list := cmd.bits.cmd.rs1(large_iterator_bitwidth * 3 + nSharers - 1, large_iterator_bitwidth * 3)
-          loop_being_configured.group_id := cmd.bits.cmd.rs1(large_iterator_bitwidth * 2 + group_w - 1, large_iterator_bitwidth * 2)
-          loop_being_configured.laddrkchs_offset := cmd.bits.cmd.rs1(large_iterator_bitwidth * 2 - 1, large_iterator_bitwidth)
-          loop_being_configured.laddrochs_offset := cmd.bits.cmd.rs1(large_iterator_bitwidth - 1, 0)
+          loop_being_configured.group_list.get := cmd.bits.cmd.rs1(large_iterator_bitwidth * 3 + nSharers - 1, large_iterator_bitwidth * 3)
+          loop_being_configured.group_id.get := cmd.bits.cmd.rs1(large_iterator_bitwidth * 2 + group_w - 1, large_iterator_bitwidth * 2)
+          loop_being_configured.laddrkchs_offset.get := cmd.bits.cmd.rs1(large_iterator_bitwidth * 2 - 1, large_iterator_bitwidth)
+          loop_being_configured.laddrochs_offset.get := cmd.bits.cmd.rs1(large_iterator_bitwidth - 1, 0)
         }
       }
       // made end
@@ -1711,16 +1688,14 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   ld_bias.io.req.bits.no_bias := loop_requesting_ld_bias.no_bias
   ld_bias.io.req.bits.loop_id := loop_requesting_ld_bias_id
   if (use_shared_res_entries) {
-    ld_bias.io.req.bits.addr_start := loop_requesting_ld_bias.acc_addr_start
-    ld_bias.io.req.bits.laddrochs_offset := loop_requesting_ld_bias.laddrochs_offset
-    ld_bias.io.req.bits.ex_ochs := loop_requesting_ld_bias.ex_ochs
+    ld_bias.io.req.bits.addr_start := loop_requesting_ld_bias.acc_addr_start.get
+    ld_bias.io.req.bits.laddrochs_offset.get := loop_requesting_ld_bias.laddrochs_offset.get
+    ld_bias.io.req.bits.ex_ochs.get := loop_requesting_ld_bias.ex_ochs.get
     ld_bias.io.req.valid := !loop_requesting_ld_bias.ld_bias_started && loop_requesting_ld_bias.configured &&
       loop_requesting_ld_bias.ld_input_started &&
       !sharedResLoopBlocked(loop_requesting_ld_bias_id)
   } else {
     ld_bias.io.req.bits.addr_start := ld_bias_addr_start.get
-    ld_bias.io.req.bits.laddrochs_offset := 0.U
-    ld_bias.io.req.bits.ex_ochs := 0.U
     ld_bias.io.req.valid := !loop_requesting_ld_bias.ld_bias_started && loop_requesting_ld_bias.configured
   }
 
@@ -1747,18 +1722,12 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   ld_input.io.req.bits.input_dilated := loop_requesting_ld_input.input_dilated
   ld_input.io.req.bits.trans_input_3120 := loop_requesting_ld_input.trans_input_3120
   ld_input.io.req.bits.loop_id := loop_requesting_ld_input_id
+  ld_input.io.req.bits.addr_start := loop_requesting_ld_input.a_addr_start
   if (use_shared_res_entries) {
-    ld_input.io.req.bits.addr_start := loop_requesting_ld_input.sp_addr_start
-    ld_input.io.req.bits.laddrkchs_offset := loop_requesting_ld_input.laddrkchs_offset
-    ld_input.io.req.bits.mv_kchs := loop_requesting_ld_input.mv_kchs
-    ld_input.io.req.bits.group_id := loop_requesting_ld_input.group_id
-    ld_input.io.req.bits.group_list := loop_requesting_ld_input.group_list
-  } else {
-    ld_input.io.req.bits.addr_start := loop_requesting_ld_input.a_addr_start
-    ld_input.io.req.bits.laddrkchs_offset := 0.U
-    ld_input.io.req.bits.mv_kchs := 0.U
-    ld_input.io.req.bits.group_id := 0.U
-    ld_input.io.req.bits.group_list := 0.U
+    ld_input.io.req.bits.laddrkchs_offset.get := loop_requesting_ld_input.laddrkchs_offset.get
+    ld_input.io.req.bits.mv_kchs.get := loop_requesting_ld_input.mv_kchs.get
+    ld_input.io.req.bits.group_id.get := loop_requesting_ld_input.group_id.get
+    ld_input.io.req.bits.group_list.get := loop_requesting_ld_input.group_list.get
   }
 
   ld_input.io.req.valid := !loop_requesting_ld_input.ld_input_started && loop_requesting_ld_input.configured
@@ -1778,21 +1747,18 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   ld_weights.io.req.bits.trans_weight_0132 := loop_requesting_ld_weights.trans_weight_0132
   ld_weights.io.req.bits.dw := loop_requesting_ld_weights.dw
   ld_weights.io.req.bits.loop_id := loop_requesting_ld_weights_id
+  ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.b_addr_end
   if (use_shared_res_entries) {
     // val ldInputBlocks = inputBlocksNeeded(loop_requesting_ld_weights.trans_input_3120,
     //   loop_requesting_ld_weights.inner_bounds.batches, loop_requesting_ld_weights.derived_params().in_channels_per_bank)
-    // ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.sp_addr_start + loop_requesting_ld_weights.derived_params().input_spad_stride * ldInputBlocks
-    // ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.sp_addr_start + loop_requesting_ld_weights.derived_params().input_spad_stride * Mux(loop_requesting_ld_weights.trans_input_3120, loop_requesting_ld_weights.inner_bounds.batches >> log2Up(block_size), loop_requesting_ld_weights.derived_params().in_channels_per_bank)
-    ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.sp_addr_end
-    ld_weights.io.req.bits.laddrochs_offset := loop_requesting_ld_weights.laddrochs_offset
-    ld_weights.io.req.bits.ex_ochs := loop_requesting_ld_weights.ex_ochs
+    // ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.a_addr_start + loop_requesting_ld_weights.derived_params().input_spad_stride * ldInputBlocks
+    // ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.a_addr_start + loop_requesting_ld_weights.derived_params().input_spad_stride * Mux(loop_requesting_ld_weights.trans_input_3120, loop_requesting_ld_weights.inner_bounds.batches >> log2Up(block_size), loop_requesting_ld_weights.derived_params().in_channels_per_bank)
+    ld_weights.io.req.bits.laddrochs_offset.get := loop_requesting_ld_weights.laddrochs_offset.get
+    ld_weights.io.req.bits.ex_ochs.get := loop_requesting_ld_weights.ex_ochs.get
     ld_weights.io.req.valid := !loop_requesting_ld_weights.ld_weights_started && loop_requesting_ld_weights.configured &&
       loop_requesting_ld_weights.ld_input_started &&
       !sharedResLoopBlocked(loop_requesting_ld_weights_id)
   } else {
-    ld_weights.io.req.bits.addr_end := loop_requesting_ld_weights.b_addr_end
-    ld_weights.io.req.bits.laddrochs_offset := 0.U
-    ld_weights.io.req.bits.ex_ochs := 0.U
     ld_weights.io.req.valid := !loop_requesting_ld_weights.ld_weights_started && loop_requesting_ld_weights.configured
   }
 
@@ -1813,29 +1779,22 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   ex.io.req.bits.trans_weight_0132 := loop_requesting_ex.trans_weight_0132
   ex.io.req.bits.trans_input_3120 := loop_requesting_ex.trans_input_3120
   ex.io.req.bits.loop_id := loop_requesting_ex_id
+  ex.io.req.bits.a_addr_start := loop_requesting_ex.a_addr_start
+  ex.io.req.bits.b_addr_end := loop_requesting_ex.b_addr_end
   if (use_shared_res_entries) {
-    ex.io.req.bits.a_addr_start := loop_requesting_ex.sp_addr_start
     // val exInputBlocks = inputBlocksNeeded(loop_requesting_ex.trans_input_3120,
     //   loop_requesting_ex.inner_bounds.batches, loop_requesting_ex.derived_params().in_channels_per_bank)
-    // ex.io.req.bits.b_addr_end := loop_requesting_ex.sp_addr_start + loop_requesting_ex.derived_params().input_spad_stride * exInputBlocks // made
-    // ex.io.req.bits.b_addr_end := loop_requesting_ex.sp_addr_start + loop_requesting_ex.derived_params().input_spad_stride * Mux(loop_requesting_ex.trans_input_3120, loop_requesting_ex.inner_bounds.batches >> log2Up(block_size), loop_requesting_ex.derived_params().in_channels_per_bank) // made
-    ex.io.req.bits.b_addr_end := loop_requesting_ex.sp_addr_end
-    ex.io.req.bits.c_addr_start := loop_requesting_ex.acc_addr_start
-    ex.io.req.bits.laddrochs_offset := loop_requesting_ex.laddrochs_offset
-    ex.io.req.bits.ex_ochs := loop_requesting_ex.ex_ochs
-    ex.io.req.bits.group_id := loop_requesting_ex.group_id
-    ex.io.req.bits.group_list := loop_requesting_ex.group_list
+    // ex.io.req.bits.b_addr_end := loop_requesting_ex.a_addr_start + loop_requesting_ex.derived_params().input_spad_stride * exInputBlocks // made
+    // ex.io.req.bits.b_addr_end := loop_requesting_ex.a_addr_start + loop_requesting_ex.derived_params().input_spad_stride * Mux(loop_requesting_ex.trans_input_3120, loop_requesting_ex.inner_bounds.batches >> log2Up(block_size), loop_requesting_ex.derived_params().in_channels_per_bank) // made
+    ex.io.req.bits.c_addr_start := loop_requesting_ex.acc_addr_start.get
+    ex.io.req.bits.laddrochs_offset.get := loop_requesting_ex.laddrochs_offset.get
+    ex.io.req.bits.ex_ochs.get := loop_requesting_ex.ex_ochs.get
+    ex.io.req.bits.group_id.get := loop_requesting_ex.group_id.get
     ex.io.req.valid := !loop_requesting_ex.ex_started && loop_requesting_ex.ld_bias_started &&
       loop_requesting_ex.ld_input_started && loop_requesting_ex.ld_weights_started && loop_requesting_ex.configured &&
       !sharedResLoopBlocked(loop_requesting_ex_id)
   } else {
-    ex.io.req.bits.a_addr_start := loop_requesting_ex.a_addr_start
-    ex.io.req.bits.b_addr_end := loop_requesting_ex.b_addr_end
     ex.io.req.bits.c_addr_start := ex_c_addr_start.get
-    ex.io.req.bits.laddrochs_offset := 0.U
-    ex.io.req.bits.ex_ochs := 0.U
-    ex.io.req.bits.group_id := 0.U
-    ex.io.req.bits.group_list := 0.U
     ex.io.req.valid := !loop_requesting_ex.ex_started && loop_requesting_ex.ld_bias_started &&
       loop_requesting_ex.ld_input_started && loop_requesting_ex.ld_weights_started && loop_requesting_ex.configured
   }
@@ -1862,20 +1821,16 @@ class LoopConv (block_size: Int, coreMaxAddrBits: Int, reservation_station_size:
   st.io.req.bits.trans_output_1203 := loop_requesting_st.trans_output_1203
   st.io.req.bits.loop_id := loop_requesting_st_id
   if (use_shared_res_entries) {
-    st.io.req.bits.addr_start := loop_requesting_st.acc_addr_start
-    st.io.req.bits.ex_ochs := loop_requesting_st.ex_ochs
-    st.io.req.bits.laddrochs_offset := loop_requesting_st.laddrochs_offset
-    st.io.req.bits.group_id := loop_requesting_st.group_id
+    st.io.req.bits.addr_start := loop_requesting_st.acc_addr_start.get
+    st.io.req.bits.ex_ochs.get := loop_requesting_st.ex_ochs.get
+    st.io.req.bits.laddrochs_offset.get := loop_requesting_st.laddrochs_offset.get
+    st.io.req.bits.group_id.get := loop_requesting_st.group_id.get
     st.io.req.valid := !loop_requesting_st.st_started && loop_requesting_st.ex_started && loop_requesting_st.configured &&
       !sharedResLoopBlocked(loop_requesting_st_id)
   } else {
     st.io.req.bits.addr_start := st_addr_start.get
-    st.io.req.bits.ex_ochs := 0.U
-    st.io.req.bits.laddrochs_offset := 0.U
-    st.io.req.bits.group_id := 0.U
     st.io.req.valid := !loop_requesting_st.st_started && loop_requesting_st.ex_started && loop_requesting_st.configured
   }
-  // made end
 
   when (st.io.req.fire) {
     loop_requesting_st.running := true.B

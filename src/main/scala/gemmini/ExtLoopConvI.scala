@@ -30,7 +30,6 @@ class ConvExState(
   nSharers: Int
 ) extends Bundle {
   val group_id      = UInt(group_w.W)
-  val group_list = UInt(nSharers.W)
   val idle = Bool()
 }
 
@@ -84,7 +83,6 @@ class LdICompleteControl(
   val ldinput_idle_delayed = RegNext(VecInit(io.in.map(_.ldinput.idle)), VecInit(Seq.fill(nSharers)(true.B)))
   val ex_idle_delayed = RegNext(VecInit(io.in.map(_.ex.idle)), VecInit(Seq.fill(nSharers)(true.B)))
   val st_idle_delayed = RegNext(VecInit(io.in.map(_.st.idle)), VecInit(Seq.fill(nSharers)(true.B)))
-  val weights = RegInit(VecInit(Seq.fill(nSharers)(0.U(log2Ceil(nSharers + 1).W))))
 
   // Make new group mask
   val groupMask = WireInit(VecInit(Seq.fill(nSharers)(0.U(group_num.W))))
@@ -95,12 +93,46 @@ class LdICompleteControl(
   }
   val reducedMask = groupMask.reduce(_|_)
 
+  // Weight update
+  val waitMatrix = RegInit(VecInit(Seq.fill(nSharers)(0.U(nSharers.W))))
+  val isWaitingReg = RegInit(0.U(nSharers.W))
+  val currentWaitingWire = Wire(Vec(nSharers, Bool()))
+  val nextWaitRows = Wire(Vec(nSharers, UInt(nSharers.W)))
+  val nextWeights = Wire(Vec(nSharers, UInt(log2Ceil(nSharers + 1).W)))
+  val maxWeight = (nSharers - 1).U(log2Ceil(nSharers + 1).W)
+
+  val currentWaitingMask = currentWaitingWire.asUInt
+  val leavingWaiters = isWaitingReg & ~currentWaitingMask
+
+  for (i <- 0 until nSharers) {
+    val theresMyGroup = group_data.map(gd => 
+      gd.valid && (gd.bits.group_id === io.in(i).ldinput.group_id)
+    )
+    val onGoing = group_data.zip(theresMyGroup).map{ case (gd, matched) => 
+      // matched && !(gd.bits.mem_data(i).ldinput_completed && gd.bits.mem_data(i).ex_completed && gd.bits.mem_data(i).st_completed)
+      matched && !(gd.bits.mem_data(i).ldinput_completed)
+    }.reduce(_||_)
+
+    val isWaiting = !io.in(i).ldinput.idle && !onGoing
+    currentWaitingWire(i) := isWaiting
+
+    val rowWithoutLeavers = waitMatrix(i) & ~leavingWaiters
+    val nextRow = Mux(!isWaiting, 0.U(nSharers.W), Mux(!isWaitingReg(i), isWaitingReg & ~leavingWaiters, rowWithoutLeavers))
+    nextWaitRows(i) := nextRow
+
+    val olderThanMeCount = PopCount(nextRow)
+    nextWeights(i) := Mux(isWaiting, maxWeight - olderThanMeCount, 0.U)
+  }
+
+  waitMatrix := nextWaitRows
+  isWaitingReg := currentWaitingMask
+
   // Make weight mask of each group
   val groupWeights = WireInit(VecInit(Seq.fill(group_num)(0.U(log2Ceil(nSharers + 1).W))))
   for (gId <- 0 until group_num) {
     val weightsForThisGroup = (0 until nSharers).map { sIdx =>
-      val isMatch = !io.in(sIdx).ldinput.idle && io.in(sIdx).ldinput.group_id === gId.U
-      Mux(isMatch, weights(sIdx), 0.U)
+      val isMatch = groupMask(sIdx)(gId)
+      Mux(isMatch, nextWeights(sIdx), 0.U)
     }
     groupWeights(gId) := weightsForThisGroup.reduce((a, b) => Mux(a > b, a, b))
   }
@@ -132,39 +164,6 @@ class LdICompleteControl(
   val failedInputNum = PopCount(loosers)
   dontTouch(failedInputNum)
 
-  // Weight update
-  val waitMatrix = RegInit(VecInit(Seq.fill(nSharers)(0.U(nSharers.W))))
-  val isWaitingReg = RegInit(0.U(nSharers.W))
-  val currentWaitingWire = Wire(Vec(nSharers, Bool()))
-
-  val currentWaitingMask = currentWaitingWire.asUInt
-  val leavingWaiters = isWaitingReg & ~currentWaitingMask
-
-  for (i <- 0 until nSharers) {
-    val theresMyGroup = group_data.map(gd => 
-      gd.valid && (gd.bits.group_id === io.in(i).ldinput.group_id)
-    )
-    val onGoing = group_data.zip(theresMyGroup).map{ case (gd, matched) => 
-      matched && !gd.bits.mem_data(i).ldinput_completed
-    }.reduce(_||_)
-
-    val isWaiting = !io.in(i).ldinput.idle && !onGoing
-    currentWaitingWire(i) := isWaiting
-
-    val rowWithoutLeavers = waitMatrix(i) & ~leavingWaiters
-    val nextRow = Mux(!isWaiting, 0.U(nSharers.W), Mux(!isWaitingReg(i), isWaitingReg & ~leavingWaiters, rowWithoutLeavers))
-    waitMatrix(i) := nextRow
-
-    val olderThanMeCount = PopCount(nextRow)
-    when (isWaiting) {
-      weights(i) := (nSharers.U - 1.U) - olderThanMeCount
-    } .otherwise {
-      weights(i) := 0.U
-    }
-  }
-
-  isWaitingReg := currentWaitingMask
-
   // Allocate groups to free slots
   val winnerMask = winnersVec.asUInt
   val allocMasks = Wire(Vec(group_num, UInt(group_num.W)))
@@ -175,8 +174,8 @@ class LdICompleteControl(
     val targetId = PriorityEncoder(allocMasks(i))
     
     val winnerGroupList = MuxCase(0.U, (0 until nSharers).map { sIdx =>
-      val isMatch = !io.in(sIdx).ldinput.idle && io.in(sIdx).ldinput.group_id === targetId
-      val isTopWeight = weights(sIdx) === groupWeights(targetId)
+      val isMatch = groupMask(sIdx)(targetId)
+      val isTopWeight = nextWeights(sIdx) === groupWeights(targetId)
       (isMatch && isTopWeight) -> io.in(sIdx).ldinput.group_list
     })
 
@@ -203,7 +202,8 @@ class LdICompleteControl(
       gd.valid && (gd.bits.group_id === io.in(i).ldinput.group_id)
     )
     val onGoing = group_data.zip(theresMyGroup).map{ case (gd, matched) => 
-      matched && !gd.bits.mem_data(i).ldinput_completed
+      // matched && !(gd.bits.mem_data(i).ldinput_completed && gd.bits.mem_data(i).ex_completed && gd.bits.mem_data(i).st_completed)
+      matched && !(gd.bits.mem_data(i).ldinput_completed)
     }.reduce(_||_)
 
     io.in(i).loop_full := !onGoing
@@ -225,12 +225,6 @@ class LdICompleteControl(
     }
   }
 
-  group_data.foreach { gd =>
-    when (gd.valid) {
-      gd.valid := !gd.bits.mem_data.map { md => md.ex_completed && md.st_completed }.reduce(_&&_)
-    }
-  }
-
   // if all members have completed, free the group
   group_data.foreach { gd =>
     when (gd.valid && gd.bits.mem_data.map { md => md.ex_completed && md.st_completed && md.ldinput_completed }.reduce(_&&_)) {
@@ -245,23 +239,17 @@ class LdICompleteControl(
   }
 
   for (i <- 0 until nSharers) {
-    val group_list  = io.in(i).ex.group_list
-    val group_mask  = VecInit(group_list.asBools)
     val lda_completed = WireInit(false.B)
 
     group_data.foreach { gd =>
       when (gd.valid && (gd.bits.group_id === io.in(i).ex.group_id)) {
-        lda_completed := gd.bits.mem_data.zip(group_mask).map { case (gdd, gmm) =>
+        lda_completed := gd.bits.mem_data.map { case gdd =>
           gdd.ldinput_completed
         }.reduce(_&&_)
       }
     }
 
     io.in(i).lda_ahead := lda_completed
-  }
-
-  when (reset.asBool) {
-    group_data.foreach(_.valid := false.B)
   }
 
   // reset logic
@@ -273,7 +261,5 @@ class LdICompleteControl(
       gd.bits.mem_data.foreach(_.st_completed := false.B)
     }
     group_data.foreach(_.bits.group_id := 0.U)
-
-    weights.foreach(_ := 0.U)
   }
 }

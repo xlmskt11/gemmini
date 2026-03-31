@@ -65,8 +65,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     }
   }
 
-  // made
-  val profile_cmd = WireInit(0.U(ROB_ID_WIDTH.W))
+  val profile_cmd = if (use_profiler) Some(WireInit(0.U(ROB_ID_WIDTH.W))) else None
 
   val unrolled_cmd = TransposePreloadUnroller(io.cmd, config, io.counter)
 
@@ -204,10 +203,10 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val cntl = mesh_cntl_signals_q.io.deq.bits
 
   val grant_output_counter = if (use_shared_ext_mem) Some(RegInit(0.U(log2Up(block_size).W))) else None
-  val rowAdvanceReq = WireInit(false.B)
-  val rowAdvanceFire = WireInit(false.B)
-  val rowAdvanceGrantRequired = WireInit(false.B)
-  val rowAdvanceGrantReady = WireInit(false.B)
+  val rowAdvanceReq = if (use_shared_ext_mem) Some(WireInit(false.B)) else None
+  val rowAdvanceFire = if (use_shared_ext_mem) Some(WireInit(false.B)) else None
+  val rowAdvanceGrantRequired = if (use_shared_ext_mem) Some(WireInit(false.B)) else None
+  val rowAdvanceGrantReady = if (use_shared_ext_mem) Some(WireInit(false.B)) else None
 
   class ExwriteGrantCtx extends Bundle {
     val addr = local_addr_t.cloneType
@@ -250,7 +249,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   }
   // Instantiate the actual mesh
   val mesh = Module(new MeshWithDelays(inputType, spatialArrayOutputType, accType, mesh_tag, dataflow, tree_reduction, tile_latency, mesh_output_delay,
-    tileRows, tileColumns, meshRows, meshColumns, shifter_banks, shifter_banks))
+    tileRows, tileColumns, meshRows, meshColumns, shifter_banks, shifter_banks, use_shared_ext_mem = use_shared_ext_mem))
 
   mesh.io.a.valid := false.B
   mesh.io.b.valid := false.B
@@ -258,11 +257,11 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   mesh.io.req.valid := control_state === flush
   if (use_shared_ext_mem) {
     grantCtxWire.get.valid := control_state === flush
+    mesh.io.row_advance_grant_required.get := rowAdvanceGrantRequired.get
+    mesh.io.row_advance_grant_ready.get := rowAdvanceGrantReady.get
+    rowAdvanceReq.get := mesh.io.row_advance_req.get
+    rowAdvanceFire.get := mesh.io.row_advance_fire.get
   }
-  mesh.io.row_advance_grant_required := rowAdvanceGrantRequired
-  mesh.io.row_advance_grant_ready := rowAdvanceGrantReady
-  rowAdvanceReq := mesh.io.row_advance_req
-  rowAdvanceFire := mesh.io.row_advance_fire
 
   mesh.io.a.bits := DontCare
   mesh.io.b.bits := DontCare
@@ -1078,7 +1077,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val rowNeedsGrant = tag_sel_dataflow.rob_valid &&
       !tag_sel_dataflow.addr.is_garbage() && pred_write_this_row
 
-    rowAdvanceGrantRequired := rowNeedsGrant
+    rowAdvanceGrantRequired.get := rowNeedsGrant
 
     val pred_spad_bank = pred_w_address.sp_bank()
     val pred_acc_bank = pred_w_address.acc_bank()
@@ -1089,24 +1088,24 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val accGrantNeed = rowNeedsGrant && ex_write_to_acc.B && pred_write_to_acc
 
     for (i <- 0 until sp_banks) {
-      io.srams.grant.get(i).valid := rowAdvanceReq && spadGrantNeed && pred_spad_bank === i.U
+      io.srams.grant.get(i).valid := rowAdvanceReq.get && spadGrantNeed && pred_spad_bank === i.U
       io.srams.grant.get(i).bits.addr := pred_spad_row
     }
     for (i <- 0 until acc_banks) {
-      io.acc.grant.get(i).valid := rowAdvanceReq && accGrantNeed && pred_acc_bank === i.U
+      io.acc.grant.get(i).valid := rowAdvanceReq.get && accGrantNeed && pred_acc_bank === i.U
       io.acc.grant.get(i).bits.addr := pred_acc_row
     }
 
     val spadGrantReady = if (sp_banks == 1) io.srams.grant.get.head.ready else Mux1H(UIntToOH(pred_spad_bank, sp_banks), io.srams.grant.get.map(_.ready))
     val accGrantReady = if (acc_banks == 1) io.acc.grant.get.head.ready else Mux1H(UIntToOH(pred_acc_bank, acc_banks), io.acc.grant.get.map(_.ready))
 
-    when (rowAdvanceReq && spadGrantNeed) {
-      rowAdvanceGrantReady := spadGrantReady
-    }.elsewhen (rowAdvanceReq && accGrantNeed) {
-      rowAdvanceGrantReady := accGrantReady
+    when (rowAdvanceReq.get && spadGrantNeed) {
+      rowAdvanceGrantReady.get := spadGrantReady
+    }.elsewhen (rowAdvanceReq.get && accGrantNeed) {
+      rowAdvanceGrantReady.get := accGrantReady
     }
 
-    when (rowAdvanceFire && tag_sel_dataflow.rob_valid) {
+    when (rowAdvanceFire.get && tag_sel_dataflow.rob_valid) {
       grant_output_counter.get := wrappingAdd(grant_output_counter.get, 1.U, pred_total_output_rows)
     }
   }
@@ -1178,9 +1177,9 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   // Profiler
   if (use_profiler) {
     when(profile_comp_rob_ids.get(0).valid) {
-      profile_cmd := profile_comp_rob_ids.get(0).pop()
+      profile_cmd.get := profile_comp_rob_ids.get(0).pop()
     }.elsewhen(profile_comp_rob_ids.get(1).valid && !profile_comp_rob_ids.get(0).valid) {
-      profile_cmd := profile_comp_rob_ids.get(1).pop()
+      profile_cmd.get := profile_comp_rob_ids.get(1).pop()
     }
 
     when (reset.asBool) {
@@ -1188,7 +1187,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     }
 
     ProfileEventIO.init(io.profile.get)
-    io.profile.get.connectEventSignal(ProfileEvent.EX_CTRL_EXECUTE, profile_comp_rob_ids.get.map(_.valid).reduce(_||_), profile_cmd)
+    io.profile.get.connectEventSignal(ProfileEvent.EX_CTRL_EXECUTE, profile_comp_rob_ids.get.map(_.valid).reduce(_||_), profile_cmd.get)
   }
 
   if (use_firesim_simulation_counters) {

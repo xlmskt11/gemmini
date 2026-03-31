@@ -121,15 +121,9 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
   val ldq :: exq :: stq :: Nil = Enum(3)
   val q_t = ldq.cloneType
 
-  val issue_cmd = Wire(new ReservationStationIssue(cmd_t, ROB_ID_WIDTH))
-  
-  issue_cmd := DontCare
-  issue_cmd.valid := false.B
-  
   if (use_profiler) {
-    io.profile.get.issue_cmd.valid := issue_cmd.valid
-    io.profile.get.issue_cmd.cmd := issue_cmd.cmd
-    io.profile.get.issue_cmd.rob_id := issue_cmd.rob_id
+    io.profile.get.issue_cmd := DontCare
+    io.profile.get.issue_cmd.valid := false.B
   }
 
   val instructions_allocated = RegInit(0.U(32.W))
@@ -447,9 +441,11 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
           val alloc_id = MuxCase((entries_count - 1).U, entries_type.zipWithIndex.map { case (e, i) => !e.valid -> i.U })
 
           when (!entries_type(alloc_id).valid) {
-            issue_cmd.cmd := new_entry.cmd
-            issue_cmd.rob_id := Cat(q.asUInt, alloc_id.pad(log2Up(res_max_per_type)))
-            issue_cmd.valid := true.B
+            if (use_profiler) {
+              io.profile.get.issue_cmd.cmd := new_entry.cmd
+              io.profile.get.issue_cmd.rob_id := Cat(q.asUInt, alloc_id.pad(log2Up(res_max_per_type)))
+              io.profile.get.issue_cmd.valid := true.B
+            }
 
             io.alloc.ready := true.B
             entries_type(alloc_id).valid := true.B

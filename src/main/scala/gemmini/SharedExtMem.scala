@@ -109,7 +109,7 @@ class AdderSellector(nSharers: Int, banks: Int) extends Module {
   val io = IO(new Bundle {
     val in_valid = Input(Vec(banks, Bool()))
     val selected_oh = Output(Vec(nSharers, UInt(banks.W)))
-    val selected_index = Output(Vec(nSharers, Valid(UInt(log2Ceil(banks).W))))
+    // val selected_index = Output(Vec(nSharers, Valid(UInt(log2Ceil(banks).W))))
   })
 
   assert(PopCount(io.in_valid) <= nSharers.U, "you cannot select more than (nSharers) adders input at a time")
@@ -119,8 +119,8 @@ class AdderSellector(nSharers: Int, banks: Int) extends Module {
     val pickOH = PriorityEncoderOH(valid_list(i))
     val pickedid = OHToUInt(pickOH)
     io.selected_oh(i) := pickOH
-    io.selected_index(i).valid := pickOH.orR
-    io.selected_index(i).bits := pickedid
+    // io.selected_index(i).valid := pickOH.orR
+    // io.selected_index(i).bits := pickedid
     valid_list(i + 1) := valid_list(i) & ~pickOH
   }
 }

@@ -97,7 +97,6 @@ class LdBCompleteControl(
   val ldb_idle_delayed = RegNext(VecInit(io.in.map(_.ldb.idle)), VecInit(Seq.fill(nSharers)(true.B)))
   val ex_idle_delayed  = RegNext(VecInit(io.in.map(_.ex.idle)),  VecInit(Seq.fill(nSharers)(true.B)))
   val stc_idle_delayed = RegNext(VecInit(io.in.map(_.stc.idle)), VecInit(Seq.fill(nSharers)(true.B)))
-  val weights = RegInit(VecInit(Seq.fill(nSharers)(0.U(log2Ceil(nSharers + 1).W))))
 
   // Make new group mask
   val groupMask = WireInit(VecInit(Seq.fill(nSharers)(0.U(group_num.W))))
@@ -108,12 +107,46 @@ class LdBCompleteControl(
   }
   val reducedMask = groupMask.reduce(_|_)
 
+  // Weight update
+  val waitMatrix = RegInit(VecInit(Seq.fill(nSharers)(0.U(nSharers.W))))
+  val isWaitingReg = RegInit(0.U(nSharers.W))
+  val currentWaitingWire = Wire(Vec(nSharers, Bool()))
+  val nextWaitRows = Wire(Vec(nSharers, UInt(nSharers.W)))
+  val nextWeights = Wire(Vec(nSharers, UInt(log2Ceil(nSharers + 1).W)))
+  val maxWeight = (nSharers - 1).U(log2Ceil(nSharers + 1).W)
+
+  val currentWaitingMask = currentWaitingWire.asUInt
+  val leavingWaiters = isWaitingReg & ~currentWaitingMask
+
+  for (i <- 0 until nSharers) {
+    val theresMyGroup = group_data.map(gd => 
+      gd.valid && (gd.bits.group_id === io.in(i).ldb.group_id)
+    )
+    val onGoing = group_data.zip(theresMyGroup).map{ case (gd, matched) => 
+      // matched && !(gd.bits.mem_data(i).ldb_end_data.valid && gd.bits.mem_data(i).ex_completed && gd.bits.mem_data(i).stc_completed)
+      matched && !(gd.bits.mem_data(i).ldb_end_data.valid)
+    }.reduce(_||_)
+
+    val isWaiting = !io.in(i).ldb.idle && !onGoing
+    currentWaitingWire(i) := isWaiting
+
+    val rowWithoutLeavers = waitMatrix(i) & ~leavingWaiters
+    val nextRow = Mux(!isWaiting, 0.U(nSharers.W), Mux(!isWaitingReg(i), isWaitingReg & ~leavingWaiters, rowWithoutLeavers))
+    nextWaitRows(i) := nextRow
+
+    val olderThanMeCount = PopCount(nextRow)
+    nextWeights(i) := Mux(isWaiting, maxWeight - olderThanMeCount, 0.U)
+  }
+
+  waitMatrix := nextWaitRows
+  isWaitingReg := currentWaitingMask
+
   // Make weight mask of each group
   val groupWeights = WireInit(VecInit(Seq.fill(group_num)(0.U(log2Ceil(nSharers + 1).W))))
   for (gId <- 0 until group_num) {
     val weightsForThisGroup = (0 until nSharers).map { sIdx =>
-      val isMatch = !io.in(sIdx).ldb.idle && io.in(sIdx).ldb.group_id === gId.U
-      Mux(isMatch, weights(sIdx), 0.U)
+      val isMatch = groupMask(sIdx)(gId)
+      Mux(isMatch, nextWeights(sIdx), 0.U)
     }
     groupWeights(gId) := weightsForThisGroup.reduce((a, b) => Mux(a > b, a, b))
   }
@@ -145,39 +178,6 @@ class LdBCompleteControl(
   val failedInputNum = PopCount(loosers)
   dontTouch(failedInputNum)
 
-  // Weight update
-  val waitMatrix = RegInit(VecInit(Seq.fill(nSharers)(0.U(nSharers.W))))
-  val isWaitingReg = RegInit(0.U(nSharers.W))
-  val currentWaitingWire = Wire(Vec(nSharers, Bool()))
-
-  val currentWaitingMask = currentWaitingWire.asUInt
-  val leavingWaiters = isWaitingReg & ~currentWaitingMask
-
-  for (i <- 0 until nSharers) {
-    val theresMyGroup = group_data.map(gd => 
-      gd.valid && (gd.bits.group_id === io.in(i).ldb.group_id)
-    )
-    val onGoing = group_data.zip(theresMyGroup).map{ case (gd, matched) => 
-      matched && !gd.bits.mem_data(i).ldb_end_data.valid
-    }.reduce(_||_)
-
-    val isWaiting = !io.in(i).ldb.idle && !onGoing
-    currentWaitingWire(i) := isWaiting
-
-    val rowWithoutLeavers = waitMatrix(i) & ~leavingWaiters
-    val nextRow = Mux(!isWaiting, 0.U(nSharers.W), Mux(!isWaitingReg(i), isWaitingReg & ~leavingWaiters, rowWithoutLeavers))
-    waitMatrix(i) := nextRow
-
-    val olderThanMeCount = PopCount(nextRow)
-    when (isWaiting) {
-      weights(i) := (nSharers.U - 1.U) - olderThanMeCount
-    } .otherwise {
-      weights(i) := 0.U
-    }
-  }
-
-  isWaitingReg := currentWaitingMask
-
   // Allocate groups to free slots
   val winnerMask = winnersVec.asUInt
   val allocMasks = Wire(Vec(group_num, UInt(group_num.W)))
@@ -188,8 +188,9 @@ class LdBCompleteControl(
     val targetId = PriorityEncoder(allocMasks(i))
     
     val winnerGroupList = MuxCase(0.U, (0 until nSharers).map { sIdx =>
-      val isMatch = !io.in(sIdx).ldb.idle && io.in(sIdx).ldb.group_id === targetId
-      val isTopWeight = weights(sIdx) === groupWeights(targetId)
+      // val isMatch = !io.in(sIdx).ldb.idle && io.in(sIdx).ldb.group_id === targetId
+      val isMatch = groupMask(sIdx)(targetId)
+      val isTopWeight = nextWeights(sIdx) === groupWeights(targetId)
       (isMatch && isTopWeight) -> io.in(sIdx).ldb.group_list
     })
 
@@ -218,7 +219,8 @@ class LdBCompleteControl(
       gd.valid && (gd.bits.group_id === io.in(i).ldb.group_id)
     )
     val onGoing = group_data.zip(theresMyGroup).map{ case (gd, matched) => 
-      matched && !gd.bits.mem_data(i).ldb_end_data.valid
+      // matched && !(gd.bits.mem_data(i).ldb_end_data.valid && gd.bits.mem_data(i).ex_completed && gd.bits.mem_data(i).stc_completed)
+      matched && !(gd.bits.mem_data(i).ldb_end_data.valid)
     }.reduce(_||_)
 
     io.in(i).loop_full := !onGoing
@@ -272,7 +274,7 @@ class LdBCompleteControl(
       }
     }
 
-    val ld_ahead = io.in.zip(group_mask).map{ case (in, m) => m && (io.in(i).ex.group_id === in.ldb.group_id) && (io.in(i).ex.k >= in.ldb.k_offset) && ((in.ldb.k_offset + in.ldb.k > io.in(i).ex.k) || ((in.ldb.k_offset + in.ldb.k === io.in(i).ex.k && in.ldb.j > io.in(i).ex.j)))}.reduce(_||_)
+    val ld_ahead = io.in.zip(group_mask).map{ case (in, m) => m && !in.ldb.idle && (io.in(i).ex.group_id === in.ldb.group_id) && (io.in(i).ex.k >= in.ldb.k_offset) && ((in.ldb.k_offset + in.ldb.k > io.in(i).ex.k) || ((in.ldb.k_offset + in.ldb.k === io.in(i).ex.k && in.ldb.j > io.in(i).ex.j)))}.reduce(_||_)
 
     // io.in(i).ldb_ahead := (ldb_completed || ld_ahead) && !(group_data.map( gd => gd.valid && (gd.bits.group_id === io.in(i).ex.group_id) && gd.bits.mem_data(i).ex_completed).reduce(_||_))
     io.in(i).ldb_ahead := ldb_completed || ld_ahead
@@ -289,7 +291,5 @@ class LdBCompleteControl(
       gd.bits.mem_data.foreach(_.ldb_end_data.bits.max_k := 0.U)
     }
     group_data.foreach(_.bits.group_id := 0.U)
-
-    weights.foreach(_ := 0.U)
   }
 }
