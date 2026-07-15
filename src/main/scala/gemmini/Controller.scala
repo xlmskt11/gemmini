@@ -25,7 +25,7 @@ class Gemmini[T <: Data : Arithmetic, U <: Data, V <: Data](val config: GemminiA
                                      (implicit p: Parameters)
   extends LazyRoCC (
     opcodes = config.opcodes,
-    nPTWPorts = if (config.use_shared_tlb) 1 else 2) {
+    nPTWPorts = if (config.use_shared_tlb) 1 else if (config.use_profiler) 3 else 2) {
 
   Files.write(Paths.get(config.headerFilePath), config.generateHeader().getBytes(StandardCharsets.UTF_8))
   if (System.getenv("GEMMINI_ONLY_GENERATE_GEMMINI_H") == "1") {
@@ -91,13 +91,20 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   if (use_profiler) {
     val profiler = profilers.get
     ProfileEventIO.init(profiler.module.io.profile_io.event_io)
-    profiler.module.io.profiler_dram_addr := 0.U
+    profiler.module.io.profiler_vaddr_valid := false.B
+    profiler.module.io.profiler_vaddr := 0.U
+    profiler.module.io.profiler_status := DontCare
   }
 
   // TLB
   implicit val edge = outer.spad.id_node.edges.out.head
-  val tlb = Module(new FrontendTLB(2, tlb_size, dma_maxbytes, use_tlb_register_filter, use_firesim_simulation_counters, use_shared_tlb))
-  (tlb.io.clients zip outer.spad.module.io.tlb).foreach(t => t._1 <> t._2)
+  val nTlbClients = if (use_profiler) 3 else 2
+  val tlb = Module(new FrontendTLB(nTlbClients, tlb_size, dma_maxbytes, use_tlb_register_filter, use_firesim_simulation_counters, use_shared_tlb))
+  tlb.io.clients(0) <> outer.spad.module.io.tlb(0)
+  tlb.io.clients(1) <> outer.spad.module.io.tlb(1)
+  if (use_profiler) {
+    tlb.io.clients(2) <> profilers.get.module.io.tlb
+  }
 
   tlb.io.exp.foreach(_.flush_skip := false.B)
   tlb.io.exp.foreach(_.flush_retry := false.B)
@@ -171,7 +178,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     clock_en_reg := io.cmd.bits.rs1(0)
   }
 
-  val raw_cmd_q = Module(new Queue(new GemminiCmd(reservation_station_entries), entries = 2))
+  val raw_cmd_q = Module(new Queue(new GemminiCmd(reservation_station_entries), entries = 5))
   raw_cmd_q.io.enq.valid := io.cmd.valid
   io.cmd.ready := raw_cmd_q.io.enq.ready
   raw_cmd_q.io.enq.bits.cmd := io.cmd.bits
@@ -401,7 +408,8 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   reservation_station_completed_arb.io.out.ready := true.B
 
   // Wire up global RoCC signals
-  io.busy := raw_cmd.valid || loop_conv_unroller_busy || loop_matmul_unroller_busy || reservation_station.io.busy || spad.module.io.busy || loop_cmd.valid || conv_cmd.valid
+  val profiler_busy = if (use_profiler) profilers.get.module.io.busy else false.B
+  io.busy := raw_cmd.valid || loop_conv_unroller_busy || loop_matmul_unroller_busy || reservation_station.io.busy || spad.module.io.busy || profiler_busy || loop_cmd.valid || conv_cmd.valid
 
   io.interrupt := tlb.io.exp.map(_.interrupt).reduce(_ || _)
 
@@ -468,7 +476,9 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
     .elsewhen (is_profiler_paddr){
       if (use_profiler) {
-        profilers.get.module.io.profiler_dram_addr := loop_cmd.bits.cmd.rs1
+        profilers.get.module.io.profiler_vaddr_valid := loop_cmd.valid
+        profilers.get.module.io.profiler_vaddr := loop_cmd.bits.cmd.rs1
+        profilers.get.module.io.profiler_status := loop_cmd.bits.cmd.status
       }
       loop_cmd.ready := true.B
     }

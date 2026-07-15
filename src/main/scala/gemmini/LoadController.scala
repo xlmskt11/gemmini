@@ -191,7 +191,7 @@ class LoadController[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig
   // Profiler
   if (use_profiler) {
     ProfileEventIO.init(io.profile.get)
-    io.profile.get.connectEventSignal(ProfileEvent.LD_CTRL_EXECUTE, cmd.fire, cmd.bits.rob_id.bits)
+    io.profile.get.connectEventSignal(ProfileEvent.LD_CTRL_EXECUTE, cmd_tracker.io.alloc.fire(), cmd.bits.rob_id.bits)
   }
 
   // Assertions

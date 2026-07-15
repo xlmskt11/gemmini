@@ -1,4 +1,3 @@
-
 package gemmini
 
 import chisel3._
@@ -22,6 +21,8 @@ class LoopMatmulLdAReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
   val laddrR_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None // made
   val dram_addr = UInt(coreMaxAddrBits.W)
   val dram_stride = UInt(coreMaxAddrBits.W)
+  val tile_row_offset = UInt(iterator_bitwidth.W)
+  val tile_col_offset = UInt(iterator_bitwidth.W)
   val transpose = Bool()
   val addr_start = UInt(log2Up(max_addr).W)
   val loop_id = UInt(log2Up(concurrent_loops).W)
@@ -67,7 +68,7 @@ class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   val col_pad = Mux(req.transpose, req.pad_i, req.pad_k)
 
   val max_col_dim = Mux(req.transpose, req.max_i, req.max_k)
-  val max_blocks = Mux(max_col_dim <= max_block_len.U, max_col_dim, max_block_len.U)
+  val max_blocks_without_page_limit = Mux(max_col_dim <= max_block_len.U, max_col_dim, max_block_len.U)
 
   // changed
   // val sp_addr_start = req.addr_start
@@ -77,7 +78,19 @@ class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     req.addr_start
   }
 
-  val dram_offset = (row_iterator * req.dram_stride + col_iterator) * block_size.U * (input_w/8).U
+  val dram_stride = LoopMatmul.pagePackedStridePayload(req.dram_stride)
+  val page_packed = LoopMatmul.isPagePackedStride(req.dram_stride) && !req.transpose
+  val shared_page_packed_row_offset = if (use_shared_res_entries) req.laddrR_offset.get else 0.U(iterator_bitwidth.W)
+  val page_packed_row_iterator = req.tile_row_offset + row_iterator + shared_page_packed_row_offset
+  val page_packed_col_iterator = req.tile_col_offset + col_iterator
+  val page_packed_col_blocks = LoopMatmul.pagePacked2DColBlocks(block_size, input_w/8, max_block_len)
+  val page_packed_blocks_left = page_packed_col_blocks.U - page_packed_col_iterator % page_packed_col_blocks.U
+  val max_blocks = Mux(page_packed && page_packed_blocks_left < max_blocks_without_page_limit,
+    page_packed_blocks_left, max_blocks_without_page_limit)
+  val row_major_dram_offset = (row_iterator * dram_stride + col_iterator) * block_size.U * (input_w/8).U
+  val page_packed_dram_offset =
+    LoopMatmul.pagePacked2DOffset(page_packed_row_iterator, page_packed_col_iterator, dram_stride, block_size, input_w/8, max_block_len)
+  val dram_offset = Mux(page_packed, page_packed_dram_offset, row_major_dram_offset)
   val dram_addr = req.dram_addr + LoopMatmul.castDramOffset(dram_offset)
   val sp_addr = sp_addr_start + (row_iterator * spad_stride + col_iterator) * block_size.U
   val blocks = Mux(col_iterator + max_blocks <= max_col_iterator, max_blocks, max_col_iterator-col_iterator)
@@ -116,8 +129,8 @@ class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     state := idle
   }.elsewhen (io.cmd.fire) {
     // The order here is k, j, i
-    val i_blocks = Mux(req.transpose, max_blocks, 1.U)
-    val k_blocks = Mux(req.transpose, 1.U, max_blocks)
+    val i_blocks = Mux(req.transpose, blocks, 1.U)
+    val k_blocks = Mux(req.transpose, 1.U, blocks)
 
     val next_i = floorAdd(i, i_blocks, req.max_i)
     val next_k = floorAdd(k, k_blocks, req.max_k, next_i === 0.U)
@@ -152,6 +165,8 @@ class LoopMatmulLdBReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
   val group_list = if (use_shared_res_entries) Some(UInt(nSharers.W)) else None // made
   val dram_addr = UInt(coreMaxAddrBits.W)
   val dram_stride = UInt(coreMaxAddrBits.W)
+  val tile_row_offset = UInt(iterator_bitwidth.W)
+  val tile_col_offset = UInt(iterator_bitwidth.W)
   val transpose = Bool()
   val addr_end = UInt(log2Up(max_addr+1).W)
   val loop_id = UInt(log2Up(concurrent_loops).W)
@@ -206,7 +221,7 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   val col_pad = Mux(req.transpose, req.pad_k, req.pad_j)
 
   val max_col_dim = Mux(req.transpose, req.max_k, req.max_j)
-  val max_blocks = Mux(max_col_dim <= max_block_len.U, max_col_dim, max_block_len.U)
+  val max_blocks_without_page_limit = Mux(max_col_dim <= max_block_len.U, max_col_dim, max_block_len.U)
 
   // changed
   // val sp_addr_start = req.addr_end - req.max_k * req.max_j * block_size.U
@@ -216,7 +231,19 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     req.addr_end - req.max_k * req.max_j * block_size.U
   }
 
-  val dram_offset = (row_iterator * req.dram_stride + col_iterator) * block_size.U * (input_w/8).U
+  val dram_stride = LoopMatmul.pagePackedStridePayload(req.dram_stride)
+  val page_packed = LoopMatmul.isPagePackedStride(req.dram_stride) && !req.transpose
+  val shared_page_packed_row_offset = if (use_shared_res_entries) req.laddrR_offset.get else 0.U(iterator_bitwidth.W)
+  val page_packed_row_iterator = req.tile_row_offset + row_iterator + shared_page_packed_row_offset
+  val page_packed_col_iterator = req.tile_col_offset + col_iterator
+  val page_packed_col_blocks = LoopMatmul.pagePackedBColBlocks(block_size, input_w/8)
+  val page_packed_blocks_left = page_packed_col_blocks.U - page_packed_col_iterator % page_packed_col_blocks.U
+  val max_blocks = Mux(page_packed && page_packed_blocks_left < max_blocks_without_page_limit,
+    page_packed_blocks_left, max_blocks_without_page_limit)
+  val row_major_dram_offset = (row_iterator * dram_stride + col_iterator) * block_size.U * (input_w/8).U
+  val page_packed_dram_offset =
+    LoopMatmul.pagePackedBOffset(page_packed_row_iterator, page_packed_col_iterator, dram_stride, block_size, input_w/8)
+  val dram_offset = Mux(page_packed, page_packed_dram_offset, row_major_dram_offset)
   val dram_addr = req.dram_addr + LoopMatmul.castDramOffset(dram_offset)
   val sp_addr = sp_addr_start + (row_iterator * spad_stride + col_iterator) * block_size.U
   val blocks = Mux(col_iterator + max_blocks <= max_col_iterator, max_blocks, max_col_iterator-col_iterator)
@@ -255,7 +282,7 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     io.laddrK_offset.get := req.laddrR_offset.get // made
     io.group_id.get := req.group_id.get // made
     io.group_list.get := req.group_list.get // made
-    io.max_k.get := max_row_iterator // made
+    io.max_k.get := req.max_k // made
   }
 
   val loop_has_room = if (use_shared_res_entries) !io.loop_full.get else true.B
@@ -264,8 +291,8 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     state := idle
   }.elsewhen (io.cmd.fire) {
     // The order here is k, j, i
-    val j_blocks = Mux(req.transpose, 1.U, max_blocks)
-    val k_blocks = Mux(req.transpose, max_blocks, 1.U)
+    val j_blocks = Mux(req.transpose, 1.U, blocks)
+    val k_blocks = Mux(req.transpose, blocks, 1.U)
 
     val next_j = floorAdd(j, j_blocks, req.max_j)
     val next_k = floorAdd(k, k_blocks, req.max_k, next_j === 0.U)
@@ -297,6 +324,8 @@ class LoopMatmulLdDReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
   val laddrI_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None // made
   val dram_addr = UInt(coreMaxAddrBits.W)
   val dram_stride = UInt(coreMaxAddrBits.W)
+  val tile_row_offset = UInt(iterator_bitwidth.W)
+  val tile_col_offset = UInt(iterator_bitwidth.W)
   val low_d = Bool()
   val addr_start = UInt(log2Up(max_acc_addr).W)
   val loop_id = UInt(log2Up(concurrent_loops).W)
@@ -323,7 +352,7 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 
   val req = Reg(new LoopMatmulLdDReq(block_size, coreMaxAddrBits, iterator_bitwidth, max_acc_addr, concurrent_loops, use_shared_res_entries))
 
-  val max_blocks = Mux(req.low_d, Mux(req.max_j <= max_block_len.U, req.max_j, max_block_len.U),
+  val max_blocks_without_page_limit = Mux(req.low_d, Mux(req.max_j <= max_block_len.U, req.max_j, max_block_len.U),
     Mux(req.max_j <= max_block_len_acc.U, req.max_j, max_block_len_acc.U))
 
   val j = Reg(UInt(iterator_bitwidth.W))
@@ -338,8 +367,23 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   }
   // end
 
-  val dram_offset = Mux(req.low_d, (i * req.dram_stride + j) * block_size.U * (input_w/8).U,
-    (i * req.dram_stride + j) * block_size.U * (acc_w/8).U)
+  val dram_stride = LoopMatmul.pagePackedStridePayload(req.dram_stride)
+  val page_packed = LoopMatmul.isPagePackedStride(req.dram_stride)
+  val page_packed_i_offset = if (use_shared_res_entries) req.laddrI_offset.get else 0.U(iterator_bitwidth.W)
+  val page_packed_i = req.tile_row_offset + i + page_packed_i_offset
+  val page_packed_j = req.tile_col_offset + j
+  val input_page_col_blocks = LoopMatmul.pagePacked2DColBlocks(block_size, input_w/8, max_block_len)
+  val acc_page_col_blocks = LoopMatmul.pagePacked2DColBlocks(block_size, acc_w/8, max_block_len_acc)
+  val page_packed_col_blocks = Mux(req.low_d, input_page_col_blocks.U, acc_page_col_blocks.U)
+  val page_packed_blocks_left = page_packed_col_blocks - page_packed_j % page_packed_col_blocks
+  val max_blocks = Mux(page_packed && page_packed_blocks_left < max_blocks_without_page_limit,
+    page_packed_blocks_left, max_blocks_without_page_limit)
+  val row_major_dram_offset = Mux(req.low_d, (i * dram_stride + j) * block_size.U * (input_w/8).U,
+    (i * dram_stride + j) * block_size.U * (acc_w/8).U)
+  val page_packed_dram_offset = Mux(req.low_d,
+    LoopMatmul.pagePacked2DOffset(page_packed_i, page_packed_j, dram_stride, block_size, input_w/8, max_block_len),
+    LoopMatmul.pagePacked2DOffset(page_packed_i, page_packed_j, dram_stride, block_size, acc_w/8, max_block_len_acc))
+  val dram_offset = Mux(page_packed, page_packed_dram_offset, row_major_dram_offset)
   val dram_addr = req.dram_addr + LoopMatmul.castDramOffset(dram_offset)
   val sp_addr = acc_addr_start + (i * req.max_j + j) * block_size.U
   val blocks = Mux(j + max_blocks <= req.max_j, max_blocks, req.max_j-j)
@@ -378,7 +422,7 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   }.elsewhen (io.cmd.fire) {
     // The order here is k, j, i
     val next_i = floorAdd(i, 1.U, req.max_i)
-    val next_j = floorAdd(j, max_blocks, req.max_j, next_i === 0.U)
+    val next_j = floorAdd(j, blocks, req.max_j, next_i === 0.U)
 
     i := next_i
     j := next_j
@@ -612,6 +656,8 @@ class LoopMatmulStCReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
   val laddrI_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None // made
   val dram_addr = UInt(coreMaxAddrBits.W)
   val dram_stride = UInt(coreMaxAddrBits.W)
+  val tile_row_offset = UInt(iterator_bitwidth.W)
+  val tile_col_offset = UInt(iterator_bitwidth.W)
   val full_c = Bool()
   val act = UInt(Activation.bitwidth.W)
   val addr_start = UInt(log2Up(max_acc_addr).W)
@@ -620,7 +666,7 @@ class LoopMatmulStCReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
 }
 
 class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: Int, max_acc_addr: Int, input_w: Int, acc_w: Int,
-                    max_block_len: Int, concurrent_loops: Int, mvout_rs2_t: MvoutRs2, group_w: Int, use_shared_res_entries: Boolean)
+                    max_block_len: Int, max_block_len_acc: Int, concurrent_loops: Int, mvout_rs2_t: MvoutRs2, group_w: Int, use_shared_res_entries: Boolean)
                    (implicit p: Parameters) extends Module {
   val io = IO(new Bundle {
     val req = Flipped(Decoupled(new LoopMatmulStCReq(block_size, coreMaxAddrBits, iterator_bitwidth, max_acc_addr, concurrent_loops, group_w, use_shared_res_entries)))
@@ -650,7 +696,7 @@ class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 
   val req = Reg(new LoopMatmulStCReq(block_size, coreMaxAddrBits, iterator_bitwidth, max_acc_addr, concurrent_loops, group_w, use_shared_res_entries))
 
-  val max_blocks = Mux(req.full_c, 1.U, Mux(req.max_j <= max_block_len.U, req.max_j, max_block_len.U))
+  val max_blocks_without_page_limit = Mux(req.full_c, 1.U, Mux(req.max_j <= max_block_len.U, req.max_j, max_block_len.U))
 
   // Non-normalization-related iterators and calculations
   val j = Reg(UInt(iterator_bitwidth.W))
@@ -664,8 +710,23 @@ class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     /*(BigInt(1) << 31).U | (req.full_c << 29.U).asUInt |*/ req.addr_start
   }
 
-  val dram_offset = Mux(req.full_c, (i * req.dram_stride + j) * block_size.U * (acc_w/8).U,
-    (i * req.dram_stride + j) * block_size.U * (input_w/8).U)
+  val dram_stride = LoopMatmul.pagePackedStridePayload(req.dram_stride)
+  val page_packed = LoopMatmul.isPagePackedStride(req.dram_stride)
+  val page_packed_i_offset = if (use_shared_res_entries) req.laddrI_offset.get else 0.U(iterator_bitwidth.W)
+  val page_packed_i = req.tile_row_offset + i + page_packed_i_offset
+  val page_packed_j = req.tile_col_offset + j
+  val input_page_col_blocks = LoopMatmul.pagePacked2DColBlocks(block_size, input_w/8, max_block_len)
+  val acc_page_col_blocks = LoopMatmul.pagePacked2DColBlocks(block_size, acc_w/8, max_block_len_acc)
+  val page_packed_col_blocks = Mux(req.full_c, acc_page_col_blocks.U, input_page_col_blocks.U)
+  val page_packed_blocks_left = page_packed_col_blocks - page_packed_j % page_packed_col_blocks
+  val max_blocks = Mux(page_packed && page_packed_blocks_left < max_blocks_without_page_limit,
+    page_packed_blocks_left, max_blocks_without_page_limit)
+  val row_major_dram_offset = Mux(req.full_c, (i * dram_stride + j) * block_size.U * (acc_w/8).U,
+    (i * dram_stride + j) * block_size.U * (input_w/8).U)
+  val page_packed_dram_offset = Mux(req.full_c,
+    LoopMatmul.pagePacked2DOffset(page_packed_i, page_packed_j, dram_stride, block_size, acc_w/8, max_block_len_acc),
+    LoopMatmul.pagePacked2DOffset(page_packed_i, page_packed_j, dram_stride, block_size, input_w/8, max_block_len))
+  val dram_offset = Mux(page_packed, page_packed_dram_offset, row_major_dram_offset)
   val dram_addr = req.dram_addr + LoopMatmul.castDramOffset(dram_offset)
   val sp_addr = acc_addr_start + (i * req.max_j + j) * block_size.U
   val blocks = Mux(j + max_blocks <= req.max_j, max_blocks, req.max_j-j)
@@ -702,12 +763,12 @@ class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   val ln_r = ln_row +& ln_stat_id
 
   val ln_sp_addr = acc_addr_start +& (i * req.max_j +& j) * block_size.U +& ln_r
-  val ln_norm_cmd = Mux(j +& max_blocks >= req.max_j,
+  val ln_norm_cmd = Mux(j +& blocks >= req.max_j,
     Mux(req.act === Activation.LAYERNORM, ln_norm_cmds(ln_cmd)(1), sm_norm_cmds(ln_cmd)(1)),
     Mux(req.act === Activation.LAYERNORM, ln_norm_cmds(ln_cmd)(0), sm_norm_cmds(ln_cmd)(0)))
 
   // TODO we assume for now that full_C and layernorm aren't true at the same
-  val ln_dram_offset = ((i * req.dram_stride +& j) * block_size.U +& ln_r * req.dram_stride) * (input_w/8).U
+  val ln_dram_offset = ((i * dram_stride +& j) * block_size.U +& ln_r * dram_stride) * (input_w/8).U
   val ln_dram_addr = req.dram_addr + LoopMatmul.castDramOffset(ln_dram_offset)
 
   val ln_config_norm_rs1 = Wire(new GemminiISA.ConfigNormRs1)
@@ -764,7 +825,7 @@ class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   }.elsewhen (io.cmd.fire() && state === st) {
     // The order here is k, j, i
     val next_i = floorAdd(i, 1.U, req.max_i)
-    val next_j = floorAdd(j, max_blocks, req.max_j, next_i === 0.U)
+    val next_j = floorAdd(j, blocks, req.max_j, next_i === 0.U)
 
     i := next_i
     j := next_j
@@ -775,7 +836,7 @@ class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   }.elsewhen (io.cmd.fire() && state === ln_config) {
     state := ln_st
   }.elsewhen (io.cmd.fire() && state === ln_st) {
-    val next_j = floorAdd(j, max_blocks, req.max_j)
+    val next_j = floorAdd(j, blocks, req.max_j)
     val next_stat_id = floorAdd(ln_stat_id, 1.U, ln_stat_ids, next_j === 0.U)
     val next_cmd = floorAdd(ln_cmd, 1.U, ln_norm_cmds.size.U, next_j === 0.U && next_stat_id === 0.U)
     val next_row = floorAdd(ln_row, NORM_STAT_IDS.U, rows, next_j === 0.U && next_stat_id === 0.U && next_cmd === 0.U)
@@ -842,6 +903,15 @@ class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val 
   val d_dram_stride = UInt(coreMaxAddrBits.W)
   val c_dram_stride = UInt(coreMaxAddrBits.W)
 
+  val a_tile_row_offset = UInt(iterator_bitwidth.W)
+  val a_tile_col_offset = UInt(iterator_bitwidth.W)
+  val b_tile_row_offset = UInt(iterator_bitwidth.W)
+  val b_tile_col_offset = UInt(iterator_bitwidth.W)
+  val d_tile_row_offset = UInt(iterator_bitwidth.W)
+  val d_tile_col_offset = UInt(iterator_bitwidth.W)
+  val c_tile_row_offset = UInt(iterator_bitwidth.W)
+  val c_tile_col_offset = UInt(iterator_bitwidth.W)
+
   val a_transpose = Bool()
   val b_transpose = Bool()
 
@@ -897,6 +967,15 @@ class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val 
     laddrRA_offset.foreach(_ := 0.U)
     group_id.foreach(_ := 0.U)
     group_list.foreach(_ := 0.U)
+
+    a_tile_row_offset := 0.U
+    a_tile_col_offset := 0.U
+    b_tile_row_offset := 0.U
+    b_tile_col_offset := 0.U
+    d_tile_row_offset := 0.U
+    d_tile_col_offset := 0.U
+    c_tile_row_offset := 0.U
+    c_tile_col_offset := 0.U
   }
 }
 
@@ -944,7 +1023,7 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   val ldB = Module(new LoopMatmulLdB(block_size, coreMaxAddrBits, iterator_bitwidth, max_addr, input_w, max_block_len, concurrent_loops, mvin_rs2_t, use_shared_res_entries, group_w, nSharers))
   val ldD = Module(new LoopMatmulLdD(block_size, coreMaxAddrBits, iterator_bitwidth, max_acc_addr, input_w, acc_w, max_block_len, max_block_len_acc, concurrent_loops, mvin_rs2_t, use_shared_res_entries))
   val ex = Module(new LoopMatmulExecute(block_size, coreMaxAddrBits, iterator_bitwidth, max_addr, max_acc_addr, concurrent_loops, preload_rs1_t, preload_rs2_t, compute_rs1_t, compute_rs2_t, use_shared_res_entries, group_w, nSharers))
-  val stC = Module(new LoopMatmulStC(block_size, coreMaxAddrBits, iterator_bitwidth, max_acc_addr, input_w, acc_w, max_block_len, concurrent_loops, mvout_rs2_t, group_w, use_shared_res_entries))
+  val stC = Module(new LoopMatmulStC(block_size, coreMaxAddrBits, iterator_bitwidth, max_acc_addr, input_w, acc_w, max_block_len, max_block_len_acc, concurrent_loops, mvout_rs2_t, group_w, use_shared_res_entries))
 
   // Create command queue
   val cmd = Queue(io.in)
@@ -970,7 +1049,10 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   val arb = Module(new Arbiter(new RoCCCommand(), 4))
   arb.io.in(0) <> stC.io.cmd
   arb.io.in(1) <> ex.io.cmd
-  arb.io.in(2) <> ldD.io.cmd
+  // arb.io.in(2) <> ldD.io.cmd
+  arb.io.in(2).bits <> ldD.io.cmd.bits
+  arb.io.in(2).valid := ldD.io.cmd.valid && ((ldA.io.loop_id === ldD.io.loop_id) && (ldB.io.loop_id === ldD.io.loop_id) || !(tail_loop_id === ldD.io.loop_id))
+  ldD.io.cmd.ready := arb.io.in(2).ready && ((ldA.io.loop_id === ldD.io.loop_id) && (ldB.io.loop_id === ldD.io.loop_id) || !(tail_loop_id === ldD.io.loop_id))
   arb.io.in(3) <> ldab_arb.io.out
   val unrolled_cmd = arb.io.out
 
@@ -994,7 +1076,9 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   } else {
     false.B
   }
-  val is_loop_config_cmd = (cmd.bits.cmd.inst.funct >= LOOP_WS_CONFIG_BOUNDS && cmd.bits.cmd.inst.funct <= LOOP_WS_CONFIG_STRIDES_DC) || shared_loop_config_cmd
+  val page_offset_config_cmd = cmd.bits.cmd.inst.funct === LOOP_WS_CONFIG_PAGE_OFFSETS
+  val is_loop_config_cmd = (cmd.bits.cmd.inst.funct >= LOOP_WS_CONFIG_BOUNDS && cmd.bits.cmd.inst.funct <= LOOP_WS_CONFIG_STRIDES_DC) ||
+    shared_loop_config_cmd || page_offset_config_cmd
   val is_loop_cmd = is_loop_run_cmd || is_loop_config_cmd
 
   io.out.bits.cmd := Mux(loop_configured, unrolled_cmd.bits, cmd.bits.cmd)
@@ -1112,6 +1196,18 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
         loop_being_configured.c_dram_stride := cmd.bits.cmd.rs2
       }
 
+      is (LOOP_WS_CONFIG_PAGE_OFFSETS) {
+        loop_being_configured.a_tile_row_offset := cmd.bits.cmd.rs1(iterator_bitwidth - 1, 0)
+        loop_being_configured.a_tile_col_offset := cmd.bits.cmd.rs1(iterator_bitwidth * 2 - 1, iterator_bitwidth)
+        loop_being_configured.b_tile_row_offset := cmd.bits.cmd.rs1(iterator_bitwidth * 3 - 1, iterator_bitwidth * 2)
+        loop_being_configured.b_tile_col_offset := cmd.bits.cmd.rs1(iterator_bitwidth * 4 - 1, iterator_bitwidth * 3)
+
+        loop_being_configured.d_tile_row_offset := cmd.bits.cmd.rs2(iterator_bitwidth - 1, 0)
+        loop_being_configured.d_tile_col_offset := cmd.bits.cmd.rs2(iterator_bitwidth * 2 - 1, iterator_bitwidth)
+        loop_being_configured.c_tile_row_offset := cmd.bits.cmd.rs2(iterator_bitwidth * 3 - 1, iterator_bitwidth * 2)
+        loop_being_configured.c_tile_col_offset := cmd.bits.cmd.rs2(iterator_bitwidth * 4 - 1, iterator_bitwidth * 3)
+      }
+
       is (LOOP_WS) {
         loop_being_configured.ex_accumulate := cmd.bits.cmd.rs1(0)
         loop_being_configured.full_c := cmd.bits.cmd.rs1(1)
@@ -1149,6 +1245,8 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   }
   ldA.io.req.bits.dram_addr := loop_requesting_ldA.a_dram_addr
   ldA.io.req.bits.dram_stride := loop_requesting_ldA.a_dram_stride
+  ldA.io.req.bits.tile_row_offset := loop_requesting_ldA.a_tile_row_offset
+  ldA.io.req.bits.tile_col_offset := loop_requesting_ldA.a_tile_col_offset
   ldA.io.req.bits.transpose := loop_requesting_ldA.a_transpose
   ldA.io.req.bits.addr_start := loop_requesting_ldA.a_addr_start
   val ldACanStart = !loop_requesting_ldA.lda_started && loop_requesting_ldA.configured
@@ -1176,6 +1274,8 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   }
   ldB.io.req.bits.dram_addr := loop_requesting_ldB.b_dram_addr
   ldB.io.req.bits.dram_stride := loop_requesting_ldB.b_dram_stride
+  ldB.io.req.bits.tile_row_offset := loop_requesting_ldB.b_tile_row_offset
+  ldB.io.req.bits.tile_col_offset := loop_requesting_ldB.b_tile_col_offset
   ldB.io.req.bits.transpose := loop_requesting_ldB.b_transpose
   ldB.io.req.bits.addr_end := loop_requesting_ldB.b_addr_end
   ldB.io.req.bits.max_k := ldBMaxK
@@ -1245,6 +1345,8 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   ldD.io.req.bits.pad_i := loop_requesting_ldD.pad_i
   ldD.io.req.bits.dram_addr := loop_requesting_ldD.d_dram_addr
   ldD.io.req.bits.dram_stride := loop_requesting_ldD.d_dram_stride
+  ldD.io.req.bits.tile_row_offset := loop_requesting_ldD.d_tile_row_offset
+  ldD.io.req.bits.tile_col_offset := loop_requesting_ldD.d_tile_col_offset
   ldD.io.req.bits.low_d := loop_requesting_ldD.low_d
   val ldDCanStart = !loop_requesting_ldD.ldd_started && loop_requesting_ldD.configured
   if (use_shared_res_entries) {
@@ -1278,6 +1380,8 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   stC.io.req.bits.pad_i := loop_requesting_st.pad_i
   stC.io.req.bits.dram_addr := loop_requesting_st.c_dram_addr
   stC.io.req.bits.dram_stride := loop_requesting_st.c_dram_stride
+  stC.io.req.bits.tile_row_offset := loop_requesting_st.c_tile_row_offset
+  stC.io.req.bits.tile_col_offset := loop_requesting_st.c_tile_col_offset
   stC.io.req.bits.full_c := loop_requesting_st.full_c
   stC.io.req.bits.act := loop_requesting_st.act
   val stCanStart = !loop_requesting_st.st_started && loop_requesting_st.ex_started && loop_requesting_st.configured
@@ -1342,6 +1446,69 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
 }
 
 object LoopMatmul {
+  private val pagePackedStrideFlagBit = 31
+  private val pagePackedPageBytes = 4096
+
+  def isPagePackedStride(stride: UInt): Bool = {
+    if (stride.getWidth > pagePackedStrideFlagBit) {
+      stride(pagePackedStrideFlagBit)
+    } else {
+      false.B
+    }
+  }
+
+  def pagePackedStridePayload(stride: UInt): UInt = {
+    if (stride.getWidth > pagePackedStrideFlagBit) {
+      stride & ((BigInt(1) << pagePackedStrideFlagBit) - 1).U(stride.getWidth.W)
+    } else {
+      stride
+    }
+  }
+
+  private def ceilDivByConst(value: UInt, divisor: Int): UInt = {
+    if (divisor == 1) value else (value + (divisor - 1).U) / divisor.U
+  }
+
+  def pagePacked2DColBlocks(blockSize: Int, elemBytes: Int, maxBlockLen: Int): Int = {
+    val blocksPerPage = pagePackedPageBytes / (blockSize * blockSize * elemBytes)
+    if (maxBlockLen < blocksPerPage) maxBlockLen else blocksPerPage
+  }
+
+  def pagePackedBColBlocks(blockSize: Int, elemBytes: Int): Int = {
+    pagePackedPageBytes / (blockSize * blockSize * elemBytes)
+  }
+
+  def pagePacked2DOffset(rowBlock: UInt, colBlock: UInt, strideElems: UInt,
+                         blockSize: Int, elemBytes: Int, maxBlockLen: Int): UInt = {
+    val blocksPerPage = pagePackedPageBytes / (blockSize * blockSize * elemBytes)
+    val pageColBlocks = pagePacked2DColBlocks(blockSize, elemBytes, maxBlockLen)
+    val pageRowBlocks = blocksPerPage / pageColBlocks
+    val strideBlocks = ceilDivByConst(strideElems, blockSize)
+    val colPages = ceilDivByConst(strideBlocks, pageColBlocks)
+
+    val rowPage = rowBlock / pageRowBlocks.U
+    val colPage = colBlock / pageColBlocks.U
+    val rowInPage = rowBlock % pageRowBlocks.U
+    val colInPage = colBlock % pageColBlocks.U
+
+    val pageIndex = rowPage * colPages + colPage
+    val pageCols = pageColBlocks * blockSize
+    pageIndex * pagePackedPageBytes.U +
+      (rowInPage * (blockSize * pageCols).U + colInPage * blockSize.U) * elemBytes.U
+  }
+
+  def pagePackedBOffset(rowBlock: UInt, colBlock: UInt, strideElems: UInt,
+                        blockSize: Int, elemBytes: Int): UInt = {
+    val pageColBlocks = pagePackedBColBlocks(blockSize, elemBytes)
+    val strideBlocks = ceilDivByConst(strideElems, blockSize)
+    val colPages = ceilDivByConst(strideBlocks, pageColBlocks)
+
+    val colPage = colBlock / pageColBlocks.U
+    val colInPage = colBlock % pageColBlocks.U
+    val pageIndex = rowBlock * colPages + colPage
+    pageIndex * pagePackedPageBytes.U + colInPage * blockSize.U * elemBytes.U
+  }
+
   def apply(in: DecoupledIO[GemminiCmd], ld_completed: UInt, st_completed: UInt, ex_completed: UInt,
             block_size: Int, coreMaxAddrBits: Int, rob_size: Int, max_lds: Int, max_exs: Int, max_sts: Int,
             max_addr: Int, max_acc_addr: Int, input_w: Int, acc_w: Int, dma_max_bytes: Int,

@@ -324,7 +324,7 @@ class StoreController[T <: Data : Arithmetic, U <: Data, V <: Data](config: Gemm
   // Profiler
   if (use_profiler) {
     ProfileEventIO.init(io.profile.get)
-    io.profile.get.connectEventSignal(ProfileEvent.ST_CTRL_EXECUTE, cmd.fire, cmd.bits.rob_id.bits)
+    io.profile.get.connectEventSignal(ProfileEvent.ST_CTRL_EXECUTE, cmd_tracker.io.alloc.fire(), cmd.bits.rob_id.bits)
   }
 
   if (use_firesim_simulation_counters) {

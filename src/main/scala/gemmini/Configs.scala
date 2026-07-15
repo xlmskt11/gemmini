@@ -306,7 +306,8 @@ class DefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
   mesh_cols: Int = 16,
   sp_kb: Int = 64,
   acc_kb: Int = 32,
-  gemminiConfig: GemminiArrayConfig[T,U,V] = GemminiConfigs.chipConfig
+  use_profiler: Boolean = false,
+  gemminiConfig: GemminiArrayConfig[T,U,V] = GemminiConfigs.firesimConfig
 ) extends Config((site, here, up) => {
   case BuildRoCC => up(BuildRoCC) ++ Seq(
     (p: Parameters) => {
@@ -342,7 +343,8 @@ class DefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       use_shared_res_entries = false,
       nSharers = 1,
       use_shared_ext_mem = false,
-      max_in_flight_mem_reqs = mesh_rows
+      max_in_flight_mem_reqs = mesh_rows,
+      use_profiler = use_profiler
       )))
       gemmini
     }
@@ -355,6 +357,7 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
   mesh_cols: Int = 16,
   sp_kB: Int = 64,
   acc_kB: Int = 32,
+  use_profiler: Boolean = false,
   gemminiConfig: GemminiArrayConfig[T,U,V] = GemminiConfigs.firesimConfig
 ) extends Config((site, here, up) => {
   case BuildRoCC => {
@@ -373,6 +376,7 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
       use_shared_res_entries = true,
+      use_profiler = use_profiler,
       nSharers = 4
       )))
       gemmini0
@@ -388,6 +392,7 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
       use_shared_res_entries = true,
+      use_profiler = use_profiler,
       nSharers = 4
       )))
       gemmini1
@@ -403,6 +408,7 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
       use_shared_res_entries = true,
+      use_profiler = use_profiler,
       nSharers = 4
       )))
       gemmini2
@@ -418,6 +424,7 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       sp_capacity = CapacityInKilobytes(sp_kB),
       acc_capacity = CapacityInKilobytes(acc_kB),
       use_shared_res_entries = true,
+      use_profiler = use_profiler,
       nSharers = 4
       )))
       InModuleBody {

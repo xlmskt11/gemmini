@@ -307,7 +307,7 @@ class StreamReaderCore[T <: Data, U <: Data, V <: Data](config: GemminiArrayConf
     // Performance counter
     CounterEventIO.init(io.counter)
     io.counter.connectEventSignal(CounterEvent.RDMA_ACTIVE_CYCLE, state =/= s_idle)
-    io.counter.connectEventSignal(CounterEvent.RDMA_TLB_WAIT_CYCLES, io.tlb.resp.miss)
+    io.counter.connectEventSignal(CounterEvent.RDMA_TLB_WAIT_CYCLES, tl.a.ready && translate_q.io.deq.valid && io.tlb.resp.miss)
     io.counter.connectEventSignal(CounterEvent.RDMA_TL_WAIT_CYCLES, tl.a.valid && !tl.a.ready)
 
     // External counters
@@ -610,7 +610,7 @@ class StreamWriter[T <: Data: Arithmetic](nXacts: Int, beatBits: Int, maxBytes: 
     // Performance counter
     CounterEventIO.init(io.counter)
     io.counter.connectEventSignal(CounterEvent.WDMA_ACTIVE_CYCLE, state =/= s_idle)
-    io.counter.connectEventSignal(CounterEvent.WDMA_TLB_WAIT_CYCLES, io.tlb.resp.miss)
+    io.counter.connectEventSignal(CounterEvent.WDMA_TLB_WAIT_CYCLES, tl.a.ready && translate_q.io.deq.valid && io.tlb.resp.miss)
     io.counter.connectEventSignal(CounterEvent.WDMA_TL_WAIT_CYCLES, tl.a.valid && !tl.a.ready)
 
     // External counters
