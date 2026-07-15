@@ -1,0 +1,29 @@
+{
+  "name" : "llama-firesim",
+  "base" : "br-base.json",
+  "workdir" : ".",
+  "rootfs-size" : "32GiB",
+  "host-init" : "host-init.sh",
+  "command" : "/root/llama-firesim/llama-firesim-launch.sh",
+  "files" : [
+    ["generated/root/llama-firesim", "/root/"],
+    ["generated/root/models", "/root/"]
+  ],
+  "outputs" : [
+    "/root/llama-results/run_summary.csv",
+    "/root/llama-results/token_trace.csv",
+    "/root/llama-results/op_profile.csv",
+    "/root/llama-results/stage_summary.csv",
+    "/root/llama-results/backend_summary.csv",
+    "/root/llama-results/arrival_request_summary.csv",
+    "/root/llama-results/arrival_mode_summary.csv",
+    "/root/llama-results/arrival_stage_summary.csv",
+    "/root/llama-results/summary.md"
+  ],
+  "firesim" : {
+    "simulation_outputs" : [
+      "uartlog",
+      "memory_stats*.csv"
+    ]
+  }
+}
