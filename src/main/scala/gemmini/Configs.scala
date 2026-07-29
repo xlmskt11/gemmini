@@ -4,7 +4,7 @@ import chisel3._
 import org.chipsalliance.cde.config.{Config, Parameters}
 import freechips.rocketchip.diplomacy.LazyModule
 import freechips.rocketchip.subsystem._
-import freechips.rocketchip.tile.{BuildRoCC, OpcodeSet, XLen}
+import freechips.rocketchip.tile.{BuildRoCC, OpcodeSet, RoCCCommandRoute, XLen}
 import freechips.rocketchip.rocket._
 import freechips.rocketchip.tile._
 import freechips.rocketchip.system._
@@ -378,7 +378,7 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       use_shared_res_entries = true,
       use_profiler = use_profiler,
       nSharers = 4
-      )))
+      ), commandRoute = RoCCCommandRoute(broadcastIndex = Some(0))))
       gemmini0
     }
     val gemmini_1 = (p: Parameters) => {
@@ -394,7 +394,7 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       use_shared_res_entries = true,
       use_profiler = use_profiler,
       nSharers = 4
-      )))
+      ), commandRoute = RoCCCommandRoute(broadcastIndex = Some(1))))
       gemmini1
     }
     val gemmini_2 = (p: Parameters) => {
@@ -410,7 +410,7 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       use_shared_res_entries = true,
       use_profiler = use_profiler,
       nSharers = 4
-      )))
+      ), commandRoute = RoCCCommandRoute(broadcastIndex = Some(2))))
       gemmini2
     }
     val gemmini_3 = (p: Parameters) => {
@@ -426,7 +426,7 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       use_shared_res_entries = true,
       use_profiler = use_profiler,
       nSharers = 4
-      )))
+      ), commandRoute = RoCCCommandRoute(broadcastIndex = Some(3))))
       InModuleBody {
         require(gemmini0.config.sp_banks == gemmini1.config.sp_banks && gemmini2.config.sp_banks == gemmini3.config.sp_banks && gemmini0.config.sp_banks == gemmini2.config.sp_banks)
         require(gemmini0.config.acc_banks == gemmini1.config.acc_banks && gemmini2.config.acc_banks == gemmini3.config.acc_banks && gemmini0.config.acc_banks == gemmini2.config.acc_banks)

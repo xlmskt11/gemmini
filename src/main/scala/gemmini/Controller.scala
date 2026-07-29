@@ -21,11 +21,14 @@ class GemminiCmd(rob_entries: Int)(implicit p: Parameters) extends Bundle {
   val from_conv_fsm = Bool()
 }
 
-class Gemmini[T <: Data : Arithmetic, U <: Data, V <: Data](val config: GemminiArrayConfig[T, U, V])
+class Gemmini[T <: Data : Arithmetic, U <: Data, V <: Data](
+    val config: GemminiArrayConfig[T, U, V],
+    commandRoute: RoCCCommandRoute = RoCCCommandRoute.default)
                                      (implicit p: Parameters)
   extends LazyRoCC (
     opcodes = config.opcodes,
-    nPTWPorts = if (config.use_shared_tlb) 1 else if (config.use_profiler) 3 else 2) {
+    nPTWPorts = if (config.use_shared_tlb) 1 else if (config.use_profiler) 3 else 2,
+    commandRoute = commandRoute) {
 
   Files.write(Paths.get(config.headerFilePath), config.generateHeader().getBytes(StandardCharsets.UTF_8))
   if (System.getenv("GEMMINI_ONLY_GENERATE_GEMMINI_H") == "1") {
