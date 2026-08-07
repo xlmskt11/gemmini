@@ -7,6 +7,7 @@ import freechips.rocketchip.tile.RoCCCommand
 import org.chipsalliance.cde.config.Parameters
 import GemminiISA._
 import LocalAddr._
+import VpuLocalAddr._
 import Util._
 
 // LdA
@@ -79,10 +80,14 @@ class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   }
 
   val dram_stride = LoopMatmul.pagePackedStridePayload(req.dram_stride)
-  val page_packed = LoopMatmul.isPagePackedStride(req.dram_stride) && !req.transpose
-  val shared_page_packed_row_offset = if (use_shared_res_entries) req.laddrR_offset.get else 0.U(iterator_bitwidth.W)
-  val page_packed_row_iterator = req.tile_row_offset + row_iterator + shared_page_packed_row_offset
-  val page_packed_col_iterator = req.tile_col_offset + col_iterator
+  val page_packed = LoopMatmul.isPagePackedStride(req.dram_stride)
+  val shared_page_packed_offset = if (use_shared_res_entries) req.laddrR_offset.get else 0.U(iterator_bitwidth.W)
+  val page_packed_row_base = Mux(req.transpose, req.tile_col_offset, req.tile_row_offset)
+  val page_packed_col_base = Mux(req.transpose, req.tile_row_offset, req.tile_col_offset)
+  val page_packed_row_iterator = page_packed_row_base + row_iterator +
+    Mux(req.transpose, 0.U(iterator_bitwidth.W), shared_page_packed_offset)
+  val page_packed_col_iterator = page_packed_col_base + col_iterator +
+    Mux(req.transpose, shared_page_packed_offset, 0.U(iterator_bitwidth.W))
   val page_packed_col_blocks = LoopMatmul.pagePacked2DColBlocks(block_size, input_w/8, max_block_len)
   val page_packed_blocks_left = page_packed_col_blocks.U - page_packed_col_iterator % page_packed_col_blocks.U
   val max_blocks = Mux(page_packed && page_packed_blocks_left < max_blocks_without_page_limit,
@@ -154,7 +159,8 @@ class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 // LdB
 
 class LoopMatmulLdBReq(val block_size: Int, val coreMaxAddrBits: Int, val iterator_bitwidth: Int, val max_addr: Int,
-                       val concurrent_loops: Int, val group_w: Int, val nSharers: Int, val use_shared_res_entries: Boolean) extends Bundle {
+                       val concurrent_loops: Int, val group_w: Int, val nSharers: Int,
+                       val use_shared_res_entries: Boolean, val use_vpu_fusion: Boolean) extends Bundle {
   val max_k = UInt(iterator_bitwidth.W)
   val max_fk = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None // made
   val max_j = UInt(iterator_bitwidth.W)
@@ -163,6 +169,7 @@ class LoopMatmulLdBReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
   val laddrR_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None // made
   val group_id = if (use_shared_res_entries) Some(UInt(group_w.W)) else None // made
   val group_list = if (use_shared_res_entries) Some(UInt(nSharers.W)) else None // made
+  val has_gemv_followup = if (use_shared_res_entries && use_vpu_fusion) Some(Bool()) else None
   val dram_addr = UInt(coreMaxAddrBits.W)
   val dram_stride = UInt(coreMaxAddrBits.W)
   val tile_row_offset = UInt(iterator_bitwidth.W)
@@ -173,10 +180,14 @@ class LoopMatmulLdBReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
 }
 
 class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: Int, max_addr: Int, input_w: Int,
-                    max_block_len: Int, concurrent_loops: Int, mvin_rs2_t: MvinRs2, use_shared_res_entries: Boolean, group_w: Int, nSharers: Int)
+                    max_block_len: Int, concurrent_loops: Int, mvin_rs2_t: MvinRs2,
+                    use_shared_res_entries: Boolean, use_vpu_fusion: Boolean,
+                    group_w: Int, nSharers: Int)
                    (implicit p: Parameters) extends Module {
   val io = IO(new Bundle {
-    val req = Flipped(Decoupled(new LoopMatmulLdBReq(block_size, coreMaxAddrBits, iterator_bitwidth, max_addr, concurrent_loops, group_w, nSharers, use_shared_res_entries)))
+    val req = Flipped(Decoupled(new LoopMatmulLdBReq(block_size, coreMaxAddrBits,
+      iterator_bitwidth, max_addr, concurrent_loops, group_w, nSharers,
+      use_shared_res_entries, use_vpu_fusion)))
     val cmd = Decoupled(Output(new RoCCCommand))
 
     val k = Output(UInt(iterator_bitwidth.W))
@@ -190,6 +201,7 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     val laddrK_offset = if (use_shared_res_entries) Some(Output(UInt(iterator_bitwidth.W))) else None // made
     val group_id = if (use_shared_res_entries) Some(Output(UInt(group_w.W))) else None // made
     val group_list = if (use_shared_res_entries) Some(Output(UInt(nSharers.W))) else None // made
+    val has_gemv_followup = if (use_shared_res_entries && use_vpu_fusion) Some(Output(Bool())) else None
     val max_k = if (use_shared_res_entries) Some(Output(UInt(iterator_bitwidth.W))) else None // made
     val loop_full = if (use_shared_res_entries) Some(Input(Bool())) else None // made
   })
@@ -200,7 +212,9 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   import State._
   val state = RegInit(idle)
 
-  val req = Reg(new LoopMatmulLdBReq(block_size, coreMaxAddrBits, iterator_bitwidth, max_addr, concurrent_loops, group_w, nSharers, use_shared_res_entries))
+  val req = Reg(new LoopMatmulLdBReq(block_size, coreMaxAddrBits,
+    iterator_bitwidth, max_addr, concurrent_loops, group_w, nSharers,
+    use_shared_res_entries, use_vpu_fusion))
 
   val k = Reg(UInt(iterator_bitwidth.W))
   val j = Reg(UInt(iterator_bitwidth.W))
@@ -232,10 +246,14 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   }
 
   val dram_stride = LoopMatmul.pagePackedStridePayload(req.dram_stride)
-  val page_packed = LoopMatmul.isPagePackedStride(req.dram_stride) && !req.transpose
-  val shared_page_packed_row_offset = if (use_shared_res_entries) req.laddrR_offset.get else 0.U(iterator_bitwidth.W)
-  val page_packed_row_iterator = req.tile_row_offset + row_iterator + shared_page_packed_row_offset
-  val page_packed_col_iterator = req.tile_col_offset + col_iterator
+  val page_packed = LoopMatmul.isPagePackedStride(req.dram_stride)
+  val shared_page_packed_offset = if (use_shared_res_entries) req.laddrR_offset.get else 0.U(iterator_bitwidth.W)
+  val page_packed_row_base = Mux(req.transpose, req.tile_col_offset, req.tile_row_offset)
+  val page_packed_col_base = Mux(req.transpose, req.tile_row_offset, req.tile_col_offset)
+  val page_packed_row_iterator = page_packed_row_base + row_iterator +
+    Mux(req.transpose, 0.U(iterator_bitwidth.W), shared_page_packed_offset)
+  val page_packed_col_iterator = page_packed_col_base + col_iterator +
+    Mux(req.transpose, shared_page_packed_offset, 0.U(iterator_bitwidth.W))
   val page_packed_col_blocks = LoopMatmul.pagePackedBColBlocks(block_size, input_w/8)
   val page_packed_blocks_left = page_packed_col_blocks.U - page_packed_col_iterator % page_packed_col_blocks.U
   val max_blocks = Mux(page_packed && page_packed_blocks_left < max_blocks_without_page_limit,
@@ -284,6 +302,9 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     io.group_list.get := req.group_list.get // made
     io.max_k.get := req.max_k // made
   }
+  if (use_shared_res_entries && use_vpu_fusion) {
+    io.has_gemv_followup.get := req.has_gemv_followup.get
+  }
 
   val loop_has_room = if (use_shared_res_entries) !io.loop_full.get else true.B
 
@@ -316,7 +337,8 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 // LdD
 
 class LoopMatmulLdDReq(val block_size: Int, val coreMaxAddrBits: Int, val iterator_bitwidth: Int, val max_acc_addr: Int,
-                       val concurrent_loops: Int, val use_shared_res_entries: Boolean) extends Bundle {
+                       val concurrent_loops: Int, val use_shared_res_entries: Boolean,
+                       val use_vpu_fusion: Boolean) extends Bundle {
   val max_j = UInt(iterator_bitwidth.W)
   val max_i = UInt(iterator_bitwidth.W)
   val pad_j = UInt(log2Up(block_size).W)
@@ -327,15 +349,20 @@ class LoopMatmulLdDReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
   val tile_row_offset = UInt(iterator_bitwidth.W)
   val tile_col_offset = UInt(iterator_bitwidth.W)
   val low_d = Bool()
+  val d_from_vsram = if (use_vpu_fusion) Some(Bool()) else None
   val addr_start = UInt(log2Up(max_acc_addr).W)
   val loop_id = UInt(log2Up(concurrent_loops).W)
 }
 
 class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: Int, max_acc_addr: Int, input_w: Int,
-                    acc_w: Int, max_block_len: Int, max_block_len_acc: Int, concurrent_loops: Int, mvin_rs2_t: MvinRs2, use_shared_res_entries: Boolean)
+                    acc_w: Int, max_block_len: Int, max_block_len_acc: Int,
+                    concurrent_loops: Int, mvin_rs2_t: MvinRs2,
+                    use_shared_res_entries: Boolean, use_vpu_fusion: Boolean)
                    (implicit p: Parameters) extends Module {
   val io = IO(new Bundle {
-    val req = Flipped(Decoupled(new LoopMatmulLdDReq(block_size, coreMaxAddrBits, iterator_bitwidth, max_acc_addr, concurrent_loops, use_shared_res_entries)))
+    val req = Flipped(Decoupled(new LoopMatmulLdDReq(block_size,
+      coreMaxAddrBits, iterator_bitwidth, max_acc_addr, concurrent_loops,
+      use_shared_res_entries, use_vpu_fusion)))
     val cmd = Decoupled(Output(new RoCCCommand))
 
     val idle = Output(Bool())
@@ -350,10 +377,18 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   import State._
   val state = RegInit(idle)
 
-  val req = Reg(new LoopMatmulLdDReq(block_size, coreMaxAddrBits, iterator_bitwidth, max_acc_addr, concurrent_loops, use_shared_res_entries))
+  val req = Reg(new LoopMatmulLdDReq(block_size, coreMaxAddrBits,
+    iterator_bitwidth, max_acc_addr, concurrent_loops,
+    use_shared_res_entries, use_vpu_fusion))
 
-  val max_blocks_without_page_limit = Mux(req.low_d, Mux(req.max_j <= max_block_len.U, req.max_j, max_block_len.U),
+  val ordinaryMaxBlocks = Mux(req.low_d,
+    Mux(req.max_j <= max_block_len.U, req.max_j, max_block_len.U),
     Mux(req.max_j <= max_block_len_acc.U, req.max_j, max_block_len_acc.U))
+  val max_blocks_without_page_limit = if (use_vpu_fusion) {
+    Mux(req.d_from_vsram.get, 1.U, ordinaryMaxBlocks)
+  } else {
+    ordinaryMaxBlocks
+  }
 
   val j = Reg(UInt(iterator_bitwidth.W))
   val i = Reg(UInt(iterator_bitwidth.W))
@@ -384,8 +419,24 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     LoopMatmul.pagePacked2DOffset(page_packed_i, page_packed_j, dram_stride, block_size, input_w/8, max_block_len),
     LoopMatmul.pagePacked2DOffset(page_packed_i, page_packed_j, dram_stride, block_size, acc_w/8, max_block_len_acc))
   val dram_offset = Mux(page_packed, page_packed_dram_offset, row_major_dram_offset)
-  val dram_addr = req.dram_addr + LoopMatmul.castDramOffset(dram_offset)
   val sp_addr = acc_addr_start + (i * req.max_j + j) * block_size.U
+  val ordinaryDramAddr = req.dram_addr + LoopMatmul.castDramOffset(dram_offset)
+  val dram_addr = if (use_vpu_fusion) {
+    // In D_FROM_VSRAM mode the configured D address is a VSRAM matrix-row
+    // base, not a byte address. One LOAD3 covers one DIM-wide tile, and its
+    // row source advances in the same tile-major order as C_TO_VSRAM.
+    val vsram_i = if (use_shared_res_entries) {
+      req.laddrI_offset.get + i
+    } else {
+      i
+    }
+    val vsram_row_offset = (vsram_i * req.max_j + j) * block_size.U
+    Mux(req.d_from_vsram.get,
+      req.dram_addr + vsram_row_offset.pad(coreMaxAddrBits),
+      ordinaryDramAddr)
+  } else {
+    ordinaryDramAddr
+  }
   val blocks = Mux(j + max_blocks <= req.max_j, max_blocks, req.max_j-j)
   val cols = (blocks * block_size.U) - Mux(j + blocks >= req.max_j, req.pad_j, 0.U)
   val rows = block_size.U - Mux(i === req.max_i-1.U, req.pad_i, 0.U)
@@ -399,7 +450,13 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   mvin_cmd_rs2 := DontCare
   mvin_cmd_rs2.num_rows := rows.asUInt
   mvin_cmd_rs2.num_cols := cols.asUInt
-  mvin_cmd_rs2.local_addr := cast_to_acc_addr(mvin_cmd_rs2.local_addr, sp_addr, accumulate = false.B, read_full = false.B)
+  val acc_local_addr = cast_to_acc_addr(mvin_cmd_rs2.local_addr, sp_addr,
+    accumulate = false.B, read_full = false.B)
+  mvin_cmd_rs2.local_addr := (if (use_vpu_fusion) {
+    with_d_from_vsram(acc_local_addr, req.d_from_vsram.get)
+  } else {
+    acc_local_addr
+  })
   mvin_cmd.rs2 := mvin_cmd_rs2.asUInt
 
   io.req.ready := state === idle
@@ -409,7 +466,13 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   // changed
   // io.cmd.valid := state =/= idle && !io.rob_overloaded && req.dram_addr =/= 0.U
   if (use_shared_res_entries) {
-     io.cmd.valid := state =/= idle && !io.rob_overloaded && req.dram_addr =/= 0.U && req.max_i =/= 0.U
+    val hasDSource = if (use_vpu_fusion) {
+      req.d_from_vsram.get || req.dram_addr =/= 0.U
+    } else {
+      req.dram_addr =/= 0.U
+    }
+    io.cmd.valid := state =/= idle && !io.rob_overloaded &&
+      hasDSource && req.max_i =/= 0.U
   } else {
     io.cmd.valid := state =/= idle && !io.rob_overloaded && req.dram_addr =/= 0.U
   }
@@ -417,7 +480,12 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 
   io.loop_id := req.loop_id
 
-  when (req.dram_addr === 0.U || req.max_i === 0.U) {
+  val noDSource = if (use_vpu_fusion) {
+    !req.d_from_vsram.get && req.dram_addr === 0.U
+  } else {
+    req.dram_addr === 0.U
+  }
+  when (noDSource || req.max_i === 0.U) {
     state := idle
   }.elsewhen (io.cmd.fire) {
     // The order here is k, j, i
@@ -433,6 +501,10 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   }
 
   when (io.req.fire) {
+    if (use_vpu_fusion) {
+      assert(!(io.req.bits.d_from_vsram.get && io.req.bits.low_d),
+        "D_FROM_VSRAM is an FP32 accumulator load and cannot use low_D")
+    }
     req := io.req.bits
     state := ld
     j := 0.U
@@ -443,7 +515,8 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 // Compute
 class LoopMatmulExecuteReq(val block_size: Int, val coreMaxAddrBits: Int, val iterator_bitwidth: Int, val max_addr: Int,
                            val max_acc_addr: Int, val concurrent_loops: Int, val group_w: Int, val nSharers: Int,
-                           val use_shared_res_entries: Boolean) extends Bundle {
+                           val use_shared_res_entries: Boolean,
+                           val use_vpu_fusion: Boolean) extends Bundle {
   val max_j = UInt(iterator_bitwidth.W)
   val max_k = UInt(iterator_bitwidth.W)
   val max_i = UInt(iterator_bitwidth.W)
@@ -454,6 +527,8 @@ class LoopMatmulExecuteReq(val block_size: Int, val coreMaxAddrBits: Int, val it
   val a_tranpose = Bool()
   val b_tranpose = Bool()
   val accumulate = Bool()
+  val a_from_vsram = if (use_vpu_fusion) Some(Bool()) else None
+  val c_to_vsram = if (use_vpu_fusion) Some(Bool()) else None
   val a_addr_start = UInt(log2Up(max_addr).W)
   val b_addr_end = UInt(log2Up(max_addr+1).W)
   val c_addr_start = UInt(log2Up(max_acc_addr).W)
@@ -467,10 +542,14 @@ class LoopMatmulExecuteReq(val block_size: Int, val coreMaxAddrBits: Int, val it
 
 class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: Int, max_addr: Int, max_acc_addr: Int, concurrent_loops: Int,
                         preload_rs1_t: PreloadRs, preload_rs2_t: PreloadRs,
-                        compute_rs1_t: ComputeRs, compute_rs2_t: ComputeRs, use_shared_res_entries: Boolean, group_w: Int, nSharers: Int)
+                        compute_rs1_t: ComputeRs, compute_rs2_t: ComputeRs, use_shared_res_entries: Boolean,
+                        use_vpu_fusion: Boolean, group_w: Int, nSharers: Int)
                        (implicit p: Parameters) extends Module {
   val io = IO(new Bundle {
-    val req = Flipped(Decoupled(new LoopMatmulExecuteReq(block_size, coreMaxAddrBits, iterator_bitwidth, max_addr, max_acc_addr, concurrent_loops, group_w, nSharers, use_shared_res_entries)))
+    val req = Flipped(Decoupled(new LoopMatmulExecuteReq(block_size,
+      coreMaxAddrBits, iterator_bitwidth, max_addr, max_acc_addr,
+      concurrent_loops, group_w, nSharers, use_shared_res_entries,
+      use_vpu_fusion)))
     val cmd = Decoupled(Output(new RoCCCommand))
 
     val k = Output(UInt(iterator_bitwidth.W))
@@ -501,7 +580,16 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
   import State._
   val state = RegInit(idle)
 
-  val req = Reg(new LoopMatmulExecuteReq(block_size, coreMaxAddrBits, iterator_bitwidth, max_addr, max_acc_addr, concurrent_loops, group_w, nSharers, use_shared_res_entries))
+  val req = Reg(new LoopMatmulExecuteReq(block_size, coreMaxAddrBits,
+    iterator_bitwidth, max_addr, max_acc_addr, concurrent_loops, group_w,
+    nSharers, use_shared_res_entries, use_vpu_fusion))
+
+  if (use_vpu_fusion) {
+    require(compute_rs1_t.local_addr.garbage.getWidth >= 2,
+      "Gemmini/VPU fusion requires two LocalAddr garbage bits")
+    require(preload_rs2_t.local_addr.garbage.getWidth >= 2,
+      "Gemmini/VPU fusion requires two LocalAddr garbage bits")
+  }
 
   // changed
   // val c_addr_start = /*(BigInt(1) << 31).U |*/ req.c_addr_start
@@ -565,7 +653,16 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
   pre_cmd_rs2 := DontCare
   pre_cmd_rs2.num_rows := c_rows.asUInt
   pre_cmd_rs2.num_cols := c_cols.asUInt
-  pre_cmd_rs2.local_addr := cast_to_acc_addr(pre_cmd_rs2.local_addr, c_addr, accumulate = req.accumulate || k =/= 0.U, read_full = false.B)
+  val pre_c_addr = cast_to_acc_addr(pre_cmd_rs2.local_addr, c_addr,
+    accumulate = req.accumulate || k =/= 0.U, read_full = false.B)
+  if (use_vpu_fusion) {
+    // Only the final K tile owns the fully accumulated C value. Earlier K
+    // tiles must continue to write their FP32 partial sums to the ACC SRAM.
+    pre_cmd_rs2.local_addr := with_c_to_vsram(pre_c_addr,
+      req.c_to_vsram.get && k === req.max_k - 1.U)
+  } else {
+    pre_cmd_rs2.local_addr := pre_c_addr
+  }
 
   pre_cmd.rs1 := pre_cmd_rs1.asUInt
   pre_cmd.rs2 := pre_cmd_rs2.asUInt
@@ -578,7 +675,13 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
   comp_cmd_rs1 := DontCare
   comp_cmd_rs1.num_rows := a_rows.asUInt
   comp_cmd_rs1.num_cols := a_cols.asUInt
-  comp_cmd_rs1.local_addr := cast_to_sp_addr(comp_cmd_rs1.local_addr, a_addr)
+  val comp_a_addr = cast_to_sp_addr(comp_cmd_rs1.local_addr, a_addr)
+  if (use_vpu_fusion) {
+    comp_cmd_rs1.local_addr := with_a_from_vsram(comp_a_addr,
+      req.a_from_vsram.get)
+  } else {
+    comp_cmd_rs1.local_addr := comp_a_addr
+  }
 
   val comp_cmd_rs2 = Wire(compute_rs2_t.cloneType)
   comp_cmd_rs2 := DontCare
@@ -870,7 +973,8 @@ class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 
 // Combined loop
 class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val max_addr: Int, val max_acc_addr: Int,
-                      val group_w: Int, val nSharers: Int, val use_shared_res_entries: Boolean) extends Bundle {
+                      val group_w: Int, val nSharers: Int, val use_shared_res_entries: Boolean,
+                      val use_vpu_fusion: Boolean) extends Bundle {
   // made
   // val sp_addr_start = UInt(log2Up(max_addr).W)
   // val sp_addr_end = UInt(log2Up(max_addr+1).W)
@@ -920,6 +1024,10 @@ class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val 
   val low_d = Bool()
   val full_c = Bool()
   val ex_accumulate = Bool()
+  val a_from_vsram = if (use_vpu_fusion) Some(Bool()) else None
+  val c_to_vsram = if (use_vpu_fusion) Some(Bool()) else None
+  val d_from_vsram = if (use_vpu_fusion) Some(Bool()) else None
+  val has_gemv_followup = if (use_vpu_fusion) Some(Bool()) else None
 
   val configured = Bool()
 
@@ -967,6 +1075,10 @@ class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val 
     laddrRA_offset.foreach(_ := 0.U)
     group_id.foreach(_ := 0.U)
     group_list.foreach(_ := 0.U)
+    a_from_vsram.foreach(_ := false.B)
+    c_to_vsram.foreach(_ := false.B)
+    d_from_vsram.foreach(_ := false.B)
+    has_gemv_followup.foreach(_ := false.B)
 
     a_tile_row_offset := 0.U
     a_tile_col_offset := 0.U
@@ -982,7 +1094,8 @@ class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val 
 class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size: Int, max_lds: Int, max_exs: Int, max_sts: Int,
                  max_addr: Int, max_acc_addr: Int, input_w: Int, acc_w: Int, dma_max_bytes: Int,
                  mvin_rs2_t: MvinRs2, preload_rs1_t: PreloadRs, preload_rs2_t: PreloadRs,
-                 compute_rs1_t: ComputeRs, compute_rs2_t: ComputeRs, mvout_rs2_t: MvoutRs2, use_shared_res_entries: Boolean, nSharers: Int)
+                 compute_rs1_t: ComputeRs, compute_rs2_t: ComputeRs, mvout_rs2_t: MvoutRs2, use_shared_res_entries: Boolean,
+                 use_vpu_fusion: Boolean, nSharers: Int)
                 (implicit p: Parameters) extends Module {
   val iterator_bitwidth = 16
   val concurrent_loops = 2
@@ -1000,14 +1113,17 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
     val busy = Output(Bool())
 
     val ext_loop_ws = if (use_shared_res_entries) {
-      Some(new LdBExIO(group_w, nSharers, iterator_bitwidth))
+      Some(new LdBExIO(group_w, nSharers, iterator_bitwidth,
+        use_vpu_fusion))
     } else {
       None
     }
   })
 
   // Create states
-  val loops = Reg(Vec(concurrent_loops, new LoopMatmulState(iterator_bitwidth, coreMaxAddrBits, max_addr, max_acc_addr, group_w, nSharers, use_shared_res_entries)))
+  val loops = Reg(Vec(concurrent_loops, new LoopMatmulState(iterator_bitwidth,
+    coreMaxAddrBits, max_addr, max_acc_addr, group_w, nSharers,
+    use_shared_res_entries, use_vpu_fusion)))
   val head_loop_id = Reg(UInt(log2Up(concurrent_loops).W))
   val tail_loop_id = (~head_loop_id).asUInt // This is the loop that we always try to configure if available
   val head_loop = loops(head_loop_id)
@@ -1020,9 +1136,14 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
 
   // Create inner modules
   val ldA = Module(new LoopMatmulLdA(block_size, coreMaxAddrBits, iterator_bitwidth, max_addr, input_w, max_block_len, concurrent_loops, mvin_rs2_t, use_shared_res_entries))
-  val ldB = Module(new LoopMatmulLdB(block_size, coreMaxAddrBits, iterator_bitwidth, max_addr, input_w, max_block_len, concurrent_loops, mvin_rs2_t, use_shared_res_entries, group_w, nSharers))
-  val ldD = Module(new LoopMatmulLdD(block_size, coreMaxAddrBits, iterator_bitwidth, max_acc_addr, input_w, acc_w, max_block_len, max_block_len_acc, concurrent_loops, mvin_rs2_t, use_shared_res_entries))
-  val ex = Module(new LoopMatmulExecute(block_size, coreMaxAddrBits, iterator_bitwidth, max_addr, max_acc_addr, concurrent_loops, preload_rs1_t, preload_rs2_t, compute_rs1_t, compute_rs2_t, use_shared_res_entries, group_w, nSharers))
+  val ldB = Module(new LoopMatmulLdB(block_size, coreMaxAddrBits,
+    iterator_bitwidth, max_addr, input_w, max_block_len, concurrent_loops,
+    mvin_rs2_t, use_shared_res_entries, use_vpu_fusion, group_w, nSharers))
+  val ldD = Module(new LoopMatmulLdD(block_size, coreMaxAddrBits,
+    iterator_bitwidth, max_acc_addr, input_w, acc_w, max_block_len,
+    max_block_len_acc, concurrent_loops, mvin_rs2_t,
+    use_shared_res_entries, use_vpu_fusion))
+  val ex = Module(new LoopMatmulExecute(block_size, coreMaxAddrBits, iterator_bitwidth, max_addr, max_acc_addr, concurrent_loops, preload_rs1_t, preload_rs2_t, compute_rs1_t, compute_rs2_t, use_shared_res_entries, use_vpu_fusion, group_w, nSharers))
   val stC = Module(new LoopMatmulStC(block_size, coreMaxAddrBits, iterator_bitwidth, max_acc_addr, input_w, acc_w, max_block_len, max_block_len_acc, concurrent_loops, mvout_rs2_t, group_w, use_shared_res_entries))
 
   // Create command queue
@@ -1116,6 +1237,10 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
     io.ext_loop_ws.get.ldb.max_k := ldB.io.max_k.get
     io.ext_loop_ws.get.ldb.idle := ldB.io.idle
     io.ext_loop_ws.get.ldb.group_list := ldB.io.group_list.get
+    if (use_vpu_fusion) {
+      io.ext_loop_ws.get.ldb.has_gemv_followup.get :=
+        ldB.io.has_gemv_followup.get
+    }
     ldB.io.loop_full.get := io.ext_loop_ws.get.loop_full
   } else {
     ex.io.ldb_completed.get := (ldB.io.loop_id =/= ex.io.loop_id) || ldB.io.idle
@@ -1212,6 +1337,13 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
         loop_being_configured.ex_accumulate := cmd.bits.cmd.rs1(0)
         loop_being_configured.full_c := cmd.bits.cmd.rs1(1)
         loop_being_configured.low_d := cmd.bits.cmd.rs1(2)
+        if (use_vpu_fusion) {
+          loop_being_configured.a_from_vsram.get := cmd.bits.cmd.rs1(3)
+          loop_being_configured.c_to_vsram.get := cmd.bits.cmd.rs1(4)
+          loop_being_configured.has_gemv_followup.get :=
+            (if (use_shared_res_entries) cmd.bits.cmd.rs1(5) else false.B)
+          loop_being_configured.d_from_vsram.get := cmd.bits.cmd.rs1(6)
+        }
         loop_being_configured.act := cmd.bits.cmd.rs1(8+Activation.bitwidth-1, 8) // TODO magic numbers
 
         loop_being_configured.a_transpose := cmd.bits.cmd.rs2(0)
@@ -1237,7 +1369,13 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   val loop_requesting_ldA = loops(loop_requesting_ldA_id)
   val ldAMaxI = if (use_shared_res_entries) loop_requesting_ldA.ex_I.get else loop_requesting_ldA.max_i
   ldA.io.req.bits.max_k := loop_requesting_ldA.max_k
-  ldA.io.req.bits.max_i := ldAMaxI
+  // A_FROM_VSRAM retains the ordinary LdA request/started/completed protocol,
+  // but turns its payload into the existing zero-row no-op. This preserves
+  // group allocation and execute-start dependencies without ever issuing a
+  // LOAD command or touching the (software may pass NULL) host A pointer.
+  ldA.io.req.bits.max_i :=
+    (if (use_vpu_fusion) Mux(loop_requesting_ldA.a_from_vsram.get, 0.U, ldAMaxI)
+     else ldAMaxI)
   ldA.io.req.bits.pad_k := loop_requesting_ldA.pad_k
   ldA.io.req.bits.pad_i := loop_requesting_ldA.pad_i
   if (use_shared_res_entries) {
@@ -1284,6 +1422,10 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
     ldB.io.req.bits.laddrR_offset.get := loop_requesting_ldB.laddrRB_offset.get
     ldB.io.req.bits.group_id.get := loop_requesting_ldB.group_id.get
     ldB.io.req.bits.group_list.get := loop_requesting_ldB.group_list.get
+    if (use_vpu_fusion) {
+      ldB.io.req.bits.has_gemv_followup.get :=
+        loop_requesting_ldB.has_gemv_followup.get
+    }
   }
   ldB.io.req.bits.loop_id := loop_requesting_ldB_id
 
@@ -1309,6 +1451,10 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   ex.io.req.bits.a_addr_start := loop_requesting_ex.a_addr_start
   ex.io.req.bits.b_addr_end := loop_requesting_ex.b_addr_end
   ex.io.req.bits.accumulate := loop_requesting_ex.ex_accumulate
+  if (use_vpu_fusion) {
+    ex.io.req.bits.a_from_vsram.get := loop_requesting_ex.a_from_vsram.get
+    ex.io.req.bits.c_to_vsram.get := loop_requesting_ex.c_to_vsram.get
+  }
   val exCanStart = !loop_requesting_ex.ex_started && loop_requesting_ex.lda_started &&
     loop_requesting_ex.ldb_started && loop_requesting_ex.ldd_started && loop_requesting_ex.configured
   if (use_shared_res_entries) {
@@ -1348,6 +1494,9 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   ldD.io.req.bits.tile_row_offset := loop_requesting_ldD.d_tile_row_offset
   ldD.io.req.bits.tile_col_offset := loop_requesting_ldD.d_tile_col_offset
   ldD.io.req.bits.low_d := loop_requesting_ldD.low_d
+  if (use_vpu_fusion) {
+    ldD.io.req.bits.d_from_vsram.get := loop_requesting_ldD.d_from_vsram.get
+  }
   val ldDCanStart = !loop_requesting_ldD.ldd_started && loop_requesting_ldD.configured
   if (use_shared_res_entries) {
     ldD.io.req.bits.laddrI_offset.get := loop_requesting_ldD.laddrRA_offset.get
@@ -1378,7 +1527,15 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   stC.io.req.bits.max_i := stMaxI
   stC.io.req.bits.pad_j := loop_requesting_st.pad_j
   stC.io.req.bits.pad_i := loop_requesting_st.pad_i
-  stC.io.req.bits.dram_addr := loop_requesting_st.c_dram_addr
+  // C_TO_VSRAM is a redirect, not a dual destination.  Suppress Store-C even
+  // if software left a nonzero C pointer, because ACC intentionally retains
+  // the pre-final value while the post-RMW FP32 row is written to VSRAM.
+  stC.io.req.bits.dram_addr := (if (use_vpu_fusion) {
+    Mux(loop_requesting_st.c_to_vsram.get, 0.U,
+      loop_requesting_st.c_dram_addr)
+  } else {
+    loop_requesting_st.c_dram_addr
+  })
   stC.io.req.bits.dram_stride := loop_requesting_st.c_dram_stride
   stC.io.req.bits.tile_row_offset := loop_requesting_st.c_tile_row_offset
   stC.io.req.bits.tile_col_offset := loop_requesting_st.c_tile_col_offset
@@ -1513,11 +1670,13 @@ object LoopMatmul {
             block_size: Int, coreMaxAddrBits: Int, rob_size: Int, max_lds: Int, max_exs: Int, max_sts: Int,
             max_addr: Int, max_acc_addr: Int, input_w: Int, acc_w: Int, dma_max_bytes: Int,
             mvin_rs2_t: MvinRs2, preload_rs1_t: PreloadRs, preload_rs2_t: PreloadRs,
-            compute_rs1_t: ComputeRs, compute_rs2_t: ComputeRs, mvout_rs2_t: MvoutRs2, use_shared_res_entries: Boolean, nSharers: Int)
+            compute_rs1_t: ComputeRs, compute_rs2_t: ComputeRs, mvout_rs2_t: MvoutRs2, use_shared_res_entries: Boolean,
+            use_vpu_fusion: Boolean, nSharers: Int)
            (implicit p: Parameters): (DecoupledIO[GemminiCmd], Bool, Option[LdBExIO]) = {
     val mod = Module(new LoopMatmul(block_size, coreMaxAddrBits, rob_size, max_lds, max_exs, max_sts,
       max_addr, max_acc_addr, input_w, acc_w, dma_max_bytes,
-      mvin_rs2_t, preload_rs1_t, preload_rs2_t, compute_rs1_t, compute_rs2_t, mvout_rs2_t, use_shared_res_entries, nSharers))
+      mvin_rs2_t, preload_rs1_t, preload_rs2_t, compute_rs1_t, compute_rs2_t, mvout_rs2_t,
+      use_shared_res_entries, use_vpu_fusion, nSharers))
     mod.io.in <> in
     mod.io.ld_completed := ld_completed
     mod.io.st_completed := st_completed

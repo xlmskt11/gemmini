@@ -6,6 +6,7 @@ import chisel3.util._
 import freechips.rocketchip.tile.RoCCCommand
 import freechips.rocketchip.util.PlusArg
 import GemminiISA._
+import VpuLocalAddr._
 import Util._
 
 import midas.targetutils.PerfCounter
@@ -98,10 +99,17 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     val profile = if (use_profiler) Some(new ProfileIO(cmd_t, ROB_ID_WIDTH)) else None
 
     val ext_deps = if (use_shared_res_entries) {
-      Some(new EntriesForDeps(local_addr_t, reservation_station_entries_ld, reservation_station_entries_ex, reservation_station_entries_st, res_max_per_type))
+      Some(new EntriesForDeps(local_addr_t, reservation_station_entries_ld,
+        reservation_station_entries_ex, reservation_station_entries_st,
+        res_max_per_type))
     } else {
       None
     }
+    val vsram_deps = if (use_vpu_fusion) {
+      Some(new VsramEntriesForDeps(local_addr_t,
+        reservation_station_entries_ld, reservation_station_entries_ex,
+        reservation_station_entries_st, res_max_per_type))
+    } else None
   })
 
   if (use_shared_res_entries) {
@@ -115,6 +123,19 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     io.ext_deps.get.issue_st.bits := DontCare
     io.ext_deps.get.complete_id.valid := false.B
     io.ext_deps.get.complete_id.bits := DontCare
+  }
+
+  if (use_vpu_fusion) {
+    io.vsram_deps.get.alloc_entry.valid := false.B
+    io.vsram_deps.get.alloc_entry.bits := DontCare
+    io.vsram_deps.get.issue_ld.valid := false.B
+    io.vsram_deps.get.issue_ld.bits := DontCare
+    io.vsram_deps.get.issue_ex.valid := false.B
+    io.vsram_deps.get.issue_ex.bits := DontCare
+    io.vsram_deps.get.issue_st.valid := false.B
+    io.vsram_deps.get.issue_st.bits := DontCare
+    io.vsram_deps.get.complete_id.valid := false.B
+    io.vsram_deps.get.complete_id.bits := DontCare
   }
 
   // TODO make this a ChiselEnum
@@ -378,6 +399,69 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     assert(ldq < exq && exq < stq)
 
     val not_config = !new_entry.is_config
+
+    // SharedExtEntries remains the SPAD/ACC dependency tracker in a fused
+    // build. Remove redirected VSRAM operands from its descriptor, while
+    // preserving D_FROM's ACC write and C_TO accumulate's ACC read.
+    val ext_op1 = WireInit(op1)
+    val ext_op2 = WireInit(op2)
+    val ext_dst = WireInit(dst)
+    val cToVsram = if (use_vpu_fusion) {
+      funct === PRELOAD_CMD && dst.valid && dst.bits.start.c_to_vsram()
+    } else false.B
+
+    if (use_vpu_fusion) {
+      when(funct_is_compute && op1.valid &&
+          op1.bits.start.a_from_vsram()) {
+        ext_op1.valid := false.B
+      }
+      when(cToVsram && !dst.bits.start.accumulate) {
+        ext_dst.valid := false.B
+      }
+    }
+
+    val ext_alloc_opa = Wire(UDValid(new OpT(local_addr_t)))
+    val ext_alloc_opb = Wire(UDValid(new OpT(local_addr_t)))
+    val ext_alloc_opa_is_dst = Wire(Bool())
+    ext_alloc_opa_is_dst := ext_dst.valid && !cToVsram
+    when(ext_dst.valid) {
+      ext_alloc_opa := ext_dst
+      ext_alloc_opb := Mux(ext_op1.valid, ext_op1, ext_op2)
+    }.otherwise {
+      ext_alloc_opa := Mux(ext_op1.valid, ext_op1, ext_op2)
+      ext_alloc_opb := ext_op2
+    }
+
+    // A Gemmini fusion micro-command has exactly one VSRAM effect. The VPU
+    // side retains three descriptors for its two-source/one-destination ops.
+    val vsramAccess = if (use_vpu_fusion) {
+      val aFromVsram = funct_is_compute && op1.valid &&
+        op1.bits.start.a_from_vsram()
+      val dFromVsram = is_load && dst.valid &&
+        dst.bits.start.d_from_vsram()
+
+      val aAccess = VsramAccess.fromLocal(op1, aFromVsram,
+        acc_banks * acc_bank_entries, read = true.B, write = false.B)
+      val cAccess = VsramAccess.fromLocal(dst, cToVsram,
+        acc_banks * acc_bank_entries, read = false.B, write = true.B)
+
+      val dSource = Wire(UDValid(new OpT(local_addr_t)))
+      val dRows = cmd.rs2(48 + mvin_rows_bits - 1, 48)
+      dSource.valid := dFromVsram
+      dSource.bits.start := LocalAddr.cast_to_acc_addr(local_addr_t,
+        cmd.rs1, accumulate = false.B, read_full = false.B)
+      dSource.bits.end := dSource.bits.start + dRows
+      dSource.bits.wraps_around :=
+        dSource.bits.start.add_with_overflow(dRows)._2
+      val dAccess = VsramAccess.fromLocal(dSource, dFromVsram,
+        acc_banks * acc_bank_entries, read = true.B, write = false.B)
+
+      val access = WireInit(aAccess)
+      when(cToVsram) { access := cAccess }
+      when(dFromVsram) { access := dAccess }
+      Some(access)
+    } else None
+
     if (use_shared_res_entries) {
       val rightPad_ld = res_max_per_type - reservation_station_entries_ld
       val rightPad_ex = res_max_per_type - reservation_station_entries_ex
@@ -458,12 +542,21 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
               entries_type(alloc_id).bits.allocated_at := new_entry.allocated_at
               entries_type(alloc_id).bits.deps_m.get := new_entry.deps_m.get
 
+              val sharedId = Cat(q.asUInt,
+                alloc_id.pad(log2Up(res_max_per_type)))
               io.ext_deps.get.alloc_entry.valid := true.B
-              io.ext_deps.get.alloc_entry.bits.alloc_id := Cat(q.asUInt, alloc_id.pad(log2Up(res_max_per_type)))
-              io.ext_deps.get.alloc_entry.bits.opa := alloc_opa
-              io.ext_deps.get.alloc_entry.bits.opb := alloc_opb
-              io.ext_deps.get.alloc_entry.bits.opa_is_dst := alloc_opa_is_dst
+              io.ext_deps.get.alloc_entry.bits.alloc_id := sharedId
+              io.ext_deps.get.alloc_entry.bits.opa := ext_alloc_opa
+              io.ext_deps.get.alloc_entry.bits.opb := ext_alloc_opb
+              io.ext_deps.get.alloc_entry.bits.opa_is_dst :=
+                ext_alloc_opa_is_dst
               io.ext_deps.get.alloc_entry.bits.not_config := not_config
+
+              if (use_vpu_fusion) {
+                io.vsram_deps.get.alloc_entry.valid := vsramAccess.get.valid
+                io.vsram_deps.get.alloc_entry.bits.alloc_id := sharedId
+                io.vsram_deps.get.alloc_entry.bits.access := vsramAccess.get
+              }
             } else {
               entries_type(alloc_id).bits := new_entry
             }
@@ -499,8 +592,40 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
 
   // Issue commands which are ready to be issued
   if (use_shared_res_entries) {
-    Seq((ldq, io.issue.ld, entries_ld, io.ext_deps.get.ld_deps_ready, io.ext_deps.get.issue_ld), (exq, io.issue.ex, entries_ex, io.ext_deps.get.ex_deps_ready, io.ext_deps.get.issue_ex), (stq, io.issue.st, entries_st, io.ext_deps.get.st_deps_ready, io.ext_deps.get.issue_st))
-      .foreach { case (q, io_issue, entries_type, in_ready, out_issue) =>
+    val ldSharedReady = if (use_vpu_fusion) {
+      VecInit(io.ext_deps.get.ld_deps_ready
+        .zip(io.vsram_deps.get.ld_deps_ready)
+        .map { case (spadAccReady, vsramReady) =>
+          spadAccReady && vsramReady
+        })
+    } else io.ext_deps.get.ld_deps_ready
+    val exSharedReady = if (use_vpu_fusion) {
+      VecInit(io.ext_deps.get.ex_deps_ready
+        .zip(io.vsram_deps.get.ex_deps_ready)
+        .map { case (spadAccReady, vsramReady) =>
+          spadAccReady && vsramReady
+        })
+    } else io.ext_deps.get.ex_deps_ready
+    val stSharedReady = if (use_vpu_fusion) {
+      VecInit(io.ext_deps.get.st_deps_ready
+        .zip(io.vsram_deps.get.st_deps_ready)
+        .map { case (spadAccReady, vsramReady) =>
+          spadAccReady && vsramReady
+        })
+    } else io.ext_deps.get.st_deps_ready
+
+    Seq(
+      (ldq, io.issue.ld, entries_ld, ldSharedReady,
+        io.ext_deps.get.issue_ld,
+        if (use_vpu_fusion) Some(io.vsram_deps.get.issue_ld) else None),
+      (exq, io.issue.ex, entries_ex, exSharedReady,
+        io.ext_deps.get.issue_ex,
+        if (use_vpu_fusion) Some(io.vsram_deps.get.issue_ex) else None),
+      (stq, io.issue.st, entries_st, stSharedReady,
+        io.ext_deps.get.issue_st,
+        if (use_vpu_fusion) Some(io.vsram_deps.get.issue_st) else None))
+      .foreach { case (q, io_issue, entries_type, in_ready,
+                       sharedIssue, vsramIssue) =>
 
       val issue_valids = entries_type.zip(in_ready).map { case (m, o_ready) => m.valid && m.bits.ready_m() && o_ready && !m.bits.issued }
 
@@ -529,9 +654,14 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
           }
         }
 
-        out_issue.valid := true.B
-        out_issue.bits.issue_id := issue_id
-        out_issue.bits.valid := !entries_type(issue_id).bits.complete_on_issue
+        sharedIssue.valid := true.B
+        sharedIssue.bits.issue_id := issue_id
+        sharedIssue.bits.valid := !complete_on_issue
+        if (use_vpu_fusion) {
+          vsramIssue.get.valid := true.B
+          vsramIssue.get.bits.issue_id := issue_id
+          vsramIssue.get.bits.valid := !complete_on_issue
+        }
 
         entries_type.zipWithIndex.foreach { case (e, i) =>
           val deps_type = e.bits.deps_m.get
@@ -616,8 +746,12 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     val issue_id = io.completed.bits(type_width - 1, 0)
 
     if (use_shared_res_entries) {
-      io.ext_deps.get.complete_id.bits := io.completed.bits
       io.ext_deps.get.complete_id.valid := true.B
+      io.ext_deps.get.complete_id.bits := io.completed.bits
+      if (use_vpu_fusion) {
+        io.vsram_deps.get.complete_id.valid := true.B
+        io.vsram_deps.get.complete_id.bits := io.completed.bits
+      }
     }
 
     when (queue_type === ldq) {

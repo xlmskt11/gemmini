@@ -835,7 +835,7 @@ class ExtSpadSubBankAdapter(
 
 class ExtAccSubBankAdapter[T <: Data: Arithmetic, U <: Data](
   n: Int, t: Vec[Vec[T]], scale_t: U, subBanks: Int,
-  enableExRead: Boolean, swizzleShift: Int
+  enableExRead: Boolean, swizzleShift: Int, useVpuFusion: Boolean = false
 ) extends Module {
   require(subBanks > 0 && isPow2(subBanks))
   require(n % subBanks == 0)
@@ -846,10 +846,12 @@ class ExtAccSubBankAdapter[T <: Data: Arithmetic, U <: Data](
   val io = IO(new Bundle {
     val bank = new Bundle {
       val read = Flipped(new AccumulatorReadIO(n, t, scale_t))
-      val write = Flipped(Decoupled(new ExtAccumulatorWriteReq(n, t)))
+      val write = Flipped(Decoupled(new ExtAccumulatorWriteReq(
+        n, t, useVpuFusion)))
       val grant = Flipped(Decoupled(new BankExWriteGrantReq(n)))
     }
-    val ext = Vec(subBanks, new ExtAccumulatorBankIO(n / subBanks, t))
+    val ext = Vec(subBanks, new ExtAccumulatorBankIO(
+      n / subBanks, t, useVpuFusion))
   })
 
   val q = Module(new Queue(new AccumulatorReadResp(t, scale_t), 1, true, true))
@@ -878,6 +880,9 @@ class ExtAccSubBankAdapter[T <: Data: Arithmetic, U <: Data](
     io.ext(s).write.valid := false.B
     io.ext(s).write.bits := DontCare
     io.ext(s).write.bits.exwrite := false.B
+    if (useVpuFusion) {
+      io.ext(s).write.bits.toVpu.get := false.B
+    }
     io.ext(s).grant.valid := false.B
     io.ext(s).grant.bits := false.B
   }
@@ -946,6 +951,9 @@ class ExtAccSubBankAdapter[T <: Data: Arithmetic, U <: Data](
       io.ext(s).write.bits.acc := io.bank.write.bits.acc
       io.ext(s).write.bits.mask := io.bank.write.bits.mask
       io.ext(s).write.bits.exwrite := io.bank.write.bits.exwrite
+      if (useVpuFusion) {
+        io.ext(s).write.bits.toVpu.get := io.bank.write.bits.toVpu.get
+      }
     }
   }
 
@@ -1144,8 +1152,21 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
           Vec(meshColumns, Vec(tileColumns, accType))
         )))
         val write = Flipped(Vec(acc_banks, Decoupled(new AccumulatorWriteReq(
-          acc_bank_entries, Vec(meshColumns, Vec(tileColumns, accType))
-        ))))
+          acc_bank_entries, Vec(meshColumns, Vec(tileColumns, accType))))))
+        val write_to_vpu = if (use_vpu_fusion) {
+          Some(Input(Vec(acc_banks, Bool())))
+        } else {
+          None
+        }
+        // D_FROM_VSRAM writes are ordinary (non-execute) FP32 accumulator
+        // writes.  Keeping a separate port lets the bank arbiter apply
+        // backpressure without weakening ExecuteController's grant contract.
+        val vpu_d_write = if (use_vpu_fusion) {
+          Some(Flipped(Vec(acc_banks, Decoupled(new AccumulatorWriteReq(
+            acc_bank_entries, Vec(meshColumns, Vec(tileColumns, accType)))))))
+        } else {
+          None
+        }
       }
 
       val exwrite_grant = if (use_shared_ext_mem) Some(new Bundle {
@@ -1158,7 +1179,8 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         // Some(new ExtSpadMemIO(sp_banks, acc_banks, acc_sub_banks))
         Some(new ExtMemIO_new(
           sp_banks, sp_sub_banks, sp_bank_entries / sp_sub_banks, spad_w, sp_mask_len,
-          acc_banks, acc_sub_banks, acc_bank_entries / acc_sub_banks, acc_row_t
+          acc_banks, acc_sub_banks, acc_bank_entries / acc_sub_banks, acc_row_t,
+          use_vpu_fusion
         ))
       } else {
         None
@@ -1889,7 +1911,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       val acc_adapters = Seq.fill(acc_banks) {
         Module(new ExtAccSubBankAdapter(
           acc_bank_entries, acc_row_t, acc_scale_t.asInstanceOf[V], acc_sub_banks,
-          ex_read_from_acc, dmaSubBankSwizzleShift
+          ex_read_from_acc, dmaSubBankSwizzleShift, use_vpu_fusion
         ))
       }
       acc_adapters.zipWithIndex.foreach { case (adapter, i) =>
@@ -1975,7 +1997,20 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         // then zero_writer
 
         val exwrite = io.acc.write(i).valid
+        val vpuDWrite = if (use_vpu_fusion) {
+          io.acc.vpu_d_write.get(i).valid
+        } else {
+          false.B
+        }
+        val vpuDWriteBits = if (use_vpu_fusion) {
+          io.acc.vpu_d_write.get(i).bits
+        } else {
+          0.U.asTypeOf(chiselTypeOf(io.acc.write(i).bits))
+        }
         io.acc.write(i).ready := true.B
+        if (use_vpu_fusion) {
+          io.acc.vpu_d_write.get(i).ready := !exwrite && bio.write.ready
+        }
         assert(!(exwrite && !bio.write.ready), "Execute controller write to AccumulatorMem was skipped")
 
         // val from_mvin_scale = mvin_scale_out.valid && mvin_scale_out.bits.tag.is_acc
@@ -2021,12 +2056,16 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
           }
         }
         bio.write.valid := false.B
+        if (use_vpu_fusion) {
+          bio.write.bits.toVpu.get := false.B
+        }
 
         assert(!(exwrite && !bio.write.ready))
 
         // bio.write.bits.acc := MuxCase(zero_writer.io.resp.bits.laddr.accumulate,
         bio.write.bits.acc := MuxCase(zero_writer_pixel_repeater.io.resp.bits.laddr.accumulate,
           Seq(exwrite -> io.acc.write(i).bits.acc,
+            vpuDWrite -> false.B,
             // from_mvin_scale -> mvin_scale_out.bits.tag.accumulate,
             from_mvin_scale -> mvin_scale_pixel_repeater.io.resp.bits.tag.accumulate,
             from_mvin_scale_acc -> mvin_scale_acc_out.bits.tag.accumulate))
@@ -2034,6 +2073,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         // bio.write.bits.addr := MuxCase(zero_writer.io.resp.bits.laddr.acc_row(),
         bio.write.bits.addr := MuxCase(zero_writer_pixel_repeater.io.resp.bits.laddr.acc_row(),
           Seq(exwrite -> io.acc.write(i).bits.addr,
+            vpuDWrite -> vpuDWriteBits.addr,
             (from_mvin_scale || from_mvin_scale_acc) -> dmaread_row))
 
         when (exwrite) {
@@ -2041,6 +2081,14 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
           bio.write.bits.data := io.acc.write(i).bits.data
           bio.write.bits.mask := io.acc.write(i).bits.mask
           bio.write.bits.exwrite := true.B
+          if (use_vpu_fusion) {
+            bio.write.bits.toVpu.get := io.acc.write_to_vpu.get(i)
+          }
+        }.elsewhen (vpuDWrite) {
+          bio.write.valid := true.B
+          bio.write.bits.data := vpuDWriteBits.data
+          bio.write.bits.mask := vpuDWriteBits.mask
+          bio.write.bits.exwrite := false.B
         }.elsewhen (dmaread && !spad_last && !consecutive_write_block) {
           bio.write.valid := true.B
           bio.write.bits.data := Mux(from_mvin_scale,

@@ -95,6 +95,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              use_shared_ext_mem: Boolean = false,
                                                                              clock_gate: Boolean = false,
                                                                              use_shared_res_entries: Boolean = false,
+                                                                             use_vpu_fusion: Boolean = false,
                                                                              nSharers: Int = 4,
                                                                              use_profiler: Boolean = false,
                                                                             //  sub_bank_buffer_cap: Int = 4,
@@ -103,6 +104,15 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
 
                                                                              headerFileName: String = "gemmini_params.h"
                                                        ) {
+  require(!use_vpu_fusion ||
+    (use_shared_ext_mem && use_shared_res_entries && ex_write_to_acc),
+    "Gemmini/VPU fusion requires shared external memory, shared reservation dependencies, and accumulator execute writes")
+  require(!use_vpu_fusion || dataflow == Dataflow.WS,
+    "Gemmini/VPU fusion requires a weight-stationary-only array")
+  require(!use_vpu_fusion ||
+    spatialArrayOutputType.getWidth == accType.getWidth,
+    "Gemmini/VPU fusion requires full-precision spatial partial sums")
+
   val sp_width = meshColumns * tileColumns * inputType.getWidth
   val sp_bank_entries = sp_capacity match {
     case CapacityInKilobytes(kb) => kb * 1024 * 8 / (sp_banks * sp_width)
