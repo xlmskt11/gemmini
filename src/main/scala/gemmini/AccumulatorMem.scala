@@ -43,12 +43,28 @@ class AccumulatorWriteReq[T <: Data: Arithmetic](n: Int, t: Vec[Vec[T]]) extends
   val mask = Vec(t.getWidth / 8, Bool()) // TODO Use aligned_to here
 }
 
+class AccumulatorVpuWriteReq[T <: Data: Arithmetic](n: Int, t: Vec[Vec[T]])
+    extends Bundle {
+  val subRow = UInt(log2Up(n).W)
+  val data = t.cloneType
+  val laneMask = Vec(t.length * t.head.length, Bool())
+}
+
 
 class AccumulatorMemIO [T <: Data: Arithmetic, U <: Data](n: Int, t: Vec[Vec[T]], scale_t: U,
-  acc_sub_banks: Int, use_shared_ext_mem: Boolean
+  acc_sub_banks: Int, use_shared_ext_mem: Boolean, use_vpu_fusion: Boolean
 ) extends Bundle {
   val read = Flipped(new AccumulatorReadIO(n, t, scale_t))
   val write = Flipped(Decoupled(new AccumulatorWriteReq(n, t)))
+
+  // C_TO_VSRAM is carried beside the legacy write request so the ordinary
+  // AccumulatorWriteReq remains unchanged for non-fusion configurations.
+  val write_to_vpu = if (use_vpu_fusion) Some(Input(Bool())) else None
+  val vpu_write = if (use_vpu_fusion) {
+    Some(Valid(new AccumulatorVpuWriteReq(n, t)))
+  } else {
+    None
+  }
 
   // changed
   val ext_mem = if (use_shared_ext_mem) Some(Vec(acc_sub_banks, new ExtMemIO)) else None
@@ -95,6 +111,7 @@ class AccumulatorMem[T <: Data, U <: Data](
   n: Int, t: Vec[Vec[T]], scale_func: (T, U) => T, scale_t: U,
   acc_singleported: Boolean, acc_sub_banks: Int,
   use_shared_ext_mem: Boolean,
+  use_vpu_fusion: Boolean,
   acc_latency: Int, acc_type: T, is_dummy: Boolean
 )
   (implicit ev: Arithmetic[T]) extends Module {
@@ -108,7 +125,8 @@ class AccumulatorMem[T <: Data, U <: Data](
   import ev._
 
   // TODO unify this with TwoPortSyncMemIO
-  val io = IO(new AccumulatorMemIO(n, t, scale_t, acc_sub_banks, use_shared_ext_mem))
+  val io = IO(new AccumulatorMemIO(
+    n, t, scale_t, acc_sub_banks, use_shared_ext_mem, use_vpu_fusion))
 
   require (acc_latency >= 2)
 
@@ -120,6 +138,25 @@ class AccumulatorMem[T <: Data, U <: Data](
     pipelined_writes(i) := pipelined_writes(i-1)
   }
 
+  val pipelined_writes_to_vpu = if (use_vpu_fusion) {
+    Some(Reg(Vec(acc_latency, Bool())))
+  } else {
+    None
+  }
+  if (use_vpu_fusion) {
+    pipelined_writes_to_vpu.get(0) :=
+      io.write.fire && io.write_to_vpu.get
+    for (i <- 1 until acc_latency) {
+      pipelined_writes_to_vpu.get(i) :=
+        pipelined_writes_to_vpu.get(i - 1)
+    }
+  }
+  val oldest_write_to_vpu = if (use_vpu_fusion) {
+    pipelined_writes_to_vpu.get(acc_latency - 1)
+  } else {
+    false.B
+  }
+
   val rdata_for_adder = Wire(t)
   rdata_for_adder := DontCare
   val rdata_for_read_resp = Wire(t)
@@ -129,6 +166,8 @@ class AccumulatorMem[T <: Data, U <: Data](
   io.adder.valid := pipelined_writes(0).valid && pipelined_writes(0).bits.acc
   io.adder.op1 := rdata_for_adder
   io.adder.op2 := pipelined_writes(0).bits.data
+  val final_write_data = Mux(oldest_pipelined_write.bits.acc,
+    adder_sum, oldest_pipelined_write.bits.data)
 
   val block_read_req = WireInit(false.B)
   val block_write_req = WireInit(false.B)
@@ -140,8 +179,8 @@ class AccumulatorMem[T <: Data, U <: Data](
     require(!use_shared_ext_mem)
     val mem = TwoPortSyncMem(n, t, mask_len) // TODO We assume byte-alignment here. Use aligned_to instead
     mem.io.waddr := oldest_pipelined_write.bits.addr
-    mem.io.wen := oldest_pipelined_write.valid
-    mem.io.wdata := Mux(oldest_pipelined_write.bits.acc, adder_sum, oldest_pipelined_write.bits.data)
+    mem.io.wen := oldest_pipelined_write.valid && !oldest_write_to_vpu
+    mem.io.wdata := final_write_data
     mem.io.mask := oldest_pipelined_write.bits.mask
     rdata_for_adder := mem.io.rdata
     rdata_for_read_resp := mem.io.rdata
@@ -240,7 +279,8 @@ class AccumulatorMem[T <: Data, U <: Data](
         }
       }
 
-      val w_q_push = oldest_pipelined_write.valid && isThisBank(oldest_pipelined_write.bits.addr)
+      val w_q_push = oldest_pipelined_write.valid &&
+        !oldest_write_to_vpu && isThisBank(oldest_pipelined_write.bits.addr)
 
       when (w_q_push) {
         assert(!w_q_full || wen, "we ran out of acc-sub-bank write q entries")
@@ -249,7 +289,7 @@ class AccumulatorMem[T <: Data, U <: Data](
         for (i <- 0 until nEntries) {
           when (w_q_tail(i)) {
             w_q(i).valid := true.B
-            w_q(i).data  := Mux(oldest_pipelined_write.bits.acc, adder_sum, oldest_pipelined_write.bits.data).asTypeOf(Vec(mask_len, mask_elem))
+            w_q(i).data  := final_write_data.asTypeOf(Vec(mask_len, mask_elem))
             w_q(i).mask  := oldest_pipelined_write.bits.mask
             w_q(i).addr  := getBankIdx(oldest_pipelined_write.bits.addr)
           }
@@ -337,6 +377,20 @@ class AccumulatorMem[T <: Data, U <: Data](
 
   io.write.ready := !block_write_req &&
     !pipelined_writes.map(r => r.valid && r.bits.addr === io.write.bits.addr && io.write.bits.acc).reduce(_||_)
+
+  if (use_vpu_fusion) {
+    io.vpu_write.get.valid :=
+      oldest_pipelined_write.valid && oldest_write_to_vpu
+    io.vpu_write.get.bits.subRow := oldest_pipelined_write.bits.addr
+    io.vpu_write.get.bits.data := final_write_data
+
+    val bytes_per_element = t.head.head.getWidth / 8
+    require(bytes_per_element > 0 &&
+      oldest_pipelined_write.bits.mask.length % bytes_per_element == 0)
+    io.vpu_write.get.bits.laneMask := VecInit(
+      oldest_pipelined_write.bits.mask.grouped(bytes_per_element)
+        .map(_.reduce(_ || _)).toSeq)
+  }
 
   when (reset.asBool) {
     pipelined_writes.foreach(_.valid := false.B)

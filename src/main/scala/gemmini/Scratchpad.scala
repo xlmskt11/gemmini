@@ -1167,6 +1167,16 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         } else {
           None
         }
+        // With a local accumulator, C_TO_VSRAM leaves the post-RMW result
+        // here instead of writing it back into the accumulator SRAM.  The
+        // shared-memory configuration continues to use SharedExtMem.vpuWrite.
+        val vpu_write = if (use_vpu_fusion && !use_shared_ext_mem) {
+          Some(Valid(new GemminiVpuMatrixWriteReq(
+            1 max log2Ceil(acc_banks * acc_bank_entries), block_cols,
+            accType.getWidth)))
+        } else {
+          None
+        }
       }
 
       val exwrite_grant = if (use_shared_ext_mem) Some(new Bundle {
@@ -1717,9 +1727,29 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         acc_bank_entries, acc_row_t, acc_scale_func, acc_scale_t.asInstanceOf[V],
         acc_singleported, acc_sub_banks,
         use_shared_ext_mem,
+        use_vpu_fusion,
         acc_latency, accType, is_dummy
       )) }
       val bank_ios = VecInit(banks.map(_.io))
+
+      if (use_vpu_fusion) {
+        val bank_writes = banks.map(_.io.vpu_write.get)
+        val bank_write_valid = VecInit(bank_writes.map(_.valid))
+        assert(PopCount(bank_write_valid) <= 1.U,
+          "one Gemmini produced multiple local-ACC VSRAM rows in one cycle")
+
+        io.acc.vpu_write.get.valid := bank_write_valid.asUInt.orR
+        io.acc.vpu_write.get.bits.rowAddress := Mux1H(
+          bank_write_valid,
+          bank_writes.zipWithIndex.map { case (write, bank) =>
+            val full_row = bank.U * acc_bank_entries.U + write.bits.subRow
+            full_row.pad(1 max log2Ceil(acc_banks * acc_bank_entries))
+          })
+        val selected_write = Mux1H(bank_write_valid, bank_writes.map(_.bits))
+        io.acc.vpu_write.get.bits.data := VecInit(
+          selected_write.data.flatten.map(_.asUInt))
+        io.acc.vpu_write.get.bits.laneMask := selected_write.laneMask
+      }
 
       // Getting the output of the bank that's about to be issued to the writer
       val bank_issued_io = bank_ios(write_issue_q.io.deq.bits.laddr.acc_bank())
@@ -1805,7 +1835,21 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         // then zero_writer
 
         val exwrite = io.acc.write(i).valid
+        val vpu_d_write = if (use_vpu_fusion) {
+          io.acc.vpu_d_write.get(i).valid
+        } else {
+          false.B
+        }
+        val vpu_d_write_bits = if (use_vpu_fusion) {
+          io.acc.vpu_d_write.get(i).bits
+        } else {
+          0.U.asTypeOf(chiselTypeOf(io.acc.write(i).bits))
+        }
         io.acc.write(i).ready := true.B
+        if (use_vpu_fusion) {
+          io.acc.vpu_d_write.get(i).ready := !exwrite && bio.write.ready
+          bio.write_to_vpu.get := exwrite && io.acc.write_to_vpu.get(i)
+        }
         assert(!(exwrite && !bio.write.ready), "Execute controller write to AccumulatorMem was skipped")
 
         // val from_mvin_scale = mvin_scale_out.valid && mvin_scale_out.bits.tag.is_acc
@@ -1855,6 +1899,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         // bio.write.bits.acc := MuxCase(zero_writer.io.resp.bits.laddr.accumulate,
         bio.write.bits.acc := MuxCase(zero_writer_pixel_repeater.io.resp.bits.laddr.accumulate,
           Seq(exwrite -> io.acc.write(i).bits.acc,
+            vpu_d_write -> false.B,
             // from_mvin_scale -> mvin_scale_out.bits.tag.accumulate,
             from_mvin_scale -> mvin_scale_pixel_repeater.io.resp.bits.tag.accumulate,
             from_mvin_scale_acc -> mvin_scale_acc_out.bits.tag.accumulate))
@@ -1862,12 +1907,17 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         // bio.write.bits.addr := MuxCase(zero_writer.io.resp.bits.laddr.acc_row(),
         bio.write.bits.addr := MuxCase(zero_writer_pixel_repeater.io.resp.bits.laddr.acc_row(),
           Seq(exwrite -> io.acc.write(i).bits.addr,
+            vpu_d_write -> vpu_d_write_bits.addr,
             (from_mvin_scale || from_mvin_scale_acc) -> dmaread_row))
 
         when (exwrite) {
           bio.write.valid := true.B
           bio.write.bits.data := io.acc.write(i).bits.data
           bio.write.bits.mask := io.acc.write(i).bits.mask
+        }.elsewhen (vpu_d_write) {
+          bio.write.valid := true.B
+          bio.write.bits.data := vpu_d_write_bits.data
+          bio.write.bits.mask := vpu_d_write_bits.mask
         }.elsewhen (dmaread && !spad_last && !consecutive_write_block) {
           bio.write.valid := true.B
           bio.write.bits.data := Mux(from_mvin_scale,

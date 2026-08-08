@@ -97,7 +97,7 @@ class LdBCompleteControl(
   val iterator_bitwidth = 16
   val concurrent_loops = 2
   val group_num = nSharers * concurrent_loops
-  val group_w = log2Up(group_num)
+  val group_w = if (useVpuFusion) 3 else log2Up(group_num)
 
   require(nSharers > 0)
 

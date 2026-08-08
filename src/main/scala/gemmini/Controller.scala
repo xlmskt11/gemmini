@@ -88,6 +88,15 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val vpu_matrix_read_io = if (use_vpu_fusion) Some(IO(
     new GemminiVpuMatrixReadIO(
       vpuRowAddrBits.get, block_cols, accType.getWidth))) else None
+  val vpu_matrix_write_io = if (use_vpu_fusion && !use_shared_ext_mem) {
+    Some(IO(Valid(new GemminiVpuMatrixWriteReq(
+      vpuRowAddrBits.get, block_cols, accType.getWidth))))
+  } else {
+    None
+  }
+  if (use_vpu_fusion && !use_shared_ext_mem) {
+    vpu_matrix_write_io.get <> outer.spad.module.io.acc.vpu_write.get
+  }
 
   val tagWidth = 32
 
@@ -233,9 +242,10 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val iterator_bitwidth = 16
   val concurrent_loops = 2
   val group_num = nSharers * concurrent_loops
-  val group_w = log2Up(group_num)
+  val group_w = if (use_vpu_fusion) 3 else log2Up(group_num)
+  val use_group_control = use_shared_res_entries || use_vpu_fusion
 
-  val ext_loop_ws_io = if (use_shared_res_entries) Some(IO(new LdBExIO(
+  val ext_loop_ws_io = if (use_group_control) Some(IO(new LdBExIO(
     group_w, nSharers, iterator_bitwidth, use_vpu_fusion))) else None
   ext_loop_ws_io.foreach(_ <> ext_loop_ws.get)
   val ext_loop_conv_ws_io = if (use_shared_res_entries) Some(IO(new LdIExIO(group_w, nSharers, iterator_bitwidth))) else None

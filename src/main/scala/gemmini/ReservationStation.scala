@@ -533,6 +533,8 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
 
             io.alloc.ready := true.B
             entries_type(alloc_id).valid := true.B
+            val sharedId = Cat(q.asUInt,
+              alloc_id.pad(log2Up(res_max_per_type)))
             if (use_shared_res_entries) {
               entries_type(alloc_id).bits.q := new_entry.q
               entries_type(alloc_id).bits.is_config := new_entry.is_config
@@ -542,8 +544,6 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
               entries_type(alloc_id).bits.allocated_at := new_entry.allocated_at
               entries_type(alloc_id).bits.deps_m.get := new_entry.deps_m.get
 
-              val sharedId = Cat(q.asUInt,
-                alloc_id.pad(log2Up(res_max_per_type)))
               io.ext_deps.get.alloc_entry.valid := true.B
               io.ext_deps.get.alloc_entry.bits.alloc_id := sharedId
               io.ext_deps.get.alloc_entry.bits.opa := ext_alloc_opa
@@ -551,14 +551,13 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
               io.ext_deps.get.alloc_entry.bits.opa_is_dst :=
                 ext_alloc_opa_is_dst
               io.ext_deps.get.alloc_entry.bits.not_config := not_config
-
-              if (use_vpu_fusion) {
-                io.vsram_deps.get.alloc_entry.valid := vsramAccess.get.valid
-                io.vsram_deps.get.alloc_entry.bits.alloc_id := sharedId
-                io.vsram_deps.get.alloc_entry.bits.access := vsramAccess.get
-              }
             } else {
               entries_type(alloc_id).bits := new_entry
+            }
+            if (use_vpu_fusion) {
+              io.vsram_deps.get.alloc_entry.valid := vsramAccess.get.valid
+              io.vsram_deps.get.alloc_entry.bits.alloc_id := sharedId
+              io.vsram_deps.get.alloc_entry.bits.access := vsramAccess.get
             }
             new_allocs_type(alloc_id) := true.B
           }
@@ -680,10 +679,29 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
       }
     }
   } else {
-    Seq((ldq, io.issue.ld, entries_ld), (exq, io.issue.ex, entries_ex), (stq, io.issue.st, entries_st))
-      .foreach { case (q, io_issue, entries_type) =>
+    val ldVsramReady = if (use_vpu_fusion) {
+      io.vsram_deps.get.ld_deps_ready
+    } else VecInit(Seq.fill(reservation_station_entries_ld)(true.B))
+    val exVsramReady = if (use_vpu_fusion) {
+      io.vsram_deps.get.ex_deps_ready
+    } else VecInit(Seq.fill(reservation_station_entries_ex)(true.B))
+    val stVsramReady = if (use_vpu_fusion) {
+      io.vsram_deps.get.st_deps_ready
+    } else VecInit(Seq.fill(reservation_station_entries_st)(true.B))
 
-      val issue_valids = entries_type.map(e => e.valid && e.bits.ready() && !e.bits.issued)
+    Seq(
+      (ldq, io.issue.ld, entries_ld, ldVsramReady,
+        if (use_vpu_fusion) Some(io.vsram_deps.get.issue_ld) else None),
+      (exq, io.issue.ex, entries_ex, exVsramReady,
+        if (use_vpu_fusion) Some(io.vsram_deps.get.issue_ex) else None),
+      (stq, io.issue.st, entries_st, stVsramReady,
+        if (use_vpu_fusion) Some(io.vsram_deps.get.issue_st) else None))
+      .foreach { case (q, io_issue, entries_type, vsramReady, vsramIssue) =>
+
+      val issue_valids = entries_type.zip(vsramReady).map {
+        case (e, depsReady) =>
+          e.valid && e.bits.ready() && depsReady && !e.bits.issued
+      }
       val issue_sel = PriorityEncoderOH(issue_valids)
       val issue_id = OHToUInt(issue_sel)
       val global_issue_id = Cat(q.asUInt, issue_id.pad(log2Up(res_max_per_type)))
@@ -726,6 +744,12 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
           }
         }
 
+        if (use_vpu_fusion) {
+          vsramIssue.get.valid := true.B
+          vsramIssue.get.bits.issue_id := issue_id
+          vsramIssue.get.bits.valid := !complete_on_issue
+        }
+
         // If the instruction completed on issue, then notify the conv/matmul FSMs that another one of their commands
         // completed
         when (q === ldq) { conv_ld_issue_completed := complete_on_issue && from_conv_fsm }
@@ -748,10 +772,10 @@ class ReservationStation[T <: Data : Arithmetic, U <: Data, V <: Data](config: G
     if (use_shared_res_entries) {
       io.ext_deps.get.complete_id.valid := true.B
       io.ext_deps.get.complete_id.bits := io.completed.bits
-      if (use_vpu_fusion) {
-        io.vsram_deps.get.complete_id.valid := true.B
-        io.vsram_deps.get.complete_id.bits := io.completed.bits
-      }
+    }
+    if (use_vpu_fusion) {
+      io.vsram_deps.get.complete_id.valid := true.B
+      io.vsram_deps.get.complete_id.bits := io.completed.bits
     }
 
     when (queue_type === ldq) {

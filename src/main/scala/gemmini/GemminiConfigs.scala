@@ -104,9 +104,8 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
 
                                                                              headerFileName: String = "gemmini_params.h"
                                                        ) {
-  require(!use_vpu_fusion ||
-    (use_shared_ext_mem && use_shared_res_entries && ex_write_to_acc),
-    "Gemmini/VPU fusion requires shared external memory, shared reservation dependencies, and accumulator execute writes")
+  require(!use_vpu_fusion || ex_write_to_acc,
+    "Gemmini/VPU fusion requires accumulator execute writes")
   require(!use_vpu_fusion || dataflow == Dataflow.WS,
     "Gemmini/VPU fusion requires a weight-stationary-only array")
   require(!use_vpu_fusion ||
