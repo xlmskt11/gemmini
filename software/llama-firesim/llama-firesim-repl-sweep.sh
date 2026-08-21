@@ -6,6 +6,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/../../../.." && pwd)
 RUNTIME_CFG="${REPO_ROOT}/sims/firesim/deploy/config_runtime.yaml"
 RESULTS_ROOT="${REPO_ROOT}/sims/firesim/deploy/results-workload"
+IMAGE_PROFILE_STAMP="${REPO_ROOT}/software/firemarshal/images/firechip/llama-firesim/llama-firesim.img.hw-profile"
 SESSION_NAME="${SCREEN_NAME:-${FIRESIM_SCREEN_SESSION:-fsim0}}"
 SSH_AGENT_VARS="${HOME}/.ssh/AGENT_VARS"
 UARTLOG_OVERRIDE="${LLAMA_FIRESIM_UARTLOG:-}"
@@ -24,8 +25,24 @@ PROMPT_MIN="${LLAMA_FIRESIM_REPL_SWEEP_PROMPT_MIN:-64}"
 PROMPT_MAX="${LLAMA_FIRESIM_REPL_SWEEP_PROMPT_MAX:-256}"
 PROMPT_STEP="${LLAMA_FIRESIM_REPL_SWEEP_PROMPT_STEP:-16}"
 DECODE_TOKENS_CSV="${LLAMA_FIRESIM_REPL_SWEEP_DECODE_TOKENS:-${LLAMA_FIRESIM_N_PREDICT:-16}}"
-MASKS_CSV="${LLAMA_FIRESIM_REPL_SWEEP_MASKS:-1,3,7,15}"
-MODES_CSV="${LLAMA_FIRESIM_REPL_SWEEP_MODES:-multi}"
+HW_PROFILE="${LLAMA_FIRESIM_HW_PROFILE:-}"
+if [[ -z "${HW_PROFILE}" && -f "${IMAGE_PROFILE_STAMP}" ]]; then
+    HW_PROFILE=$(tr -d '[:space:]' < "${IMAGE_PROFILE_STAMP}")
+fi
+case "${HW_PROFILE}" in
+    single)
+        DEFAULT_MASKS_CSV="1"
+        ;;
+    multi)
+        DEFAULT_MASKS_CSV="1,3,7,15"
+        ;;
+    *)
+        echo "LLAMA_FIRESIM_HW_PROFILE must be single or multi (or build a stamped image first)." >&2
+        exit 1
+        ;;
+esac
+MASKS_CSV="${LLAMA_FIRESIM_REPL_SWEEP_MASKS:-${DEFAULT_MASKS_CSV}}"
+MODES_CSV="${LLAMA_FIRESIM_REPL_SWEEP_MODES:-${HW_PROFILE}}"
 POLL_SECONDS="${LLAMA_FIRESIM_REPL_SWEEP_POLL_SECONDS:-5}"
 USE_TAGS="${LLAMA_FIRESIM_REPL_SWEEP_USE_TAGS:-0}"
 KEEP_OPEN=0
@@ -40,8 +57,8 @@ Options:
   --prompt-max N         last prompt token count when LIST is omitted
   --prompt-step N        prompt token count step when LIST is omitted
   --decode-tokens LIST   comma-separated decode token counts
-  --masks LIST           comma-separated multi-Gemmini active masks
-  --modes LIST           comma-separated modes: multi,single
+  --masks LIST           comma-separated logical Gemmini masks
+  --modes LIST           selected compiled profile only: ${HW_PROFILE}
   --uartlog PATH         explicit local uartlog to monitor
   --remote-uartlog PATH  explicit remote uartlog to monitor through SSH
   --use-tags             send per-case tags, requires a guest with TAG-aware :prompt-tokens
@@ -277,6 +294,19 @@ wait_for_ready() {
     done
 }
 
+verify_running_profile() {
+    local expected="GEMMINI-HW-PROFILE,name=${HW_PROFILE},"
+
+    if log_contains "${expected}"; then
+        echo "REPL-SWEEP-HW-PROFILE,name=${HW_PROFILE}"
+        return
+    fi
+
+    echo "Running guest did not report the selected ${HW_PROFILE} hardware profile." >&2
+    echo "Expected UART marker: ${expected}" >&2
+    exit 1
+}
+
 case_done_seen() {
     local chunk="$1"
     local prompt_tokens="$2"
@@ -368,6 +398,26 @@ for mode in "${MODES[@]}"; do
         echo "modes must be multi or single: ${mode}" >&2
         exit 1
     fi
+    if [[ "${mode}" != "${HW_PROFILE}" ]]; then
+        echo "requested mode ${mode} does not match the built ${HW_PROFILE} profile" >&2
+        exit 1
+    fi
+done
+
+for value in "${MASKS[@]}"; do
+    if [[ "${value}" == 0[xX]* ]]; then
+        numeric_mask=$((16#${value:2}))
+    else
+        numeric_mask=$((10#${value}))
+    fi
+    if (( numeric_mask < 0 || numeric_mask > 15 )); then
+        echo "logical masks must be in [0, 0xf]: ${value}" >&2
+        exit 1
+    fi
+    if [[ "${HW_PROFILE}" == "single" && "${numeric_mask}" -gt 1 ]]; then
+        echo "single profile accepts only logical masks 0x0 and 0x1: ${value}" >&2
+        exit 1
+    fi
 done
 
 echo "REPL-SWEEP-PLAN,modes=$(IFS=,; echo "${MODES[*]}"),masks=$(IFS=,; echo "${MASKS[*]}"),prompt_tokens=$(IFS=,; echo "${PROMPT_TOKENS[*]}"),decode_tokens=$(IFS=,; echo "${DECODE_TOKENS[*]}"),use_tags=${USE_TAGS}"
@@ -399,6 +449,7 @@ else
 fi
 
 wait_for_ready
+verify_running_profile
 
 send_line ":backend gemmini"
 
@@ -406,15 +457,8 @@ case_count=0
 for mode in "${MODES[@]}"; do
     send_line ":gemmini-mode ${mode}"
 
-    case_masks=("${MASKS[@]}")
-    if [[ "${mode}" == "single" ]]; then
-        case_masks=("0x8")
-    fi
-
-    for mask in "${case_masks[@]}"; do
-        if [[ "${mode}" == "multi" ]]; then
-            send_line ":active-mask ${mask}"
-        fi
+    for mask in "${MASKS[@]}"; do
+        send_line ":active-mask ${mask}"
 
         for decode_tokens in "${DECODE_TOKENS[@]}"; do
             send_line ":n-predict ${decode_tokens}"
@@ -458,5 +502,6 @@ echo "  ${RESULT_DIR}/run_summary.csv"
 echo "  ${RESULT_DIR}/token_trace.csv"
 echo "  ${RESULT_DIR}/op_profile.csv"
 echo "  ${RESULT_DIR}/stage_summary.csv"
+echo "  ${RESULT_DIR}/matmul_summary.csv"
 echo "  ${RESULT_DIR}/backend_summary.csv"
 echo "  ${RESULT_DIR}/summary.md"

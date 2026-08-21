@@ -140,7 +140,7 @@ class StoreController[T <: Data : Arithmetic, U <: Data, V <: Data](config: Gemm
 
   val mvout_1d_rows = pool_orows * pool_ocols //for 1D mvout
   // Command tracker instantiation
-  val nCmds = (max_in_flight_mem_reqs / block_rows) + 1
+  val nCmds = (total_max_in_flight_mem_reqs / block_rows) + 1
 
   val deps_t = new Bundle {
     val rob_id = UInt(log2Up(reservation_station_entries).W)

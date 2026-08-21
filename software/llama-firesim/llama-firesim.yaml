@@ -14,6 +14,7 @@
     "/root/llama-results/token_trace.csv",
     "/root/llama-results/op_profile.csv",
     "/root/llama-results/stage_summary.csv",
+    "/root/llama-results/matmul_summary.csv",
     "/root/llama-results/backend_summary.csv",
     "/root/llama-results/arrival_request_summary.csv",
     "/root/llama-results/arrival_mode_summary.csv",

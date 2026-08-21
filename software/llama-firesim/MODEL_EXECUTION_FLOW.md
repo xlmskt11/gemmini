@@ -5,13 +5,17 @@ This document describes the current default model execution order in the
 dependencies. It is written for the default model selected by
 `host-init.sh`.
 
+> Backend update: the current accelerator path is profile-locked BF16
+> Gemmini/FP32 accumulation plus exact VPU and conditional FlashAttention. The
+> sections below describe that current numerical contract.
+
 ## Current Default Model
 
 `host-init.sh` defaults to:
 
 | item | value |
 | --- | --- |
-| packaged model | default Gemma 3 270M Q8_0 |
+| packaged model | default Gemma 3 270M BF16 |
 | GGUF path in guest | `/root/models/model.gguf` |
 | architecture | `gemma3` |
 | model name | `Gemma 3 270m` |
@@ -162,10 +166,10 @@ V_l     -> [D, N_kv, T] = [256, 1, T]
 ```
 
 These projection matmuls are eligible for Gemmini offload. The current Gemmini
-backend converts inputs to int8, runs int8 matmul with int32 accumulation, and
-rescales the output to F32.
+backend stages operands as BF16-RNE, runs BF16 matmul with FP32 accumulation,
+and unpacks/stores the FP32 result in the destination tensor layout.
 
-### 3. Q/K Norm, RoPE, And Query Scaling
+### 3. Q/K Norm, RoPE, And Attention Scaling
 
 Gemma 3 applies per-head RMSNorm to Q and K, then RoPE:
 
@@ -176,7 +180,7 @@ K_norm_l = RMSNorm(K_raw_l) * gamma_k_l
 Q_rope_l = RoPE(Q_norm_l, position)
 K_rope_l = RoPE(K_norm_l, position)
 
-Q_l = Q_rope_l * attention_scale
+score_l = attention_scale * (Q_rope_l * K_rope_l^T)
 ```
 
 For this model:
@@ -194,7 +198,9 @@ Shapes:
 | `Q_l` | `[256, 4, T]` |
 | `K_rope_l` | `[256, 1, T]` |
 
-These are CPU fallback today. RoPE and RMSNorm are not Gemmini ops.
+RMSNorm and RoPE are VPU-eligible when their runtime contracts are satisfied.
+The fused FlashAttention path stages Q without multiplying it and applies
+`attention_scale` directly to the FP32 QK score in the VPU kernel.
 
 ### 4. KV Cache Store
 
@@ -249,8 +255,21 @@ Current graph behavior:
 | mode | current behavior |
 | --- | --- |
 | default `flash_attn=auto` | attention core is a fused `FLASH_ATTN_EXT` op |
-| backend placement | CPU fallback |
-| Gemmini visibility | Gemmini does not see separate `QK^T` or `P*V` matmuls |
+| backend placement | exact prefix-causal/no-bias/no-softcap cases use the fused VPU+Gemmini kernel; other semantics fall back to CPU |
+| Gemmini visibility | the fused kernel internally issues `QK^T` and `P*V` Gemmini jobs |
+
+Fused FlashAttention does not reuse the ordinary matmul
+`GGML_GEMMINI_PAGE_PACKED_{A,B,C,D}` settings. It independently reads
+`Flash_Q_PAGE_PACKED` (default `0`), `Flash_K_PAGE_PACKED` (default `1`), and
+`Flash_V_PAGE_PACKED` (default `1`). The adapter stages Q in A layout and K/V
+in their respective B source layouts. K is packed as `[S_l, D]` and transposed
+by the QK job. The normal `M/K > 1` thresholds are applied independently to Q,
+K, and V. The adapter passes those three choices independently in the
+low-level `query_stride`, `key_stride`, and `value_stride` encodings, so K and
+V may use different layouts. FlashAttention has no output-packing option:
+after final normalization the VPU writes FP32 rows directly to the final ggml
+destination in row-major order. The online accumulator stays in VSRAM and has
+no host page layout.
 
 If FlashAttention is disabled, llama.cpp can build explicit `kq = mul_mat(k,q)`,
 `softmax`, and `kqv = mul_mat(v,kq)` nodes. In the current default path,
@@ -381,7 +400,7 @@ Per layer, the dependency graph is:
 ```text
 X_l
   -> RMSNorm + attn_norm
-       -> Q projection -> Q RMSNorm -> RoPE -> scale
+       -> Q projection -> Q RMSNorm -> RoPE
        -> K projection -> K RMSNorm -> RoPE -> KV cache store
        -> V projection ----------------------> KV cache store
   -> attention(Q, cache_K, cache_V, mask)
@@ -415,33 +434,35 @@ Hard serialization points are:
 
 ## Current Backend Mapping
 
-The Gemmini backend currently supports only `GGML_OP_MUL_MAT` plus metadata ops
-needed for backend scheduling. Everything else falls back to CPU.
+The registered accelerator backend sends supported `GGML_OP_MUL_MAT` nodes to
+Gemmini, exact supported vector nodes to the VPU, and admitted
+`GGML_OP_FLASH_ATTN_EXT` nodes to fused FlashAttention. Other nodes fall back
+to the CPU.
 
 | stage | current default op type | backend today |
 | --- | --- | --- |
 | token embedding lookup | `GET_ROWS` | CPU fallback |
 | embedding scale | `SCALE` | CPU fallback |
-| RMSNorms | `RMS_NORM` + `MUL` | CPU fallback |
+| RMSNorms | `RMS_NORM` + `MUL` | VPU eligible, CPU fallback otherwise |
 | Q/K/V projections | `MUL_MAT` | Gemmini eligible |
-| Q/K RoPE | `ROPE` | CPU fallback |
+| Q/K RoPE | `ROPE` | VPU eligible, CPU fallback otherwise |
 | KV cache write | `SET_ROWS` | CPU fallback |
-| attention core | `FLASH_ATTN_EXT` | CPU fallback |
+| attention core | `FLASH_ATTN_EXT` | fused Gemmini+VPU eligible, CPU fallback otherwise |
 | O projection | `MUL_MAT` | Gemmini eligible |
 | FFN up/gate/down | `MUL_MAT` | Gemmini eligible |
-| GEGLU | `GEGLU` | CPU fallback |
-| residual adds | `ADD` | CPU fallback |
+| GEGLU | `GEGLU` | VPU eligible, CPU fallback otherwise |
+| residual adds | `ADD` | VPU eligible, CPU fallback otherwise |
 | final LM head | `MUL_MAT` | Gemmini eligible |
 | sampling | sampler code | CPU |
 
 For offloaded matmuls, the current Gemmini path uses:
 
 ```text
-F32 or GGUF-quantized tensor
-  -> convert row to F32
-  -> quantize to int8
-  -> Gemmini int8 matmul, int32 accumulation
-  -> rescale to F32 ggml output
+F32, BF16, or supported GGUF tensor
+  -> decode/encode as BF16-RNE where needed
+  -> transpose/page-pack the weight and stage/page-pack the activation
+  -> Gemmini BF16 matmul, FP32 accumulation
+  -> unpack/store the FP32 ggml output
 ```
 
 Model weights such as `attn_q.weight`, `attn_k.weight`, `attn_v.weight`,
@@ -482,4 +503,4 @@ After all layers:
 | `src/models/gemma3.cpp` in the pinned llama.cpp tree | Gemma 3 graph order and equations |
 | `src/llama-graph.cpp` in the pinned llama.cpp tree | QKV, attention, FFN helper implementations |
 | `src/llama-context.cpp` in the pinned llama.cpp tree | default context params, KV dtype, FlashAttention auto |
-| `src/ggml/src/ggml-gemmini/ggml-gemmini.cpp` | Gemmini offload conditions, int8 repack, profiling |
+| `src/ggml/src/ggml-gemmini/ggml-gemmini.cpp` | Gemmini offload conditions, BF16 staging/packing, profiling |

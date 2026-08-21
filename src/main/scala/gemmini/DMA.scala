@@ -70,7 +70,9 @@ class StreamReader[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T
       val counter = new CounterEventIO()
     })
 
-    val nCmds = (nXacts / meshRows) + 1
+    // cmd_id is allocated by the Gemmini-wide load controller, so each lane
+    // must represent every command in flight across the complete frontend.
+    val nCmds = (config.total_max_in_flight_mem_reqs / meshRows) + 1
 
     val xactTracker = Module(new XactTracker(nXacts, maxBytes, spadWidth, accWidth, spad_rows, acc_rows, maxBytes, config.mvin_scale_t_bits, nCmds, use_firesim_simulation_counters))
 
@@ -142,7 +144,7 @@ class StreamReaderCore[T <: Data, U <: Data, V <: Data](config: GemminiArrayConf
     val accWidthBytes = accWidth / 8
     val beatBytes = beatBits / 8
 
-    val nCmds = (nXacts / meshRows) + 1
+    val nCmds = (config.total_max_in_flight_mem_reqs / meshRows) + 1
 
     val io = IO(new Bundle {
       val req = Flipped(Decoupled(new StreamReadRequest(spad_rows, acc_rows, config.mvin_scale_t_bits)))

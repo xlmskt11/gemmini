@@ -9,6 +9,13 @@ import Util._
 import org.chipsalliance.cde.config.Parameters
 import midas.targetutils.PerfCounter
 
+private[gemmini] object ExecuteCompletionCollision {
+  def configMayPop(configEligible: Bool,
+                   fusionMeshCompletionDeqValid: Bool): Bool = {
+    configEligible && !fusionMeshCompletionDeqValid
+  }
+}
+
 // TODO do we still need to flush when the dataflow is weight stationary? Won't the result just keep travelling through on its own?
 class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: Int, config: GemminiArrayConfig[T, U, V])
                                   (implicit p: Parameters, ev: Arithmetic[T]) extends Module {
@@ -205,6 +212,15 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   // Dependency stuff
   io.completed.valid := false.B
   io.completed.bits := DontCare
+
+  // CONFIG commands complete directly from the command FSM, while fused
+  // C_TO_VSRAM commands complete through the mesh-completion queue below.
+  // Both share io.completed, so keep a CONFIG command at the head of cmd_q
+  // whenever an already-queued mesh completion owns that single-wide port.
+  // Otherwise the later mesh assignment overwrites the CONFIG completion
+  // after the CONFIG has already been popped, permanently leaking its ROB
+  // entry.
+  val meshCompletionPortBusy = WireInit(false.B)
 
   // val pending_completed_rob_id = Reg(UDValid(UInt(log2Up(rob_entries).W)))
   val pending_completed_rob_ids = Reg(Vec(2, UDValid(UInt(log2Up(reservation_station_entries).W))))
@@ -652,7 +668,10 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
       when(cmd.valid(0))
       {
-        when(DoConfig && !matmul_in_progress && !pending_completed_rob_ids.map(_.valid).reduce(_ || _)) {
+        val configEligible = DoConfig && !matmul_in_progress &&
+          !pending_completed_rob_ids.map(_.valid).reduce(_ || _)
+        when(ExecuteCompletionCollision.configMayPop(
+          configEligible, meshCompletionPortBusy)) {
           val config_ex_rs1 = rs1s(0).asTypeOf(new ConfigExRs1(acc_scale_t_bits))
           val config_ex_rs2 = rs2s(0).asTypeOf(new ConfigExRs2)
 
@@ -1255,6 +1274,9 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       "fusion execute completion queue overflow")
 
     completionQueue.io.deq.ready := true.B
+    meshCompletionPortBusy := completionQueue.io.deq.valid
+    assert(!(completionQueue.io.deq.valid && DoConfig && cmd.valid(0) && cmd.pop.orR),
+      "CONFIG popped while a fused mesh completion owns the completion port")
     when(completionQueue.io.deq.valid) {
       mesh_completed_rob_id_fire := true.B
       io.completed.valid := true.B

@@ -4,6 +4,11 @@
 정리한다. 목적은 Gemmini mode에서 멈추는 경로를 좁혀서 디버깅하기 쉽게
 만드는 것이다.
 
+> 1x16/4x8 BF16 fusion update: hardware mode is now a build-time profile, all
+> public masks are logical, Gemmini operands are BF16-RNE/FP32-accumulate, and
+> exact VPU/FlashAttention operations are offloaded with CPU fallback. The
+> sections below describe that current ABI contract.
+
 ## Source Of Truth
 
 수정해야 하는 원본 파일은 아래이다.
@@ -12,13 +17,16 @@
 | --- | --- | --- |
 | FireMarshal workload | `llama-firesim.yaml` | rootfs 크기, guest command, copy-in 파일, copy-out 결과, FireSim output 정의 |
 | build/install helper | `llama-firesim-build.sh` | `marshal build`와 `marshal install` 실행 |
+| build profile helper | `llama-firesim-build-profile.sh` | 필수 `LLAMA_FIRESIM_HW_PROFILE=single\|multi` 검증과 generated software ABI hash 고정 |
 | host build hook | `host-init.sh` | pinned `llama.cpp` clone, local patch 적용, cross compile, GGUF model download, guest 파일 staging |
 | upstream patch copier | `apply-local-patches.sh` | local backend/CLI 파일을 clone된 `llama.cpp`에 복사하고 CMake/backend registry patch |
 | guest launcher | `guest/llama-firesim-launch.sh` | guest에서 model/backend/env default 선택 후 CLI 실행 |
 | UART CLI app | `src/examples/firesim/llama-firesim-cli.cpp` | REPL, benchmark mode, prefill/decode loop, token streaming, profiler 호출 |
 | Gemmini backend header | `src/ggml/include/ggml-gemmini.h` | backend 등록 API와 profiler hook 선언 |
-| Gemmini backend | `src/ggml/src/ggml-gemmini/ggml-gemmini.cpp` | ggml backend 등록, offload 조건, int8 repack/quantization, Gemmini matmul 호출, profiling output |
-| Gemmini SW helper | `sims/firesim/target-design/chipyard/generators/gemmini/software/gemmini-rocc-tests/include/gemmini_all.h` | 현재 FireSim bitstream과 같은 target-design Gemmini helper/header. backend가 직접 사용 |
+| Gemmini backend | `src/ggml/src/ggml-gemmini/ggml-gemmini.cpp` | ggml backend 등록, BF16 repack, Gemmini matmul, VPU/Flash dispatch와 CPU fallback, profiling output |
+| hardware ABI profile | `src/ggml/include/ggml-gemmini-profile.h` | 빌드에서 명시한 single/multi count·mask와 target-design generated parameter ABI를 compile time에 연결 |
+| VPU adapter | `src/ggml/src/ggml-gemmini/ggml-gemmini-vpu.cpp` | exact nonlinear/RMSNorm/RoPE/FlashAttention admission, staging, 실행 |
+| Gemmini SW helper | `sims/firesim/target-design/chipyard/generators/gemmini/software/gemmini-rocc-tests/include/gemmini_all.h` | target-design에 현재 생성된 Gemmini helper/header를 backend가 직접 사용 |
 
 아래 경로는 산출물이므로 지속적인 수정 위치가 아니다.
 
@@ -32,7 +40,8 @@
 
 manager 쪽 build 흐름은 다음과 같다.
 
-1. `llama-firesim-build.sh`가 Chipyard/RISC-V tool PATH를 설정한다.
+1. 사용자가 `LLAMA_FIRESIM_HW_PROFILE=single|multi`를 선택하고
+   `llama-firesim-build.sh`가 이를 검증한 뒤 Chipyard/RISC-V tool PATH를 설정한다.
 2. `software/firemarshal/marshal build llama-firesim.yaml`을 실행한다.
 3. FireMarshal이 `host-init.sh`를 실행한다.
 4. `host-init.sh`가 `ggml-org/llama.cpp` tag `b9060`을 clone/reset한다.
@@ -45,9 +54,12 @@ manager 쪽 build 흐름은 다음과 같다.
 11. `marshal install`이 `sims/firesim/deploy/workloads/llama-firesim.json`을 생성/갱신한다.
 
 `GEMMINI_SW_DIR`는 root 쪽 `generators/gemmini/software/gemmini-rocc-tests`가
-아니라 FireSim target-design 쪽 경로를 사용한다. 이 경로의
-`gemmini_params.h`가 실제 bitstream의 `DIM`, scratchpad, accumulator 설정과
-맞아야 한다.
+아니라 FireSim target-design 쪽 경로를 사용한다. 빌드는 이 경로의 현재
+`gemmini_params.h`, `vpu_params.h`, Gemmini/VPU kernel만을 software ABI 입력으로
+사용하며 `config_runtime.yaml`이나 HWDB를 읽지 않는다. 실행할 bitstream과
+이 생성 헤더의 일치 여부는 사용자가 관리한다. 한 software build 도중에는
+target-design `include/`와 `rocc-software/src/xcustom.h`의 hash를 확인하여 host
+packer와 RISC-V backend가 서로 다른 revision을 읽는 경우 빌드를 중단한다.
 
 guest software나 rootfs에 들어가는 파일을 바꾸면 FireSim에서 다시
 `infrasetup`을 해야 한다. 그렇지 않으면 FPGA host가 이전 rootfs를 계속
@@ -78,10 +90,11 @@ guest에는 단일 모델만 들어간다.
 
 | Build-time selector | Packaged GGUF |
 | --- | --- |
-| `gemma-3-270m` | Gemma 3 270M Q8_0 |
+| `gemma-3-270m` | Gemma 3 270M BF16 |
 | `smollm2-360m` | SmolLM2 360M Instruct Q8_0 |
 | `qwen3-0.6b` | Qwen3 0.6B Q8_0 |
-| `llama-3.2-1b` | Llama 3.2 1B Instruct Q8_0 |
+| `llama-3.2-1b` | Llama 3.2 1B Instruct BF16 |
+| `llama-3.2-3b` | Llama 3.2 3B Instruct BF16 |
 
 선택은 `LLAMA_FIRESIM_MODEL`로 `host-init.sh` 실행 시점에만 수행되고,
 guest path는 항상 `/root/models/model.gguf`이다. `LLAMA_FIRESIM_MODEL_URL`을
@@ -151,9 +164,9 @@ Gemmini backend가 지원한다고 광고하는 ggml op는 제한적이다.
 | `GGML_GEMMINI_DISABLE`이 꺼져 있음 | CPU-only baseline 지원 |
 | `GGML_GEMMINI_ACTIVE_MASK != 0` | 적어도 하나의 accelerator 필요 |
 | `src0`, `src1`, destination shape가 backend 기대 layout과 맞음 | 현재 dense matmul layout만 구현 |
-| `src0`, `src1`의 innermost dimension이 contiguous | row-wise float conversion과 int8 quantization을 위해 필요 |
-| destination type이 `F32` | Gemmini 결과를 다시 F32로 rescale해서 ggml에 반환 |
-| `src0`, `src1`이 F32이거나 `to_float` 변환 지원 type | Gemmini 입력은 실행 직전 int8로 quantize |
+| `src0`, `src1`의 innermost dimension이 contiguous | BF16 direct copy 또는 row-wise conversion/staging에 필요 |
+| destination type이 `F32` | Gemmini FP32 accumulator 결과를 ggml에 반환 |
+| `src0`, `src1`이 BF16/F32이거나 `to_float` 변환 지원 type | BF16 source는 직접 사용하고 나머지는 BF16-RNE encode |
 | activation row 수가 1 이상 | 비어 있는 matmul 제외 |
 | `GGML_GEMMINI_MAX_OFFLOADS` 제한 이하 | 기본값 `-1`에서는 제한 없이 모든 eligible matmul offload |
 
@@ -175,12 +188,14 @@ static model weight cache 여부와 stage 분류에만 사용된다.
 
 | 작업 | 이유 |
 | --- | --- |
-| norm, RoPE, softmax, KV cache, sampling | Gemmini backend 구현 없음 |
+| 지원 조건 밖 norm, RoPE, nonlinear, softmax, FlashAttention | VPU/Flash exact-semantics admission 실패 |
+| KV cache 관리, sampling | accelerator backend op가 아님 |
 | output이 F32가 아니거나 innermost stride가 맞지 않는 matmul | 현재 backend output/writeback layout 밖 |
 
 중요한 점은 projection/FFN activation인 `src1`은 runtime에서 보통 F32라는
-것이다. 현재 all-GEMM mode에서는 F32 attention-score/value matmul도 Gemmini에
-넣기 직전에 `src0`, `src1`을 int8로 quantize한다. model weight로 분류되는
+것이다. backend는 activation을 BF16-RNE로 encode한다. BF16 model weight는
+수치 변환 없이 bit pattern을 Gemmini B layout으로 transpose/page-pack하며,
+다른 지원 type은 float를 거쳐 BF16-RNE로 변환한다. model weight로 분류되는
 `src0`만 repack cache를 재사용하고, runtime intermediate `src0`는 stale data를
 피하기 위해 매 호출마다 다시 repack한다.
 
@@ -190,27 +205,42 @@ offload된 `MUL_MAT(src0, src1) -> dst`는 Gemmini에 아래처럼 mapping된다
 
 | Gemmini operand | Source | 현재 format |
 | --- | --- | --- |
-| `A` | runtime activation `src1` | F32 또는 dequantized input에서 row-wise int8 quantize |
-| `B` | matmul left operand `src0` | F32 또는 dequantized input에서 int8 repack, static model weight는 cache |
-| `C` | temporary accumulator | `acc_t` / int32 |
-| `dst` | ggml output tensor | rescale 후 F32 |
+| `A` | runtime activation `src1` | BF16-RNE, 필요하면 page-packed A로 staging |
+| `B` | matmul left operand `src0` | BF16, K x J transpose/page-packed B; static model weight는 cache |
+| `C` | temporary accumulator | `acc_t` / FP32 |
+| `dst` | ggml output tensor | FP32 accumulator를 layout 변환 후 저장 |
+
+Page-packed 설정은 shape별로 다시 admission한다. A/C/D는 `M > 1`, B는
+`K > 1`일 때만 실제 packed layout과 packed stride를 사용하고, 경계값
+이하에서는 요청 옵션과 무관하게 row-major로 staging한다.
+
+FlashAttention adapter는 일반 matmul의 `GGML_GEMMINI_PAGE_PACKED_{A,B,C,D}`를
+재사용하지 않는다. Q, K, V는 각각 `Flash_Q_PAGE_PACKED`(기본값 `0`),
+`Flash_K_PAGE_PACKED`(기본값 `1`), `Flash_V_PAGE_PACKED`(기본값 `1`)로
+독립 제어한다. Q는 A layout, 원본 형태의 K/V는 각각 B source layout이며
+`query_rows > 1`, `q_dim > 1`, `sequence > 1`인 경우에만 해당 요청을 실제
+packing으로 적용한다. adapter와 low-level kernel 사이에서도
+`query_stride`, `key_stride`, `value_stride`가 각 layout을 독립적으로
+encode하므로 K와 V 설정을 서로 다르게 줄 수 있다. K의 transpose는
+page-packed source를 읽는 QK job에서 수행한다. FlashAttention output에는
+packing 옵션이 없고 VPU H_STORE가 최종 FP32 row를 ggml dst에 직접
+row-major로 기록한다. online accumulator는 host D matrix가 아니라 VSRAM
+내부 상태다.
 
 세부 흐름은 `ggml-gemmini.cpp` 기준으로 아래이다.
 
-1. `tensor_row_to_float()`가 tensor row를 float로 변환한다. quantized ggml
-   tensor는 ggml type trait의 `to_float`를 호출한다.
-2. `quantize_row_to_i8()`가 row별 max-abs scale을 계산하고 int8 buffer를 만든다.
-3. `populate_weight_cache_entry()`가 `src0` row를 float로 변환한 뒤 `K x J`
-   int8 matrix로 repack한다.
+1. BF16 tensor row는 원래 16-bit bit pattern을 그대로 사용한다. 다른 지원
+   type은 `tensor_row_to_float()`와 ggml type trait의 `to_float`를 사용한다.
+2. F32/non-BF16 row는 BF16-RNE로 encode한다. 별도 quantization scale은 없다.
+3. `populate_weight_cache_entry()`가 `src0`를 `K x J` BF16 matrix로
+   transpose/repack한다. BF16 source에는 수치 변환이 없다.
 4. static model weight로 분류되는 `src0`만 `get_or_create_weight_cache()`로
    repack/cache한다. runtime intermediate `src0`는 매 호출마다 다시 repack한다.
-5. `ggml_backend_gemmini_mul_mat()`가 매 호출마다 activation row를 int8로 quantize한다.
+5. `ggml_backend_gemmini_mul_mat()`가 매 호출마다 activation row를 BF16-RNE로 encode한다.
 6. A/B/C buffer는 `MAX_BYTES` alignment로 할당한다.
-7. `run_gemmini_matmul()`이 Gemmini에 넘길 A/B/C buffer를 page 단위로 prefault한다.
-8. `run_gemmini_matmul()`이 `shared_multi_tiled_matmul_job_step()` path를
+7. `run_gemmini_matmul()`이 `shared_multi_tiled_matmul_job_step()` path를
    사용한다.
-9. backend가 `acc_t` output을 `activation_scale[row] * weight_scale[col]`로
-   rescale해서 ggml destination에 F32로 쓴다.
+8. backend가 FP32 `acc_t` output의 page layout을 풀어 ggml destination에 쓴다.
 
 현재 Gemmini call에는 bias fuse가 없다.
 
@@ -220,7 +250,7 @@ offload된 `MUL_MAT(src0, src1) -> dst`는 Gemmini에 아래처럼 mapping된다
 | `repeating_bias` | `false` |
 | `act` | `NO_ACTIVATION` |
 | `scale` | `ACC_SCALE_IDENTITY` |
-| `full_C` | `true`, 즉 `C`는 `acc_t` / int32 |
+| `full_C` | `true`, 즉 `C`는 `acc_t` / FP32 |
 | `dataflow` | `WEIGHT_STATIONARY` |
 | `a_transpose` | `false` |
 | `b_transpose` | `false` |
@@ -238,9 +268,9 @@ backend는 자체 low-level tiler를 구현하지 않는다. 대신
 | `dim_I` | activation row 수 |
 | `dim_J` | output column 수 |
 | `dim_K` | inner dimension |
-| `A` | quantized activation buffer |
-| `B` | repacked quantized weight buffer |
-| `C` | int32 accumulator buffer |
+| `A` | encoded/page-packed BF16 activation buffer |
+| `B` | transposed/page-packed BF16 weight buffer |
+| `C` | FP32 accumulator buffer |
 | `stride_A` | `dim_K` |
 | `stride_B` | `dim_J` |
 | `stride_C` | `dim_J` |
@@ -273,21 +303,32 @@ FireSim이 이 파일들을 copy-out한다.
 | `token_trace.csv` | run label, generated token index, token id, decoded piece |
 | `op_profile.csv` | ggml op별 timing, backend/stage label, shape, Gemmini host-side subphase, Gemmini counter |
 | `stage_summary.csv` | stage별 aggregate와 run 대비 비율 |
-| `backend_summary.csv` | backend/phase/Gemmini host-side subphase/Gemmini counter subphase aggregate |
+| `backend_summary.csv` | backend/phase/Gemmini 및 FlashAttention host-side subphase/Gemmini counter subphase aggregate |
 | `summary.md` | 사람이 읽기 위한 request summary, TTFT/TPOT, aggregate breakdown |
 
 `op_profile.csv`의 raw backend label 의미는 아래이다.
 
 | Label | 의미 |
 | --- | --- |
-| `gemmini` | hybrid run에서 Gemmini로 완료된 op |
+| `gemmini_bf16` | hybrid run에서 BF16 Gemmini로 완료된 op |
+| `vpu` | VPU에서 완료된 standalone vector op |
+| `flash_attention` | Gemmini+VPU fused FlashAttention으로 완료된 op |
 | `cpu_fallback` | hybrid run에서 CPU backend로 실행된 op |
 | `cpu_baseline` | CPU-only benchmark pass |
 
-`summary.md`와 `backend_summary.csv`의 `Backend Split`은 Gemmini op를 다시 나눈다.
-여기서 `gemmini`는 `run_gemmini_matmul()` call interval만 의미하고,
-`gemmini_host_overhead`는 weight 준비, activation quantization, output
-dequant/store를 포함한 나머지 Gemmini backend-side overhead이다.
+`Backend Split`은 backend별 전체 op wall을 표시한다. 별도의 `Backend Gemmini
+Breakdown`은 `weight_cache_lookup_pack`, `activation_stage_pack`, Gemmini
+configuration/run, `output_unpack_store`, `other_host`로 나눈다. `Backend
+FlashAttention Breakdown`은 mask/workspace/plan 준비, `input_pack`, 전체
+`fused_attention_run`, `output_unpack_store`, `other_host`로 나눈다. 호환용
+`input_validation` profiler 필드는 남아 있지만 Q/K/V 전수 검사를 제거했으므로
+새 run에서는 0이다. fused 실행 내부의 QK/online-softmax/PV 비율은 추정하지 않는다.
+
+`activation_stage_pack`은 dense row-major BF16 `src1`이면 원본 주소를 Gemmini
+A로 직접 사용한다. packed A, F32/F16, padded stride, 주소 범위 또는 output
+alias 조건을 만족하지 못하면 기존 aligned BF16 staging buffer를 사용한다.
+FlashAttention은 ggml의 positive finite score scale을 VPU kernel에 직접 전달하며
+Q staging 중 별도의 `scale * sqrt(d)` 곱셈을 수행하지 않는다.
 
 stage label은 ggml node name, source tensor name, op name에서 추론한다. stage
 label은 aggregation/debugging용이며 별도의 scheduler는 아니다. Projection
@@ -302,7 +343,7 @@ KV cache read/write, norm, residual, embedding은 별도 bucket으로
 구조상 가장 좁은 critical section은 아래이다.
 
 1. ggml scheduler가 eligible `MUL_MAT`을 `GEMMINI`에 배치한다.
-2. `ggml_backend_gemmini_mul_mat()`가 input repack/quantization을 수행한다.
+2. `ggml_backend_gemmini_mul_mat()`가 activation BF16 staging/packing과 필요한 weight cache/packing을 수행한다.
 3. `run_gemmini_matmul()`이 `shared_multi_matmul_job_t`를 만든다.
 4. `shared_multi_tiled_matmul_job_step()`이 하나 이상의 custom accelerator에 RoCC command를 발행한다.
 5. guest가 step loop, custom instruction, DMA, 또는 `gemmini_fence()` 안에서 멈출 수 있다.
@@ -313,18 +354,15 @@ isolation에 유용한 knob는 아래이다.
 | --- | --- |
 | `LLAMA_FIRESIM_BACKEND=cpu` | 전체 CPU sanity path |
 | `GGML_GEMMINI_DISABLE=1` | backend가 등록돼도 CPU fallback 강제 |
-| `GGML_GEMMINI_ACTIVE_MASK=0x1` | `custom0`만 사용 |
-| `GGML_GEMMINI_ACTIVE_MASK=0x2` | `custom1`만 사용 |
-| `GGML_GEMMINI_ACTIVE_MASK=0x4` | `custom2`만 사용 |
-| `GGML_GEMMINI_ACTIVE_MASK=0x8` | `custom3`만 사용 |
+| `GGML_GEMMINI_ACTIVE_MASK=0x1` | logical member 0. single에서는 physical `custom3`, multi에서는 `custom0` |
+| `GGML_GEMMINI_ACTIVE_MASK=0x2/0x4/0x8` | multi profile logical member 1/2/3 (`custom1/2/3`); single에서는 거부 |
 | `GGML_GEMMINI_MAX_OFFLOADS=N` | run마다 최대 N개의 unique eligible matmul만 Gemmini offload. 기본값은 `-1`로 제한 없음, `0`은 offload 없음 |
-| `GGML_GEMMINI_PREPACK_WEIGHTS=0` | model load 직후 weight int8/repack 선처리를 끄고 첫 사용 시 lazy repack |
+| `GGML_GEMMINI_PREPACK_WEIGHTS=0` | model load 직후 BF16-RNE weight repack을 끄고 첫 사용 시 lazy repack |
 | `GGML_GEMMINI_COUNTERS=1` | Gemmini performance counter 설정/읽기 활성화. 기본값은 `0`으로 RoCC counter path를 우회 |
 | `GGML_GEMMINI_PROFILE=1` | 완료된 op에 대한 profiler output 활성화 |
 | `GGML_GEMMINI_TRACE=1` | Gemmini dispatch 직전에 stage/src0/shape/mask를 UART에 출력 |
 | `LLAMA_FIRESIM_MLOCK=0` | process-wide `mlockall()` 비활성화 |
 | `LLAMA_FIRESIM_MLOCK_STRICT=1` | `mlockall()` 실패 시 guest CLI를 즉시 실패 처리 |
-| `GGML_GEMMINI_PREFAULT=0` | Gemmini A/B/C buffer prefault 비활성화 |
 
 UART가 `PREFILL-START` 또는 `DECODE-START` 뒤에 멈추면 Ctrl-C가 안 먹을 수
 있다. core가 RoCC/Gemmini path 안에서 stuck되면 CLI signal handler까지

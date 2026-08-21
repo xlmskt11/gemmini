@@ -307,7 +307,9 @@ class DefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
   sp_kb: Int = 64,
   acc_kb: Int = 32,
   use_profiler: Boolean = false,
-  gemminiConfig: GemminiArrayConfig[T,U,V] = GemminiConfigs.firesimConfig
+  gemminiConfig: GemminiArrayConfig[T,U,V] = GemminiConfigs.firesimConfig,
+  n_dma_engines: Int = 1,
+  max_in_flight_mem_reqs_per_engine: Option[Int] = None
 ) extends Config((site, here, up) => {
   case BuildRoCC => up(BuildRoCC) ++ Seq(
     (p: Parameters) => {
@@ -343,7 +345,8 @@ class DefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
       use_shared_res_entries = false,
       nSharers = 1,
       use_shared_ext_mem = false,
-      max_in_flight_mem_reqs = mesh_rows,
+      n_dma_engines = n_dma_engines,
+      max_in_flight_mem_reqs = max_in_flight_mem_reqs_per_engine.getOrElse(mesh_rows),
       use_profiler = use_profiler
       )))
       gemmini

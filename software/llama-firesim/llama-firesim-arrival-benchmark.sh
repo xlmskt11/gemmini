@@ -6,9 +6,18 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/../../../.." && pwd)
 RUNTIME_CFG="${REPO_ROOT}/sims/firesim/deploy/config_runtime.yaml"
 RESULTS_ROOT="${REPO_ROOT}/sims/firesim/deploy/results-workload"
+IMAGE_PROFILE_STAMP="${REPO_ROOT}/software/firemarshal/images/firechip/llama-firesim/llama-firesim.img.hw-profile"
 SESSION_NAME="${FIRESIM_SCREEN_SESSION:-fsim0}"
 SSH_AGENT_VARS="${HOME}/.ssh/AGENT_VARS"
 N_PREDICT="${1:-1}"
+HW_PROFILE="${LLAMA_FIRESIM_HW_PROFILE:-}"
+if [[ -z "${HW_PROFILE}" && -f "${IMAGE_PROFILE_STAMP}" ]]; then
+    HW_PROFILE=$(tr -d '[:space:]' < "${IMAGE_PROFILE_STAMP}")
+fi
+if [[ "${HW_PROFILE}" != "multi" ]]; then
+    echo "arrival benchmark requires LLAMA_FIRESIM_HW_PROFILE=multi and a 4x8 image." >&2
+    exit 1
+fi
 
 load_ssh_agent() {
     if [[ -f "${SSH_AGENT_VARS}" ]]; then
@@ -104,5 +113,6 @@ echo "  ${RESULT_DIR}/arrival_mode_summary.csv"
 echo "  ${RESULT_DIR}/arrival_stage_summary.csv"
 echo "  ${RESULT_DIR}/op_profile.csv"
 echo "  ${RESULT_DIR}/stage_summary.csv"
+echo "  ${RESULT_DIR}/matmul_summary.csv"
 echo "  ${RESULT_DIR}/backend_summary.csv"
 echo "  ${RESULT_DIR}/summary.md"

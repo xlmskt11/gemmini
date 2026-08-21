@@ -4,6 +4,12 @@
 있는지, main entry가 어디인지, CPU/Gemmini path가 어디서 갈라지는지, 그리고
 현재 latency/profile 값이 어떻게 측정되는지 정리한다.
 
+> Current ABI note: `single` (1x16/custom3) and `multi` (4x8/custom0..3) are
+> separate build profiles. The backend now uses BF16-RNE inputs, FP32
+> accumulation, exact VPU kernels, conditional fused FlashAttention, and
+> reasoned CPU fallback. This document describes that current numerical and
+> profiling contract.
+
 ## Scope
 
 이 문서의 기준은 local source tree이다.
@@ -14,7 +20,8 @@
 | FireSim CLI main | `src/examples/firesim/llama-firesim-cli.cpp` | UART REPL, prompt 실행, benchmark, arrival benchmark |
 | FireSim CLI CMake | `src/examples/firesim/CMakeLists.txt` | `llama-firesim-cli` executable 정의 |
 | Gemmini backend API | `src/ggml/include/ggml-gemmini.h` | Gemmini backend/profiler/runtime API 선언 |
-| Gemmini backend implementation | `src/ggml/src/ggml-gemmini/ggml-gemmini.cpp` | ggml backend 등록, op admission, int8 conversion, Gemmini matmul, profiling output |
+| Gemmini backend implementation | `src/ggml/src/ggml-gemmini/ggml-gemmini.cpp` | BF16 Gemmini, VPU/Flash admission, CPU fallback, profiling output |
+| VPU/Flash adapter | `src/ggml/src/ggml-gemmini/ggml-gemmini-vpu.cpp` | nonlinear/RMSNorm/RoPE/FlashAttention staging과 exact-semantics 검증 |
 | model flow doc | `MODEL_EXECUTION_FLOW.md` | Gemma 3 270M layer별 수식과 matmul dimension |
 | old structure doc | `CODE_STRUCTURE.md` | workload/build/debug 중심 구조 설명 |
 
@@ -51,8 +58,10 @@ Gemmini software headers는 FireSim target-design 쪽을 써야 한다.
 sims/firesim/target-design/chipyard/generators/gemmini/software/gemmini-rocc-tests/include
 ```
 
-이 경로의 `gemmini_all.h`와 `gemmini_params.h`가 현재 bitstream의 `DIM`,
-scratchpad, accumulator 설정과 맞는다.
+빌드는 이 경로의 `gemmini_all.h`, `gemmini_params.h`, `vpu_params.h`와 VPU
+kernel을 직접 사용한다. software build는 `config_runtime.yaml` 또는 HWDB를
+검사하지 않으며, 실행할 bitstream과 생성 헤더의 일치 여부는 사용자가
+관리한다.
 
 ## Runtime Entry Points
 
@@ -74,9 +83,18 @@ exec /root/llama-firesim/llama-firesim-cli \
 
 | env | default | 의미 |
 | --- | --- | --- |
-| `GGML_GEMMINI_ACTIVE_MASK` | `0xf` | custom0..custom3 모두 사용 |
+| `GGML_GEMMINI_ACTIVE_MASK` | single `0x1`, multi `0xf` | 선택 profile의 logical Gemmini port 사용 |
 | `GGML_GEMMINI_MAX_OFFLOADS` | `-1` | eligible matmul offload 개수 제한 없음 |
-| `GGML_GEMMINI_PREPACK_WEIGHTS` | `1` | model weight를 load 직후 int8/repack cache로 선처리 |
+| `GGML_GEMMINI_PREPACK_WEIGHTS` | `1` | model weight를 load 직후 BF16 transpose/page-pack cache로 선처리 |
+| `GGML_GEMMINI_DIRECT_A` | `1` | dense row-major BF16 activation을 staging copy 없이 Gemmini A로 직접 사용 |
+| `GGML_GEMMINI_DIRECT_C` | `1` | dense FP32/C-unpacked matmul 결과를 임시 accumulator 없이 destination에 직접 저장 |
+| `GGML_GEMMINI_PAGE_PACKED_A` | `0` | 일반 `MUL_MAT`의 A packing 요청 |
+| `GGML_GEMMINI_PAGE_PACKED_B` | `1` | 일반 `MUL_MAT`의 B packing 요청 및 offline weight-pack layout |
+| `GGML_GEMMINI_PAGE_PACKED_C` | `0` | 일반 `MUL_MAT`의 C packing 요청 |
+| `GGML_GEMMINI_PAGE_PACKED_D` | `0` | 일반 `MUL_MAT`의 D packing 요청 |
+| `Flash_Q_PAGE_PACKED` | `0` | fused FlashAttention Q packing 요청; 일반 A와 독립 |
+| `Flash_K_PAGE_PACKED` | `1` | fused FlashAttention K packing 요청; 일반 B 및 V와 독립 |
+| `Flash_V_PAGE_PACKED` | `1` | fused FlashAttention V packing 요청; 일반 B 및 K와 독립 |
 | `GGML_GEMMINI_TRACE` | `0` | Gemmini admission/dispatch trace 비활성 |
 | `LLAMA_FIRESIM_BACKEND` | `gemmini` | hybrid Gemmini backend 사용 |
 | `LLAMA_FIRESIM_CTX_SIZE` | `2048` | llama context size |
@@ -221,10 +239,10 @@ CPU fallback으로 남는 대표 작업:
 | --- | --- |
 | tokenizer | `llama_decode()` 전에 CPU string/token 처리 |
 | embedding lookup | `GET_ROWS`, Gemmini backend op 아님 |
-| RMSNorm | elementwise/reduction op |
-| RoPE | pairwise rotation op |
+| 지원 조건 밖 RMSNorm/RoPE/nonlinear | VPU exact-semantics admission 실패 |
 | KV cache view/write/read | `VIEW`, `SET_ROWS`, cache management |
-| Flash attention / softmax | 현재 Gemmini backend 구현 없음 |
+| 임의 mask/SWA/ALiBi/softcap/sinks Flash attention | fused kernel 의미와 불일치 |
+| mask/bias/scale 조건 밖 softmax | VPU softmax 의미와 불일치 |
 | residual add, scale, GEGLU 일부 | elementwise op |
 | sampling | sampler chain CPU code |
 
@@ -265,10 +283,10 @@ Gemmini backend가 지원한다고 광고하는 op:
 | `GGML_GEMMINI_DISABLE`이 false | CPU-only mode 제외 |
 | `GGML_GEMMINI_ACTIVE_MASK != 0` | 사용할 custom accelerator 존재 |
 | op가 `GGML_OP_MUL_MAT` | 현재 dense matmul만 실제 compute 구현 |
-| `dst->type == GGML_TYPE_F32` 또는 `from_float_ref` 지원 | Gemmini int32 accumulator를 float row로 dequantize한 뒤 ggml output type으로 저장 가능 |
+| `dst->type == GGML_TYPE_F32` 또는 `from_float_ref` 지원 | Gemmini FP32 accumulator를 ggml output type으로 저장 가능 |
 | src/dst shape broadcast 조건 통과 | 현재 layout 제한 |
 | innermost stride가 contiguous | row conversion/repack 가능 |
-| `src0`, `src1`이 F32이거나 `to_float` 지원 | int8 quantization 전 float 변환 필요 |
+| `src0`, `src1`이 BF16/F32이거나 `to_float` 지원 | BF16 source는 직접 사용하고 나머지는 BF16-RNE encode 가능 |
 | `GGML_GEMMINI_MAX_OFFLOADS` 제한 통과 | debugging용 앞 N개만 offload 가능 |
 
 분기 call path:
@@ -286,27 +304,56 @@ llama_decode()
 
 ## Gemmini Data Conversion
 
-현재 Gemmini는 int8 input과 int accumulator path를 사용한다. 따라서 offload된
-ggml `MUL_MAT`은 Gemmini에 들어가기 전에 software에서 변환된다.
+현재 Gemmini는 BF16 input과 FP32 accumulator path를 사용한다. 따라서 offload된
+ggml `MUL_MAT`은 Gemmini에 들어가기 전에 필요한 layout과 BF16 encoding으로
+staging된다.
 
 ```text
 ggml src0/src1
-  -> tensor_row_to_float()
-  -> quantize_row_to_i8()
+  -> BF16 direct copy or tensor_row_to_float()
+  -> BF16-RNE encode + transpose/page-pack
   -> run_gemmini_matmul()
-  -> acc_t output
-  -> F32 rescale/writeback
+  -> FP32 acc_t output
+  -> layout conversion/writeback
 ```
 
 Operand mapping:
 
 | Gemmini operand | source | 처리 |
 | --- | --- | --- |
-| `A` | ggml `src1`, runtime activation | row-wise int8 quantization every call |
-| `B` | ggml `src0`, weight or intermediate | row-wise int8 repack |
-| `D` | zero bias buffer | all-zero `acc_t`, no fused bias |
-| `C` | temporary `acc_t` output | Gemmini int accumulation result |
-| ggml `dst` | final F32 tensor | `C * a_scale[row] * b_scale[col]` |
+| `A` | ggml `src1`, runtime activation | BF16-RNE encode, optional page-packed A |
+| `B` | ggml `src0`, weight or intermediate | BF16 K x J transpose, optional page-packed B |
+| `D` | bias input | `nullptr`, no fused bias |
+| `C` | temporary `acc_t` output | Gemmini FP32 accumulation result |
+| ggml `dst` | final F32 tensor | `C` layout conversion 후 저장 |
+
+Page-packing 환경변수는 요청값이다. 각 matmul의 실제 layout은 A/C/D의
+경우 `M > 1`, B의 경우 `K > 1`일 때만 page-packed가 되며, 그 이하에서는
+옵션이 켜져 있어도 row-major를 사용한다. v3 packed-weight 파일에서는
+전역 B layout과 섞이지 않도록 `K <= 1` entry를 생략하고 runtime GGUF
+fallback이 row-major BF16 cache를 만든다.
+
+fused FlashAttention은 일반 matmul의 A/B/C/D 요청을 재사용하지 않고 아래의
+독립 환경변수를 사용한다.
+
+| 환경변수 | 기본값 | FlashAttention buffer/layout | effective 조건 |
+| --- | --- | --- | --- |
+| `Flash_Q_PAGE_PACKED` | `0` | BF16 Q `[query_rows][q_dim]`, packed A layout | `query_rows > 1` |
+| `Flash_K_PAGE_PACKED` | `1` | BF16 K `[sequence][q_dim]`, packed B source layout | `q_dim > 1` |
+| `Flash_V_PAGE_PACKED` | `1` | BF16 V `[sequence][value_dim]`, packed B source layout | `sequence > 1` |
+| 해당 옵션 없음 | - | final FP32 output은 항상 row-major direct H_STORE | 항상 linear output |
+
+K는 원본 source layout으로 page-pack한 뒤 QK Gemmini job에서 transpose한다.
+adapter는 packed Q/K/V를 4096-byte aligned staging buffer에 만들고 kernel은
+`query_stride`, `key_stride`, `value_stride` 각각에 독립적으로 encoded layout과
+page-block offset을 각 Gemmini member에 전달한다. 따라서 K와 V packing 설정도
+서로 다를 수 있다. `GGML_GEMMINI_PAGE_PACKED_{A,B,C,D}`는 이 경로에 영향을
+주지 않는다. Q staging은 BF16 encode/packing만 수행하며 원소별 scale 곱셈은
+하지 않는다. adapter가 ggml의 양수 finite attention scale을
+`vpu_flashattention_config_t::score_scale`로 전달하고 VPU가 FP32 QK score에 직접
+적용한다. 0, 음수, NaN, Inf scale은 fused path admission에서 CPU fallback된다.
+online accumulator는 VSRAM 내부 상태이고, VPU는 final
+normalization 후 각 FP32 row를 최종 ggml destination 주소에 직접 기록한다.
 
 Static model weight로 분류되는 `src0`는 `weight_cache`에 repack 결과를 저장한다.
 runtime intermediate tensor는 stale data를 피하기 위해 매번 transient repack한다.
@@ -326,7 +373,7 @@ runtime intermediate tensor는 stale data를 피하기 위해 매번 transient r
 
 현재 all-eligible mode에서는 projection/FFN뿐 아니라 조건을 만족하는 다른
 `MUL_MAT`도 Gemmini 후보가 될 수 있다. attention score/value 같은 F32 intermediate
-matmul도 조건을 통과하면 int8로 재양자화되어 Gemmini로 들어간다.
+matmul도 조건을 통과하면 BF16-RNE로 encode되어 Gemmini로 들어간다.
 
 ## Gemmini Matmul Helper Path
 
@@ -335,9 +382,8 @@ matmul도 조건을 통과하면 int8로 재양자화되어 Gemmini로 들어간
 공통 준비:
 
 1. thread-local request config에서 `active_mask`, `gemmini_id`, `split_mode` 확인
-2. A/B/C/zero bias buffer prefault
-3. active mask에 대해 최초 1회 `gemmini_flush()`
-4. cycle start 기록
+2. active mask에 대해 최초 1회 `gemmini_flush()`
+3. cycle start 기록
 
 shared-multi path:
 
@@ -495,39 +541,68 @@ ask == false:
 
 `op_profile.csv`의 `wall_us/wall_cycles`는 이 callback 기반 op interval이다.
 Gemmini로 실행된 op는 `last_gemmini` state와 tensor pointer가 일치하면 backend가
-`gemmini`로 바뀐다.
+`gemmini_bf16`으로 바뀐다.
 
 Gemmini `MUL_MAT` row는 `wall_us/wall_cycles` 안을 다시 나눈 host-side 컬럼을
 가진다.
 
 | column | 의미 |
 | --- | --- |
-| `weight_prepare_us/cycles` | weight cache lookup 또는 lazy repack 준비 구간 |
-| `activation_quant_us/cycles` | `src1` activation을 float로 읽고 int8로 quantize하는 구간 |
-| `gemmini_call_us/cycles` | `run_gemmini_matmul()` 호출 구간. CPU quant/dequant를 제외한 accelerator dispatch/wait wall interval |
-| `output_dequant_store_us/cycles` | int32 accumulator를 scale/dequantize하고 `dst` type으로 저장하는 구간 |
+| `weight_cache_lookup_pack_us/cycles` | weight cache lookup 및 cache miss/transient weight의 BF16 transpose/page-pack 구간 |
+| `activation_stage_pack_us/cycles` | dense row-major BF16이면 `src1`을 direct A로 선택하고, 그 외에는 BF16-RNE staging 및 필요한 A-layout page-pack을 수행하는 구간 |
+| `gemmini_call_us/cycles` | `run_gemmini_matmul()` 호출 구간. host-side BF16 staging/store를 제외한 accelerator dispatch/wait wall interval |
+| `output_unpack_store_us/cycles` | FP32 accumulator layout을 풀어 `dst` type으로 저장하는 구간 |
 
 따라서 Gemmini offload 자체 wall time을 볼 때는 `wall_us`가 아니라
 `gemmini_call_us`를 우선 본다. `gemmini_total_cycles`와 하위 `gemmini_*_cycles`는
 Gemmini counter 기반 세부 cycle이며, counter가 비활성화된 run에서는 0일 수 있다.
 
-`summary.md`와 `backend_summary.csv`의 `Backend Split`에서는 Gemmini op를 raw
-`wall_us/wall_cycles` 그대로 집계하지 않는다. `gemmini` row는
-`gemmini_call_us/cycles`만 합산하고, 나머지 `wall - gemmini_call` 구간은
-`gemmini_host_overhead` row로 분리한다. 따라서 backend split에서 `gemmini`는
-CPU quantization/dequantization을 제외한 accelerator call interval을 의미한다.
+`summary.md`와 `backend_summary.csv`의 `Backend Split`은 `gemmini_bf16` op의 전체
+`wall_us/wall_cycles`를 집계한다. 별도의 `Backend Gemmini Breakdown` /
+`backend_gemmini_breakdown`이 위 host-side 구간과 Gemmini dispatch/run을 나누며,
+`other_host`가 전체 Gemmini op wall과 계측된 구간 사이의 차이를 닫는다.
+
+FlashAttention도 `mask_prepare`, `workspace_prepare`, `plan_preflight`,
+`input_pack`, `fused_attention_run`, `output_unpack_store`, `other_host`로 같은
+방식으로 표시한다. `input_validation` profiler 필드는 기존 CSV schema 호환을
+위해 남아 있지만 새 run에서는 0이다. `fused_attention_run`은 전체 fused
+QK/online-softmax/PV 실행 구간이며 내부 비율은 추정하지 않는다.
+
+| subphase | 측정 범위 |
+| --- | --- |
+| `input_validation` | 호환용 0 값. fast path는 Q/K/V finite를 전제로 하며 전수 검사하지 않음 |
+| `mask_prepare` | causal mask slice 검사와 query-base metadata 준비 |
+| `workspace_prepare` | input staging/causal workspace 크기 계산과 할당 |
+| `plan_preflight` | 각 batch/head의 FlashAttention plan 및 job preflight |
+| `input_pack` | Q/K/V BF16 staging과 각각 요청된 Flash Q/K/V page packing. Q에는 host-side scale을 곱하지 않음 |
+| `fused_attention_run` | `vpu_flashattention_auto()` 전체 실행 |
+| `output_unpack_store` | 현재 direct output에서는 0; 호환용 profiler 항목 |
+| `other_host` | backend op wall에서 위 실측 구간을 뺀 lock/control 등 나머지 시간 |
+
+실패하여 CPU fallback된 FlashAttention 시도는 성공한 accelerator backend row가
+아니므로 이 breakdown에 합산하지 않는다.
+
+FlashAttention fast path는 Q/K/V가 finite라고 가정한다. NaN/Inf가 들어오면
+전수 검사 기반 CPU fallback 없이 BF16 staging 또는 accelerator 결과로 전파될 수
+있다.
+
+FlashAttention score scale은 positive finite 값만 accelerator admission하며,
+ggml op의 값을 `vpu_flashattention_config_t::score_scale`로 그대로 전달한다.
+VPU가 QK FP32 score에 scale을 적용하므로 Q staging은 F32-to-BF16 변환만 하고
+과거의 `scale * sqrt(d)` 선행 보정은 하지 않는다.
 
 ### Repack Time
 
 Gemmini `src0` repack은 `populate_weight_cache_entry()`에서 별도 event로 기록된다.
 기본값에서는 model load 직후 `GGML_GEMMINI_PREPACK_WEIGHTS=1`로 model weight를
-미리 int8 quantize/repack해서 cache에 넣는다. 따라서 일반 prompt 실행 중에는
+미리 BF16 transpose/page-pack해서 cache에 넣는다. BF16 GGUF weight에는 수치
+변환이 없다. 따라서 일반 prompt 실행 중에는
 model weight repack이 다시 발생하지 않는다. `GGML_GEMMINI_PREPACK_WEIGHTS=0`이거나
 non-model/transient tensor면 기존처럼 첫 사용 시 lazy repack될 수 있다.
 
 ```text
 phase = "load/repack"
-backend = "gemmini"
+backend = "gemmini_bf16"
 op = "weight_repack"
 ```
 
@@ -597,7 +672,7 @@ Result files:
 | `token_trace.csv` | generated token id/piece |
 | `op_profile.csv` | ggml op-level events, phase/backend/stage/dim/time |
 | `stage_summary.csv` | stage별 aggregate |
-| `backend_summary.csv` | backend/phase/Gemmini subphase aggregate |
+| `backend_summary.csv` | backend/phase 및 Gemmini/FlashAttention subphase aggregate |
 | `arrival_request_summary.csv` | request별 arrival/start/finish/e2e/queue/service |
 | `arrival_mode_summary.csv` | group_seq vs split_1gem throughput/latency aggregate |
 | `arrival_stage_summary.csv` | arrival request별 stage aggregate |
@@ -606,8 +681,9 @@ Result files:
 ## How To Interpret Percentages
 
 현재 `summary.md`의 phase/stage percent는 `op_profile.csv` event들을 집계한
-runtime breakdown이다. `Backend Split`은 Gemmini op를 `gemmini` accelerator call과
-`gemmini_host_overhead`로 나눠서 집계한다.
+runtime breakdown이다. `Backend Split`은 backend별 전체 op wall을 집계하고,
+Gemmini와 FlashAttention의 측정 가능한 내부 구간은 각각 별도 breakdown으로
+표시한다.
 
 따라서 아래 현상은 현재 코드에서 가능하다.
 
@@ -620,7 +696,7 @@ stage percent > 100%
 
 1. `load/repack` event가 Gemmini `MUL_MAT` op wall time 안에서 발생하지만 별도 event로도 기록된다.
 2. `stage_summary.csv`는 runtime op의 `wall_us`를 stage별로 합산한다.
-3. `backend_summary.csv`의 `gemmini_host_overhead`는 Gemmini op wall에서 `gemmini_call`을 뺀 나머지 backend-side overhead이다.
+3. `backend_summary.csv`의 `backend_gemmini_breakdown`과 `backend_flash_attention_breakdown`은 각 backend op wall을 실측 구간과 `other_host`로 나눈다.
 4. `stage`는 backend 이름이 아니라 profiler의 op bucket이다. Projection matmul,
    ROPE, reshape/permute, KV cache, norm, residual 등으로 세분화하며,
    분류되지 않은 CPU op만 `other_cpu`로 남긴다.
@@ -647,9 +723,9 @@ wall time에서 repack 시간을 빼거나, phase/backend/stage 집계를 non-ov
 | `:ctx-size [N|max]` | context size 조회/변경, current model max 확인 |
 | `:n-predict [N|max]` | generated token 기본값 조회/변경, current context 기준 max 확인 |
 | `:backend [gemmini|cpu]` | backend 조회 또는 CPU-only/hybrid run 선택 |
-| `:gemmini-mode [multi|single]` | multi shared path 또는 single custom3 reduced-bank-conflict path 선택 |
-| `:active-mask 0x1` | custom0만 사용 |
-| `:active-mask 0xf` | custom0..custom3 사용 |
+| `:gemmini-mode [multi|single]` | 조회 또는 compiled profile과 같은 값만 허용 |
+| `:active-mask 0x1` | logical member 0; single은 physical custom3, multi는 custom0 |
+| `:active-mask 0xf` | multi에서 logical member 0..3; single에서는 거부 |
 | `:prompt-tokens P [N]` | 정확히 P개 token synthetic prompt를 N개 decode token으로 실행 |
 | `:max-offloads N` | request마다 처음 N개 eligible matmul만 offload |
 | `:trace 1` | `GEMMINI-ADMIT`, `GEMMINI-DISPATCH`, tiling trace 출력 |
@@ -666,14 +742,14 @@ CPU/Gemmini path를 확인할 때 볼 순서:
 4. `GEMMINI-RUN-BEGIN`이 나오면 `run_gemmini_matmul()` 진입
 5. `GEMMINI-RUN-CALL`이 나오면 helper 호출 직전
 6. `GEMMINI-RUN-END`가 나오면 helper loop와 `gemmini_fence()` 통과
-7. `op_profile.csv`에 backend `gemmini` event가 있으면 callback 종료까지 완료
+7. `op_profile.csv`에 backend `gemmini_bf16` event가 있으면 callback 종료까지 완료
 
 멈춤 위치별 의미:
 
 | 마지막 trace | 가능성 |
 | --- | --- |
 | `GEMMINI-ADMIT`만 있음 | scheduler admission 후 graph compute 전 또는 첫 op 진입 전 |
-| `GEMMINI-DISPATCH`까지 있음 | quantization/repack 이후 helper 전후 문제 |
+| `GEMMINI-DISPATCH`까지 있음 | BF16 staging/packing 이후 helper 전후 문제 |
 | `GEMMINI-RUN-CALL`까지 있음 | `shared_multi_tiled_matmul_job_init/step` 또는 `tiled_matmul_auto` 내부 장시간 실행/정지 |
 | `GEMMINI-RUN-END` 없음 | Gemmini helper loop 또는 fence가 끝나지 않음 |
 | `GEMMINI-RUN-END` 있음, op_profile 없음 | callback 종료 전후 runtime 문제 |

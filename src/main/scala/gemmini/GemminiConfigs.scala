@@ -66,6 +66,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
 
                                                                              tlb_size: Int = 4,
                                                                              use_tlb_register_filter: Boolean = true,
+                                                                             n_dma_engines: Int = 1,
                                                                              max_in_flight_mem_reqs: Int = 16,
 
                                                                              ex_read_from_spad: Boolean = true,
@@ -104,6 +105,9 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
 
                                                                              headerFileName: String = "gemmini_params.h"
                                                        ) {
+  require(n_dma_engines > 0, "Gemmini must have at least one DMA engine")
+  require(max_in_flight_mem_reqs > 0,
+    "Each Gemmini DMA engine must support at least one in-flight request")
   require(!use_vpu_fusion || ex_write_to_acc,
     "Gemmini/VPU fusion requires accumulator execute writes")
   require(!use_vpu_fusion || dataflow == Dataflow.WS,
@@ -111,6 +115,11 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
   require(!use_vpu_fusion ||
     spatialArrayOutputType.getWidth == accType.getWidth,
     "Gemmini/VPU fusion requires full-precision spatial partial sums")
+
+  // max_in_flight_mem_reqs is the capacity of one DMA lane. Controllers and
+  // command-ID fields need the aggregate capacity across every lane.
+  val total_max_in_flight_mem_reqs =
+    n_dma_engines * max_in_flight_mem_reqs
 
   val sp_width = meshColumns * tileColumns * inputType.getWidth
   val sp_bank_entries = sp_capacity match {

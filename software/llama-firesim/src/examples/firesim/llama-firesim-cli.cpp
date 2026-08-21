@@ -1,4 +1,6 @@
 #include "ggml-gemmini.h"
+#include "ggml-gemmini-pack.h"
+#include "ggml-gemmini-weight-select.h"
 #include "ggml.h"
 #include "llama.h"
 
@@ -30,6 +32,7 @@
 #endif
 
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
+uint8_t llama_internal_get_tensor_usage(const llama_model * model, const char * name);
 
 namespace fs = std::filesystem;
 
@@ -59,6 +62,13 @@ static bool env_flag(const char * name, bool fallback) {
         return false;
     }
     return true;
+}
+
+static bool flash_env_flag(const char * requested_name, const char * uppercase_alias, bool fallback) {
+    if (std::getenv(requested_name) != nullptr) {
+        return env_flag(requested_name, fallback);
+    }
+    return env_flag(uppercase_alias, fallback);
 }
 
 static int32_t parse_int32_exact(const std::string & value) {
@@ -103,7 +113,11 @@ static bool parse_bool_value(const std::string & value) {
     throw std::runtime_error("invalid boolean");
 }
 
-static void configure_memory_locking() {
+static bool memory_locking_enabled() {
+    return env_flag("LLAMA_FIRESIM_MLOCK", true);
+}
+
+static void configure_memory_lock_limit() {
     if (!env_flag("LLAMA_FIRESIM_MLOCK", true)) {
         std::cout << "MLOCKALL-DISABLED\n";
         std::cout.flush();
@@ -118,6 +132,57 @@ static void configure_memory_locking() {
         if (setrlimit(RLIMIT_MEMLOCK, &raised) != 0) {
             std::perror("setrlimit(RLIMIT_MEMLOCK) failed");
         }
+    }
+
+    std::cout << "MLOCK-LIMIT-READY\n";
+    std::cout.flush();
+#else
+    std::cout << "MLOCKALL-UNSUPPORTED\n";
+    std::cout.flush();
+#endif
+}
+
+static void configure_loaded_memory_locking(const llama_model * model) {
+    if (!memory_locking_enabled()) {
+        return;
+    }
+
+#if defined(__linux__)
+    if (ggml_gemmini_hybrid_sparse_mode()) {
+        uint64_t canonical_bytes = 0;
+        const auto & tensors = llama_internal_get_tensor_map(model);
+        for (const auto & item : tensors) {
+            const ggml_tensor * tensor = item.second;
+            const unsigned usage = llama_internal_get_tensor_usage(model, item.first.c_str());
+            const auto role = ggml_gemmini_classify_weight_usage(usage);
+            if (!ggml_gemmini_weight_role_requires_original(role)) {
+                continue;
+            }
+            const size_t bytes = ggml_nbytes(tensor);
+            if (bytes != 0 && mlock(tensor->data, bytes) != 0) {
+                std::perror("mlock canonical hybrid tensor failed");
+                if (env_flag("LLAMA_FIRESIM_MLOCK_STRICT", false)) {
+                    throw std::runtime_error("failed to lock canonical hybrid tensor");
+                }
+            } else {
+                canonical_bytes += bytes;
+            }
+        }
+        if (ggml_gemmini_weight_cache_mlock() != 0) {
+            std::perror("mlock Gemmini weight cache failed");
+            if (env_flag("LLAMA_FIRESIM_MLOCK_STRICT", false)) {
+                throw std::runtime_error("failed to lock Gemmini weight cache");
+            }
+        }
+        if (mlockall(MCL_FUTURE) != 0) {
+            std::perror("mlockall(MCL_FUTURE) failed");
+            if (env_flag("LLAMA_FIRESIM_MLOCK_STRICT", false)) {
+                throw std::runtime_error("mlockall(MCL_FUTURE) failed");
+            }
+        }
+        std::cout << "MLOCK-HYBRID-OK,canonical_bytes=" << canonical_bytes << "\n";
+        std::cout.flush();
+        return;
     }
 
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
@@ -138,6 +203,25 @@ static void configure_memory_locking() {
 #endif
 }
 
+static bool read_hybrid_model_footer(
+        const std::string & path,
+        ggml_gemmini_hybrid_footer & footer) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        return false;
+    }
+    input.seekg(0, std::ios::end);
+    const std::streamoff size = input.tellg();
+    if (size < static_cast<std::streamoff>(sizeof(footer))) {
+        return false;
+    }
+    input.seekg(size - static_cast<std::streamoff>(sizeof(footer)));
+    input.read(reinterpret_cast<char *>(&footer), sizeof(footer));
+    return input && std::memcmp(
+        footer.magic, GGML_GEMMINI_HYBRID_FOOTER_MAGIC,
+        GGML_GEMMINI_HYBRID_FOOTER_MAGIC_SIZE) == 0;
+}
+
 static std::atomic<bool> abort_requested = false;
 
 static void signal_handler(int signo) {
@@ -151,7 +235,8 @@ static constexpr const char * DEFAULT_MODEL_PATH = "/root/models/model.gguf";
 struct options {
     std::string model_path = DEFAULT_MODEL_PATH;
     std::string backend = "gemmini";
-    std::string gemmini_mode = "multi";
+    // Empty means the mode compiled into the selected hardware profile.
+    std::string gemmini_mode;
     std::string results_dir = "/root/llama-results";
     std::string prompt;
     int32_t n_ctx = 2048;
@@ -167,9 +252,13 @@ struct options {
     int page_packed_b = -1;
     int page_packed_c = -1;
     int page_packed_d = -1;
+    int flash_q_page_packed = -1;
+    int flash_k_page_packed = -1;
+    int flash_v_page_packed = -1;
     bool benchmark = false;
     bool arrival_benchmark = false;
     bool sweep = false;
+    bool sweep_masks_explicit = false;
     bool interactive = false;
     bool smoke_only = false;
 };
@@ -190,6 +279,7 @@ static void print_usage(const char * argv0) {
         << "usage: " << argv0 << " [--backend gemmini|cpu] [--gemmini-mode multi|single] [--ctx-size N]\n"
         << "       [--n-predict N] [--results-dir DIR] [--prompt TEXT] [--benchmark] [--arrival-benchmark] [--sweep] [--interactive]\n"
         << "       [--gemmini-page-packed-a BOOL] [--gemmini-page-packed-b BOOL] [--gemmini-page-packed-c BOOL] [--gemmini-page-packed-d BOOL]\n"
+        << "       [--flash-q-page-packed BOOL] [--flash-k-page-packed BOOL] [--flash-v-page-packed BOOL]\n"
         << "       [--sweep-prompt-min N] [--sweep-prompt-max N] [--sweep-prompt-step N] [--sweep-masks MASK[,MASK...]]\n"
         << "       " << argv0 << " --gemmini-smoke [M N K]\n";
 }
@@ -232,6 +322,12 @@ static options parse_args(int argc, char ** argv) {
             opts.page_packed_c = parse_bool_value(argv[++i]) ? 1 : 0;
         } else if (arg == "--gemmini-page-packed-d" && i + 1 < argc) {
             opts.page_packed_d = parse_bool_value(argv[++i]) ? 1 : 0;
+        } else if (arg == "--flash-q-page-packed" && i + 1 < argc) {
+            opts.flash_q_page_packed = parse_bool_value(argv[++i]) ? 1 : 0;
+        } else if (arg == "--flash-k-page-packed" && i + 1 < argc) {
+            opts.flash_k_page_packed = parse_bool_value(argv[++i]) ? 1 : 0;
+        } else if (arg == "--flash-v-page-packed" && i + 1 < argc) {
+            opts.flash_v_page_packed = parse_bool_value(argv[++i]) ? 1 : 0;
         } else if (arg == "--ctx-size" && i + 1 < argc) {
             opts.n_ctx = std::stoi(argv[++i]);
         } else if (arg == "--n-predict" && i + 1 < argc) {
@@ -254,6 +350,7 @@ static options parse_args(int argc, char ** argv) {
             opts.sweep_prompt_step = std::stoi(argv[++i]);
         } else if (arg == "--sweep-masks" && i + 1 < argc) {
             opts.sweep_masks = parse_mask_list(argv[++i]);
+            opts.sweep_masks_explicit = true;
         } else if (arg == "--interactive") {
             opts.interactive = true;
         } else if (arg == "--gemmini-smoke") {
@@ -273,7 +370,7 @@ static options parse_args(int argc, char ** argv) {
 	        throw std::runtime_error("--backend must be gemmini or cpu");
 	    }
 
-        if (opts.gemmini_mode != "multi" && opts.gemmini_mode != "single") {
+        if (!opts.gemmini_mode.empty() && opts.gemmini_mode != "multi" && opts.gemmini_mode != "single") {
             throw std::runtime_error("--gemmini-mode must be multi or single");
         }
 
@@ -301,6 +398,9 @@ static void apply_page_packing_options(const options & opts) {
         {"GGML_GEMMINI_PAGE_PACKED_B", opts.page_packed_b},
         {"GGML_GEMMINI_PAGE_PACKED_C", opts.page_packed_c},
         {"GGML_GEMMINI_PAGE_PACKED_D", opts.page_packed_d},
+        {"Flash_Q_PAGE_PACKED", opts.flash_q_page_packed},
+        {"Flash_K_PAGE_PACKED", opts.flash_k_page_packed},
+        {"Flash_V_PAGE_PACKED", opts.flash_v_page_packed},
     };
 
     for (const auto & item : values) {
@@ -324,6 +424,9 @@ static bool eval_callback(ggml_tensor * t, bool ask, void * user_data) {
     const bool profiler_enabled = ggml_gemmini_profiler_is_enabled();
 
     if (ask) {
+        if (!state->cpu_baseline && ggml_gemmini_should_defer_eval(t)) {
+            return false;
+        }
         if (profiler_enabled) {
             ggml_gemmini_profiler_eval_begin(t, read_cycles_local(), ggml_time_us());
         }
@@ -372,13 +475,47 @@ public:
             }
         }, nullptr);
 
-        configure_memory_locking();
+        configure_memory_lock_limit();
+
+        const std::string compiled_mode = ggml_gemmini_compiled_profile_name();
+        if (opts_.gemmini_mode.empty()) {
+            opts_.gemmini_mode = compiled_mode;
+        } else if (opts_.gemmini_mode != compiled_mode) {
+            throw std::runtime_error(
+                "requested gemmini mode '" + opts_.gemmini_mode +
+                "' does not match compiled profile '" + compiled_mode + "'");
+        }
+        if (compiled_mode == "single" && !opts_.sweep_masks_explicit) {
+            opts_.sweep_masks = {0x1};
+        }
+        if (std::getenv("GGML_GEMMINI_ACTIVE_MASK") == nullptr) {
+            const std::string default_mask = std::to_string(ggml_gemmini_default_active_mask());
+            ::setenv("GGML_GEMMINI_ACTIVE_MASK", default_mask.c_str(), 1);
+        }
+        const int32_t configured_mask = env_int32(
+            "GGML_GEMMINI_ACTIVE_MASK", ggml_gemmini_default_active_mask());
+        const int32_t supported_mask = ggml_gemmini_default_active_mask();
+        if (configured_mask < 0 || (configured_mask & ~supported_mask) != 0) {
+            std::ostringstream error;
+            error << "GGML_GEMMINI_ACTIVE_MASK=0x" << std::hex << configured_mask
+                  << " exceeds compiled profile mask 0x" << supported_mask;
+            throw std::runtime_error(error.str());
+        }
+
+        std::cout << "GEMMINI-HW-PROFILE,name=" << compiled_mode
+                  << ",logical_default_mask=0x" << std::hex
+                  << ggml_gemmini_default_active_mask() << std::dec << "\n";
 
         std::cout << "GEMMINI-PAGE-PACKING,A="
                   << (env_flag("GGML_GEMMINI_PAGE_PACKED_A", false) ? 1 : 0)
                   << ",B=" << (env_flag("GGML_GEMMINI_PAGE_PACKED_B", false) ? 1 : 0)
                   << ",C=" << (env_flag("GGML_GEMMINI_PAGE_PACKED_C", false) ? 1 : 0)
                   << ",D=" << (env_flag("GGML_GEMMINI_PAGE_PACKED_D", false) ? 1 : 0)
+                  << "\n";
+        std::cout << "FLASH-PAGE-PACKING,Q="
+                  << (flash_env_flag("Flash_Q_PAGE_PACKED", "FLASH_Q_PAGE_PACKED", false) ? 1 : 0)
+                  << ",K=" << (flash_env_flag("Flash_K_PAGE_PACKED", "FLASH_K_PAGE_PACKED", true) ? 1 : 0)
+                  << ",V=" << (flash_env_flag("Flash_V_PAGE_PACKED", "FLASH_V_PAGE_PACKED", true) ? 1 : 0)
                   << "\n";
         std::cout.flush();
 
@@ -387,10 +524,12 @@ public:
 	        fs::create_directories(opts_.results_dir);
 
 	        if (opts_.smoke_only) {
+	            configure_loaded_memory_locking(nullptr);
 	            return;
 	        }
 
 	        load_model(opts_.model_path, false);
+            configure_loaded_memory_locking(model_);
 	    }
 
     ~app() {
@@ -402,11 +541,11 @@ public:
 
     int run() {
         if (opts_.smoke_only) {
-            ggml_gemmini_runtime_configure_request(
-                env_int32("GGML_GEMMINI_ACTIVE_MASK", 0xf) & 0xf,
-                -1,
-                false,
-                opts_.gemmini_mode == "single");
+            if (!ggml_gemmini_runtime_configure_request(
+                    env_int32("GGML_GEMMINI_ACTIVE_MASK", ggml_gemmini_default_active_mask()),
+                    -1, false)) {
+                throw std::runtime_error("invalid logical Gemmini request configuration");
+            }
             const int status = ggml_gemmini_smoke_matmul(
                 opts_.smoke_rows,
                 opts_.smoke_cols_out,
@@ -480,6 +619,11 @@ public:
 	            if (line.rfind(":backend ", 0) == 0) {
 	                const std::string value = line.substr(std::strlen(":backend "));
 	                if (value == "gemmini" || value == "cpu") {
+                    if (value == "cpu" && ggml_gemmini_hybrid_sparse_mode()) {
+                        std::cout << "CPU backend requires the original full GGUF; hybrid sparse model unchanged\n";
+                        std::cout.flush();
+                        continue;
+                    }
                     opts_.backend = value;
                     std::cout << "backend set to " << opts_.backend << "\n";
                 } else {
@@ -709,7 +853,6 @@ private:
         int32_t active_mask = -1;
         int32_t gemmini_id = -1;
         bool split_mode = false;
-        bool single_mode = false;
     };
 
 	    struct prompt_payload {
@@ -780,25 +923,15 @@ private:
         return out.str();
     }
 
-    static int32_t single_mask_from(int32_t active_mask, int32_t gemmini_id) {
-        (void) active_mask;
-        (void) gemmini_id;
-        return 0x8;
-    }
-
     int32_t current_run_gemmini_mask(bool cpu_baseline, const request_gemmini_config * request_config) const {
         if (cpu_baseline) {
             return 0;
         }
-        const bool single_mode = request_config != nullptr ?
-            request_config->single_mode : opts_.gemmini_mode == "single";
         if (request_config != nullptr) {
-            return single_mode ?
-                single_mask_from(request_config->active_mask, request_config->gemmini_id) :
-                request_config->active_mask & 0xf;
+            return request_config->active_mask & ggml_gemmini_default_active_mask();
         }
-        const int32_t mask = env_int32("GGML_GEMMINI_ACTIVE_MASK", 0xf) & 0xf;
-        return single_mode ? single_mask_from(mask, -1) : mask;
+        return env_int32("GGML_GEMMINI_ACTIVE_MASK", ggml_gemmini_default_active_mask()) &
+            ggml_gemmini_default_active_mask();
     }
 
     void publish_summary_metadata() const {
@@ -829,36 +962,42 @@ private:
 	        return false;
 	    }
 
-	    gemmini_prepack_result prepack_gemmini_weights() {
+	    gemmini_prepack_result prepack_gemmini_weights(
+                bool pack_loaded,
+                int32_t pack_entries,
+                const std::string & pack_path) {
 	        gemmini_prepack_result result;
 	        result.enabled = env_flag("GGML_GEMMINI_PREPACK_WEIGHTS", true);
 	        if (!result.enabled || model_ == nullptr) {
 	            return result;
 	        }
+	        result.pack_loaded = pack_loaded;
+	        result.pack_entries = pack_entries;
+	        result.pack_path = pack_path;
 
 	        const uint64_t start_cycles = read_cycles_local();
 	        const int64_t start_us = ggml_time_us();
 
-            ggml_gemmini_weight_pack_clear();
-            result.pack_path = gemmini_weight_pack_path();
-            if (!result.pack_path.empty() && fs::exists(result.pack_path)) {
-                const int loaded = ggml_gemmini_weight_pack_load(result.pack_path.c_str());
-                if (loaded >= 0) {
-                    result.pack_loaded = true;
-                    result.pack_entries = loaded;
-                } else {
-                    std::cout << "GEMMINI-WEIGHT-PACK-ERROR,path=" << result.pack_path << "\n";
-                    std::cout.flush();
-                }
-            }
-
 	        const auto & tensors = llama_internal_get_tensor_map(model_);
 	        for (const auto & item : tensors) {
-	            const int slices = ggml_gemmini_prepack_weight(item.second);
+	            const unsigned usage = llama_internal_get_tensor_usage(model_, item.first.c_str());
+	            if (usage == 0) {
+	                throw std::runtime_error(
+	                    "missing operator-role metadata for model tensor: " + item.first);
+	            }
+	            const auto role = ggml_gemmini_classify_weight_usage(usage);
+	            const int slices = ggml_gemmini_prepack_weight(item.second, role);
+	            if (slices < 0) {
+	                throw std::runtime_error(
+	                    "failed to bind required Gemmini weight pack tensor: " + item.first);
+	            }
 	            if (slices > 0) {
 	                ++result.tensors;
 	                result.slices += slices;
 	            }
+	        }
+	        if (ggml_gemmini_weight_pack_finalize() != 0) {
+	            throw std::runtime_error("Gemmini weight pack contains unbound or mismatched entries");
 	        }
 
 	        result.wall_us = ggml_time_us() - start_us;
@@ -870,20 +1009,57 @@ private:
 	        uint64_t load_cycles_start = read_cycles_local();
 	        const int64_t load_us_start = ggml_time_us();
 
+	        ggml_gemmini_weight_cache_clear();
+	        ggml_gemmini_weight_pack_clear();
+	        const bool prepack_enabled = env_flag("GGML_GEMMINI_PREPACK_WEIGHTS", true);
+	        const std::string pack_path = gemmini_weight_pack_path();
+	        int32_t pack_entries = 0;
+	        bool pack_loaded = false;
+	        if (prepack_enabled && !pack_path.empty() && fs::exists(pack_path)) {
+	            pack_entries = ggml_gemmini_weight_pack_load(pack_path.c_str());
+	            if (pack_entries < 0) {
+	                throw std::runtime_error("failed to load Gemmini weight pack: " + pack_path);
+	            }
+	            pack_loaded = true;
+	        }
+
+	        ggml_gemmini_hybrid_footer footer = {};
+	        const bool has_hybrid_footer = read_hybrid_model_footer(path, footer);
+	        if (ggml_gemmini_hybrid_sparse_mode()) {
+	            if (!has_hybrid_footer || footer.model_fingerprint !=
+	                    ggml_gemmini_weight_pack_model_fingerprint()) {
+	                throw std::runtime_error(
+	                    "hybrid sparse GGUF and Gemmini weight pack fingerprint mismatch");
+	            }
+	            ::setenv("LLAMA_FIRESIM_HYBRID_SPARSE_GGUF", "1", 1);
+	            if (opts_.backend != "gemmini" || env_flag("GGML_GEMMINI_DISABLE", false) ||
+	                    env_int32("GGML_GEMMINI_ACTIVE_MASK", ggml_gemmini_default_active_mask()) == 0 ||
+	                    env_int32("GGML_GEMMINI_MAX_OFFLOADS", -1) != -1) {
+	                throw std::runtime_error(
+	                    "hybrid sparse GGUF requires Gemmini backend, nonzero mask, and max-offloads=-1");
+	            }
+	        } else {
+	            ::unsetenv("LLAMA_FIRESIM_HYBRID_SPARSE_GGUF");
+	            if (has_hybrid_footer) {
+	                throw std::runtime_error(
+	                    "hybrid sparse GGUF requires its v4 Gemmini weight pack");
+	            }
+	        }
+
 	        llama_model_params model_params = llama_model_default_params();
 	        llama_model * loaded = llama_model_load_from_file(path.c_str(), model_params);
 	        if (loaded == nullptr) {
 	            throw std::runtime_error("failed to load model: " + path);
 	        }
 
-	        ggml_gemmini_weight_cache_clear();
 	        if (model_ != nullptr) {
 	            llama_model_free(model_);
 	        }
 	        model_ = loaded;
 	        opts_.model_path = path;
 
-	        const gemmini_prepack_result prepack = prepack_gemmini_weights();
+	        const gemmini_prepack_result prepack = prepack_gemmini_weights(
+	            pack_loaded, pack_entries, pack_path);
 	        if (prepack.enabled) {
                 if (prepack.pack_loaded) {
                     std::cout << "GEMMINI-WEIGHT-PACK-LOADED,path=" << prepack.pack_path
@@ -941,13 +1117,15 @@ private:
 	    }
 
 	    void print_active_mask() const {
-	        const int32_t mask = env_int32("GGML_GEMMINI_ACTIVE_MASK", 0xf) & 0xf;
+	        const int32_t mask = env_int32("GGML_GEMMINI_ACTIVE_MASK", ggml_gemmini_default_active_mask()) &
+	            ggml_gemmini_default_active_mask();
 	        std::cout << "ACTIVE-MASK,current=0x" << std::hex << mask << std::dec << "\n";
 	        std::cout.flush();
 	    }
 
 	    void print_gemmini_mode() const {
-	        std::cout << "GEMMINI-MODE,current=" << opts_.gemmini_mode << "\n";
+	        std::cout << "GEMMINI-MODE,current=" << opts_.gemmini_mode
+	                  << ",compiled=" << ggml_gemmini_compiled_profile_name() << "\n";
 	        std::cout.flush();
 	    }
 
@@ -1006,8 +1184,15 @@ private:
 
 	    void set_active_mask(const std::string & value) {
 	        const int32_t mask = parse_int32_exact(value);
-	        if (mask < 0 || mask > 0xf) {
-	            throw std::runtime_error("active-mask must be in [0, 0xf]");
+	        const int32_t supported_mask = ggml_gemmini_default_active_mask();
+	        if (mask < 0 || (mask & ~supported_mask) != 0) {
+	            std::ostringstream error;
+	            error << "active-mask must be a subset of compiled profile mask 0x"
+	                  << std::hex << supported_mask;
+	            throw std::runtime_error(error.str());
+	        }
+	        if (mask == 0 && ggml_gemmini_hybrid_sparse_mode()) {
+	            throw std::runtime_error("hybrid sparse GGUF requires a nonzero active mask");
 	        }
 
 	        std::ostringstream formatted;
@@ -1021,6 +1206,11 @@ private:
 	        if (value != "multi" && value != "single") {
 	            throw std::runtime_error("gemmini-mode must be multi or single");
 	        }
+	        if (value != ggml_gemmini_compiled_profile_name()) {
+	            throw std::runtime_error(
+	                "gemmini-mode does not match compiled hardware profile '" +
+	                std::string(ggml_gemmini_compiled_profile_name()) + "'");
+	        }
 	        opts_.gemmini_mode = value;
 	        print_gemmini_mode();
 	    }
@@ -1029,6 +1219,10 @@ private:
 	        const int32_t max_offloads = parse_int32_exact(value);
 	        if (max_offloads < -1) {
 	            throw std::runtime_error("max-offloads must be >= -1");
+	        }
+	        if (ggml_gemmini_hybrid_sparse_mode() && max_offloads != -1) {
+	            throw std::runtime_error(
+	                "hybrid sparse GGUF requires max-offloads=-1");
 	        }
 
 	        const std::string env_value = std::to_string(max_offloads);
@@ -1115,24 +1309,28 @@ private:
             int32_t n_predict,
             const request_gemmini_config * request_config = nullptr,
             bool quiet = false) {
+        if (ggml_gemmini_hybrid_sparse_mode() && cpu_baseline) {
+            throw std::runtime_error(
+                "CPU backend is unavailable for a hybrid sparse GGUF; use the original full GGUF");
+        }
         if (request_config == nullptr) {
             set_backend_mode(cpu_baseline);
-            if (!cpu_baseline && opts_.gemmini_mode == "single") {
-                ggml_gemmini_runtime_configure_request(
-                    0x8,
-                    3,
-                    false,
-                    true);
+            if (!cpu_baseline) {
+                if (!ggml_gemmini_runtime_configure_request(
+                        current_run_gemmini_mask(false, nullptr), -1, false)) {
+                    throw std::runtime_error("invalid logical Gemmini request configuration");
+                }
             } else {
                 ggml_gemmini_runtime_clear_request();
             }
         } else {
             ::unsetenv("GGML_GEMMINI_DISABLE");
-            ggml_gemmini_runtime_configure_request(
-                request_config->active_mask,
-                request_config->gemmini_id,
-                request_config->split_mode,
-                request_config->single_mode);
+            if (!ggml_gemmini_runtime_configure_request(
+                    request_config->active_mask,
+                    request_config->gemmini_id,
+                    request_config->split_mode)) {
+                throw std::runtime_error("invalid logical Gemmini request configuration");
+            }
         }
         abort_requested.store(false, std::memory_order_relaxed);
 
@@ -1170,6 +1368,13 @@ private:
         ctx_params.cb_eval_user_data = &eval_state_;
         ctx_params.abort_callback = decode_abort_callback;
         ctx_params.abort_callback_data = nullptr;
+
+        // fused attention
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+
+        // KV cache precision
+        ctx_params.type_k = GGML_TYPE_BF16;
+        ctx_params.type_v = GGML_TYPE_BF16;
 
         llama_context * ctx = llama_init_from_model(model_, ctx_params);
         if (ctx == nullptr) {
@@ -1347,8 +1552,12 @@ private:
         return run_once(tokenize_prompt(prompt), run_label, cpu_baseline, n_predict);
     }
 
-    void run_command(const std::string & prompt, int32_t n_predict, bool benchmark) {
-        const int32_t prompt_index = prompt_run_index_++;
+	    void run_command(const std::string & prompt, int32_t n_predict, bool benchmark) {
+	        if (benchmark && ggml_gemmini_hybrid_sparse_mode()) {
+	            throw std::runtime_error(
+	                "CPU comparison benchmark requires the original full GGUF");
+	        }
+	        const int32_t prompt_index = prompt_run_index_++;
         ggml_gemmini_profiler_note_model_load(model_load_us_, model_load_cycles_);
 
         if (benchmark) {
@@ -1473,6 +1682,13 @@ private:
     void run_prompt_token_sweep() {
         if (opts_.backend != "gemmini") {
             throw std::runtime_error("--sweep requires --backend gemmini");
+        }
+        if (ggml_gemmini_compiled_profile() == GGML_GEMMINI_HW_PROFILE_SINGLE_1X16) {
+            for (int32_t mask : opts_.sweep_masks) {
+                if (mask != 0x0 && mask != 0x1) {
+                    throw std::runtime_error("single profile sweep accepts only logical masks 0x0 and 0x1");
+                }
+            }
         }
 
         ggml_gemmini_profiler_reset();
@@ -1693,7 +1909,7 @@ private:
         if (!out) {
             throw std::runtime_error("failed to write arrival_stage_summary.csv");
         }
-        out << "mode,request_id,run_label,stage,total_us,total_cycles,pct_of_runtime_breakdown\n";
+        out << "mode,request_id,run_label,phase,stage,total_us,total_cycles,pct_of_phase\n";
         if (!in) {
             return;
         }
@@ -1707,7 +1923,7 @@ private:
             while (std::getline(ss, field, ',')) {
                 fields.push_back(field);
             }
-            if (fields.size() < 5) {
+            if (fields.size() < 6) {
                 continue;
             }
             auto it = by_label.find(fields[0]);
@@ -1720,7 +1936,8 @@ private:
                 << fields[1] << ","
                 << fields[2] << ","
                 << fields[3] << ","
-                << fields[4] << "\n";
+                << fields[4] << ","
+                << fields[5] << "\n";
         }
     }
 
@@ -1765,6 +1982,9 @@ private:
     }
 
     void run_arrival_benchmark(int32_t n_predict) {
+        if (ggml_gemmini_compiled_profile() != GGML_GEMMINI_HW_PROFILE_MULTI_4X8) {
+            throw std::runtime_error("arrival benchmark requires the compiled multi profile");
+        }
         constexpr int32_t request_count = 4;
         constexpr int32_t prompt_tokens = 256;
         constexpr int64_t interval_us = 1000000;
@@ -1782,7 +2002,7 @@ private:
 
         ggml_gemmini_profiler_reset();
         ggml_gemmini_profiler_note_model_load(model_load_us_, model_load_cycles_);
-        request_gemmini_config warmup_cfg{0xf, -1, false, false};
+        request_gemmini_config warmup_cfg{0xf, -1, false};
         const run_result warmup = run_once(prompt, "warmup", false, n_predict, &warmup_cfg, true);
         if (warmup.aborted) {
             std::cout << "ARRIVAL-BENCHMARK-ABORTED,phase=warmup\n";
@@ -1799,7 +2019,7 @@ private:
         const int64_t group_base_us = ggml_time_us();
         const uint64_t group_base_cycles = read_cycles_local();
         for (int32_t i = 0; i < request_count; ++i) {
-            request_gemmini_config cfg{0xf, -1, false, false};
+            request_gemmini_config cfg{0xf, -1, false};
             timings.push_back(run_arrival_request(prompt, "group_seq", i, group_base_us, group_base_cycles, interval_us, n_predict, cfg));
         }
 
@@ -1812,7 +2032,7 @@ private:
         for (int32_t i = 0; i < request_count; ++i) {
             workers.emplace_back([&, i]() {
                 try {
-                    request_gemmini_config cfg{1 << i, i, true, false};
+                    request_gemmini_config cfg{1 << i, i, true};
                     split_timings[i] = run_arrival_request(prompt, "split_1gem", i, split_base_us, split_base_cycles, interval_us, n_predict, cfg);
                 } catch (const std::exception & e) {
                     errors[i] = e.what();
@@ -1845,7 +2065,8 @@ private:
         } else {
             ::unsetenv("GGML_GEMMINI_DISABLE");
             if (std::getenv("GGML_GEMMINI_ACTIVE_MASK") == nullptr) {
-                ::setenv("GGML_GEMMINI_ACTIVE_MASK", "0xf", 0);
+                const std::string default_mask = std::to_string(ggml_gemmini_default_active_mask());
+                ::setenv("GGML_GEMMINI_ACTIVE_MASK", default_mask.c_str(), 0);
             }
             if (std::getenv("GGML_GEMMINI_PROFILE") == nullptr) {
                 ::setenv("GGML_GEMMINI_PROFILE", "1", 0);

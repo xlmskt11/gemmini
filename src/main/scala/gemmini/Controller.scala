@@ -28,7 +28,8 @@ class Gemmini[T <: Data : Arithmetic, U <: Data, V <: Data](
                                      (implicit p: Parameters)
   extends LazyRoCC (
     opcodes = config.opcodes,
-    nPTWPorts = if (config.use_shared_tlb) 1 else if (config.use_profiler) 3 else 2,
+    nPTWPorts = if (config.use_shared_tlb) config.n_dma_engines
+      else 2 * config.n_dma_engines + (if (config.use_profiler) 1 else 0),
     commandRoute = commandRoute) {
 
   Files.write(Paths.get(config.headerFilePath), config.generateHeader().getBytes(StandardCharsets.UTF_8))
@@ -120,22 +121,44 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
   // TLB
   implicit val edge = outer.spad.id_node.edges.out.head
-  val nTlbClients = if (use_profiler) 3 else 2
-  val tlb = Module(new FrontendTLB(nTlbClients, tlb_size, dma_maxbytes, use_tlb_register_filter, use_firesim_simulation_counters, use_shared_tlb))
-  tlb.io.clients(0) <> outer.spad.module.io.tlb(0)
-  tlb.io.clients(1) <> outer.spad.module.io.tlb(1)
-  if (use_profiler) {
-    tlb.io.clients(2) <> profilers.get.module.io.tlb
+  // Give every reader/writer pair its own translation group, matching the
+  // topology of the four separate Gemminis in the comparison point.
+  val dmaTlbs = Seq.tabulate(n_dma_engines) { i =>
+    val nClients = 2 + (if (i == 0 && use_profiler) 1 else 0)
+    Module(new FrontendTLB(nClients, tlb_size, dma_maxbytes,
+      use_tlb_register_filter, use_firesim_simulation_counters, use_shared_tlb))
   }
 
-  tlb.io.exp.foreach(_.flush_skip := false.B)
-  tlb.io.exp.foreach(_.flush_retry := false.B)
+  dmaTlbs.zipWithIndex.foreach { case (tlb, i) =>
+    tlb.io.clients(0) <> outer.spad.module.io.tlb(2 * i)
+    tlb.io.clients(1) <> outer.spad.module.io.tlb(2 * i + 1)
+  }
+  if (use_profiler) {
+    dmaTlbs.head.io.clients(2) <> profilers.get.module.io.tlb
+  }
 
-  io.ptw <> tlb.io.ptw
+  val tlbExceptions = dmaTlbs.flatMap(_.io.exp)
+  tlbExceptions.foreach { exp =>
+    exp.flush_skip := false.B
+    exp.flush_retry := false.B
+  }
 
-  counters.io.event_io.collect(tlb.io.counter)
+  val tlbPtwPorts = dmaTlbs.flatMap(_.io.ptw)
+  require(tlbPtwPorts.size == io.ptw.size,
+    s"Gemmini PTW port mismatch: ${tlbPtwPorts.size} TLB ports, ${io.ptw.size} RoCC ports")
+  io.ptw.zip(tlbPtwPorts).foreach { case (roccPtw, tlbPtw) =>
+    roccPtw <> tlbPtw
+  }
 
-  spad.module.io.flush := tlb.io.exp.map(_.flush()).reduce(_ || _)
+  val tlbCounters = dmaTlbs.map(_.io.counter)
+  tlbCounters.foreach(_.external_reset := counters.io.event_io.external_reset)
+  Seq(CounterEvent.DMA_TLB_HIT_REQ, CounterEvent.DMA_TLB_TOTAL_REQ,
+    CounterEvent.DMA_TLB_MISS_CYCLE).foreach { event =>
+    counters.io.event_io.connectEventSignal(event,
+      VecInit(tlbCounters.map(_.event_signal(event))).asUInt.orR)
+  }
+
+  spad.module.io.flush := tlbExceptions.map(_.flush()).reduce(_ || _)
 
   val clock_en_reg = RegInit(true.B)
   val gated_clock = if (clock_gate) ClockGate(clock, clock_en_reg, "gemmini_clock_gate") else clock
@@ -491,7 +514,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     vpu_d_controller.map(_.io.busy).getOrElse(false.B) || profiler_busy ||
     loop_cmd.valid || conv_cmd.valid
 
-  io.interrupt := tlb.io.exp.map(_.interrupt).reduce(_ || _)
+  io.interrupt := tlbExceptions.map(_.interrupt).reduce(_ || _)
 
   // assert(!io.interrupt, "Interrupt handlers have not been written yet")
 
@@ -537,8 +560,8 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
     when (is_flush) {
       val skip = loop_cmd.bits.cmd.rs1(0)
-      tlb.io.exp.foreach(_.flush_skip := skip)
-      tlb.io.exp.foreach(_.flush_retry := !skip)
+      tlbExceptions.foreach(_.flush_skip := skip)
+      tlbExceptions.foreach(_.flush_retry := !skip)
 
       loop_cmd.ready := true.B // TODO should we wait for an acknowledgement from the TLB?
     }

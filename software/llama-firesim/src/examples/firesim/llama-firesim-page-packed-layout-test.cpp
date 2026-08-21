@@ -1,3 +1,4 @@
+#include "ggml-gemmini-page-packing.h"
 #include "include/gemmini_params.h"
 #include "include/gemmini_page_packed.h"
 
@@ -63,7 +64,104 @@ static void check_unique_round_trip(
     }
 }
 
+static void check_shape_admission_policy() {
+    constexpr ggml_gemmini_page_packing_config all_requested{true, true, true, true};
+
+    require(ggml_gemmini_effective_page_packing(all_requested, 0, 0, true).mask() == 0x0);
+    require(ggml_gemmini_effective_page_packing(all_requested, 0, 1, true).mask() == 0x0);
+    require(ggml_gemmini_effective_page_packing(all_requested, 0, 2, true).mask() == 0x2);
+    require(ggml_gemmini_effective_page_packing(all_requested, 1, 0, true).mask() == 0x0);
+    require(ggml_gemmini_effective_page_packing(all_requested, 1, 1, true).mask() == 0x0);
+    require(ggml_gemmini_effective_page_packing(all_requested, 1, 2, true).mask() == 0x2);
+    require(ggml_gemmini_effective_page_packing(all_requested, 2, 0, true).mask() == 0xd);
+    require(ggml_gemmini_effective_page_packing(all_requested, 2, 1, true).mask() == 0xd);
+    require(ggml_gemmini_effective_page_packing(all_requested, 2, 2, true).mask() == 0xf);
+    require(ggml_gemmini_effective_page_packing(all_requested, 2, 2, false).mask() == 0x7);
+
+    constexpr ggml_gemmini_page_packing_config partial_requested{false, true, false, true};
+    require(ggml_gemmini_effective_page_packing(partial_requested, 2, 2, true).mask() == 0xa);
+    require(ggml_gemmini_effective_page_packing(partial_requested, 1, 2, true).mask() == 0x2);
+
+    require(!ggml_gemmini_weight_pack_should_emit_entry(false, 0));
+    require(ggml_gemmini_weight_pack_should_emit_entry(false, 1));
+    require(!ggml_gemmini_weight_pack_should_emit_entry(true, 0));
+    require(!ggml_gemmini_weight_pack_should_emit_entry(true, 1));
+    require(ggml_gemmini_weight_pack_should_emit_entry(true, 2));
+}
+
+static void check_flash_shape_admission_policy() {
+    constexpr ggml_gemmini_flash_page_packing_config all_requested{true, true, true};
+
+    constexpr auto all_single = ggml_gemmini_effective_flash_page_packing(
+        all_requested, 1, 1, 1);
+    require(!all_single.queries && !all_single.keys &&
+            !all_single.values &&
+            all_single.mask() == 0x0);
+
+    constexpr auto key_only = ggml_gemmini_effective_flash_page_packing(
+        all_requested, 1, 2, 1);
+    require(!key_only.queries && key_only.keys &&
+            !key_only.values &&
+            key_only.mask() == 0x2);
+
+    constexpr auto value_only = ggml_gemmini_effective_flash_page_packing(
+        all_requested, 1, 1, 2);
+    require(!value_only.queries && !value_only.keys &&
+            value_only.values &&
+            value_only.mask() == 0x4);
+
+    constexpr auto key_and_value = ggml_gemmini_effective_flash_page_packing(
+        all_requested, 1, 2, 2);
+    require(!key_and_value.queries && key_and_value.keys &&
+            key_and_value.values &&
+            key_and_value.mask() == 0x6);
+
+    constexpr auto query_only = ggml_gemmini_effective_flash_page_packing(
+        all_requested, 2, 1, 1);
+    require(query_only.queries && !query_only.keys &&
+            !query_only.values &&
+            query_only.mask() == 0x1);
+
+    constexpr auto query_and_value = ggml_gemmini_effective_flash_page_packing(
+        all_requested, 2, 1, 2);
+    require(query_and_value.queries && !query_and_value.keys &&
+            query_and_value.values &&
+            query_and_value.mask() == 0x5);
+
+    constexpr auto query_and_key = ggml_gemmini_effective_flash_page_packing(
+        all_requested, 2, 2, 1);
+    require(query_and_key.queries && query_and_key.keys &&
+            !query_and_key.values &&
+            query_and_key.mask() == 0x3);
+
+    constexpr auto all_effective = ggml_gemmini_effective_flash_page_packing(
+        all_requested, 2, 2, 2);
+    require(all_effective.queries && all_effective.keys &&
+            all_effective.values &&
+            all_effective.mask() == 0x7);
+
+    constexpr auto requested_from_mask =
+        ggml_gemmini_flash_page_packing_from_mask(UINT8_C(0x07));
+    require(requested_from_mask.mask() == 0x07);
+
+    constexpr auto q_only_requested =
+        ggml_gemmini_flash_page_packing_from_mask(UINT8_C(0x01));
+    constexpr auto k_only_requested =
+        ggml_gemmini_flash_page_packing_from_mask(UINT8_C(0x02));
+    constexpr auto v_only_requested =
+        ggml_gemmini_flash_page_packing_from_mask(UINT8_C(0x04));
+    require(q_only_requested.queries && !q_only_requested.keys &&
+            !q_only_requested.values && q_only_requested.mask() == 0x01);
+    require(!k_only_requested.queries && k_only_requested.keys &&
+            !k_only_requested.values && k_only_requested.mask() == 0x02);
+    require(!v_only_requested.queries && !v_only_requested.keys &&
+            v_only_requested.values && v_only_requested.mask() == 0x04);
+}
+
 int main() {
+    check_shape_admission_policy();
+    check_flash_shape_admission_policy();
+
     const size_t rows = DIM + 3;
     const size_t a_cols = MAX_BLOCK_LEN * DIM + 5;
     const size_t b_cols = gemmini_page_packed_input_blocks_per_page() * DIM + 7;
