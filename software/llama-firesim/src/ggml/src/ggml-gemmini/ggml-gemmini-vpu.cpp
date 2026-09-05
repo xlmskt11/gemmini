@@ -1,14 +1,12 @@
 #include "ggml-gemmini-profile.h"
 
 #include "ggml-gemmini-flash-runtime-opt.h"
-#include "ggml-gemmini-page-packing.h"
 #include "ggml-gemmini-vpu.h"
 #if !defined(GGML_GEMMINI_VPU_ADMISSION_ONLY)
 #include "ggml-impl.h"
 #endif
 
 extern "C" {
-#include "include/gemmini_page_packed.h"
 #if !defined(GGML_GEMMINI_VPU_ADMISSION_ONLY)
 #define VPU_ENABLE_GEMMINI_FLASHATTENTION 1
 #include "include/vpu_kernels.h"
@@ -37,9 +35,6 @@ namespace {
 
 #if !defined(GGML_GEMMINI_VPU_ADMISSION_ONLY)
 constexpr size_t k_workspace_alignment = 64;
-constexpr size_t k_page_packed_alignment = GEMMINI_PAGE_PACKED_PAGE_BYTES;
-static_assert((k_page_packed_alignment & (k_page_packed_alignment - 1)) == 0,
-              "Gemmini page size must be a power-of-two allocation alignment");
 
 std::mutex & vpu_mutex() {
     static std::mutex mutex;
@@ -131,88 +126,12 @@ static bool checked_add(size_t lhs, size_t rhs, size_t * out) {
     return true;
 }
 
-static bool checked_ceil_div(size_t numerator, size_t denominator, size_t * out) {
-    if (out == nullptr || denominator == 0) {
-        return false;
-    }
-    *out = numerator / denominator + (numerator % denominator != 0);
-    return true;
-}
-
-enum class flash_storage_layout {
-    linear,
-    page_packed_a,
-    page_packed_b,
-};
-
-// Return the allocation size in elements without relying on the unchecked
-// addition/multiplication in the generated convenience page-count helpers.
-// GGML shapes are adversarial input, so page rounding must not be allowed to
-// wrap after the ordinary logical element-count checks have succeeded.
 static bool flash_storage_elements(
-        size_t               rows,
-        size_t               columns,
-        flash_storage_layout layout,
-        size_t               element_size,
-        size_t *             elements) {
-    if (elements == nullptr || rows == 0 || columns == 0 || element_size == 0) {
-        return false;
-    }
-    if (layout == flash_storage_layout::linear) {
-        return checked_mul(rows, columns, elements);
-    }
-
-    size_t row_blocks = 0;
-    size_t column_blocks = 0;
-    if (!checked_ceil_div(rows, DIM, &row_blocks) ||
-        !checked_ceil_div(columns, DIM, &column_blocks)) {
-        return false;
-    }
-
-    size_t pages = 0;
-    switch (layout) {
-        case flash_storage_layout::page_packed_a: {
-            const size_t row_blocks_per_page = gemmini_page_packed_a_i_blocks_per_page();
-            const size_t column_blocks_per_page = gemmini_page_packed_a_k_blocks_per_page();
-            size_t row_pages = 0;
-            size_t column_pages = 0;
-            if (!checked_ceil_div(row_blocks, row_blocks_per_page, &row_pages) ||
-                !checked_ceil_div(column_blocks, column_blocks_per_page, &column_pages) ||
-                !checked_mul(row_pages, column_pages, &pages)) {
-                return false;
-            }
-            break;
-        }
-        case flash_storage_layout::page_packed_b: {
-            const size_t column_blocks_per_page = gemmini_page_packed_b_j_blocks_per_page();
-            size_t column_pages = 0;
-            if (!checked_ceil_div(column_blocks, column_blocks_per_page, &column_pages) ||
-                !checked_mul(row_blocks, column_pages, &pages)) {
-                return false;
-            }
-            break;
-        }
-        case flash_storage_layout::linear:
-            return false;
-    }
-
-    size_t bytes = 0;
-    if (!checked_mul(pages, GEMMINI_PAGE_PACKED_PAGE_BYTES, &bytes) ||
-        bytes % element_size != 0) {
-        return false;
-    }
-    *elements = bytes / element_size;
-    return true;
-}
-
-static ggml_gemmini_flash_page_packing_config flash_page_packing_for_shape(
-        uint8_t requested_mask,
-        size_t  query_rows,
-        size_t  q_dim,
-    size_t  sequence) {
-    return ggml_gemmini_effective_flash_page_packing(
-        ggml_gemmini_flash_page_packing_from_mask(requested_mask),
-        query_rows, q_dim, sequence);
+        size_t rows,
+        size_t columns,
+        size_t * elements) {
+    return rows != 0 && columns != 0 &&
+        checked_mul(rows, columns, elements);
 }
 
 #if !defined(GGML_GEMMINI_VPU_ADMISSION_ONLY)
@@ -956,7 +875,6 @@ static bool valid_logical_gemmini_mask(unsigned mask) {
 static bool can_compute_flash_attention(
         const ggml_tensor * op,
         unsigned            logical_mask,
-        uint8_t             requested_flash_page_packing_mask,
         char *              reason,
         size_t              capacity) {
     const ggml_tensor * q = op->src[0];
@@ -1000,12 +918,6 @@ static bool can_compute_flash_attention(
                       logical_mask, GGML_GEMMINI_PROFILE_NAME,
                       static_cast<unsigned>(GGML_GEMMINI_PROFILE_LOGICAL_MASK));
     }
-    if ((requested_flash_page_packing_mask & UINT8_C(0xf8)) != 0) {
-        return reject(reason, capacity,
-                      "FlashAttention page-packing mask 0x%x has unknown bits",
-                      static_cast<unsigned>(requested_flash_page_packing_mask));
-    }
-
     const int64_t d = q->ne[0];
     const int64_t queries = q->ne[1];
     const int64_t heads = q->ne[2];
@@ -1057,36 +969,24 @@ static bool can_compute_flash_attention(
         }
     }
 
-    const auto packing = flash_page_packing_for_shape(
-        requested_flash_page_packing_mask,
-        static_cast<size_t>(queries),
-        static_cast<size_t>(d),
-        static_cast<size_t>(sequence));
-    // Bit 31 tags a page-packed stride even when page packing was not
-    // requested, so every encoded logical row width is limited to the
-    // remaining payload bits.
-    if (static_cast<uint64_t>(d) > GEMMINI_PAGE_PACKED_STRIDE_MASK ||
-        static_cast<uint64_t>(value_dim) > GEMMINI_PAGE_PACKED_STRIDE_MASK) {
+    // The low-level FlashAttention ABI reserves bit 31 of each input stride
+    // for its packed-stride capability. Linear strides must fit in the
+    // remaining payload even though this adapter always supplies linear
+    // inputs.
+    constexpr uint64_t linear_stride_max = UINT32_MAX >> 1;
+    if (static_cast<uint64_t>(d) > linear_stride_max ||
+        static_cast<uint64_t>(value_dim) > linear_stride_max) {
         return reject(reason, capacity,
-                      "FlashAttention row width exceeds the 31-bit stride payload");
+                      "FlashAttention linear row width exceeds the 31-bit stride payload");
     }
 
     size_t ignored = 0;
     if (!flash_storage_elements(
-            static_cast<size_t>(queries), static_cast<size_t>(d),
-            packing.queries ? flash_storage_layout::page_packed_a
-                            : flash_storage_layout::linear,
-            sizeof(elem_t), &ignored) ||
+            static_cast<size_t>(queries), static_cast<size_t>(d), &ignored) ||
         !flash_storage_elements(
-            static_cast<size_t>(sequence), static_cast<size_t>(d),
-            packing.keys ? flash_storage_layout::page_packed_b
-                         : flash_storage_layout::linear,
-            sizeof(elem_t), &ignored) ||
+            static_cast<size_t>(sequence), static_cast<size_t>(d), &ignored) ||
         !flash_storage_elements(
-            static_cast<size_t>(sequence), static_cast<size_t>(value_dim),
-            packing.values ? flash_storage_layout::page_packed_b
-                           : flash_storage_layout::linear,
-            sizeof(elem_t), &ignored)) {
+            static_cast<size_t>(sequence), static_cast<size_t>(value_dim), &ignored)) {
         return reject(reason, capacity, "FlashAttention staging size overflows size_t");
     }
     return true;
@@ -2006,31 +1906,6 @@ static void encode_flash_input_span(
     }
 }
 
-static elem_t * flash_staging_row_span(
-        elem_t *             base,
-        size_t               row,
-        size_t               column,
-        size_t               columns,
-        flash_storage_layout layout) {
-    switch (layout) {
-        case flash_storage_layout::linear:
-            return base + row * columns + column;
-        case flash_storage_layout::page_packed_a: {
-            elem_t * block = gemmini_page_packed_a_block_addr_mut(
-                base, row / DIM, column / DIM, columns);
-            return block + (row % DIM) *
-                gemmini_page_packed_a_k_blocks_per_page() * DIM + column % DIM;
-        }
-        case flash_storage_layout::page_packed_b: {
-            elem_t * block = gemmini_page_packed_b_block_addr_mut(
-                base, row / DIM, column / DIM, columns);
-            return block + (row % DIM) *
-                gemmini_page_packed_b_j_blocks_per_page() * DIM + column % DIM;
-        }
-    }
-    return nullptr;
-}
-
 static ggml_gemmini_flash_tensor_view flash_tensor_view(
         const ggml_tensor * tensor,
         size_t              element_bytes) {
@@ -2055,7 +1930,6 @@ static bool flash_linear_bf16_zero_copy_eligible(
         const ggml_tensor * source,
         size_t              rows,
         size_t              columns,
-        flash_storage_layout layout,
         const ggml_tensor * destination) {
     if (source == nullptr ||
         rows != static_cast<size_t>(source->ne[1]) ||
@@ -2064,8 +1938,7 @@ static bool flash_linear_bf16_zero_copy_eligible(
     }
     const ggml_gemmini_flash_direct_slice_plan plan =
         ggml_gemmini_flash_make_direct_bf16_input_slice(
-            true, layout != flash_storage_layout::linear,
-            source->type == GGML_TYPE_BF16, true,
+            true, source->type == GGML_TYPE_BF16, true,
             !tensor_storage_overlaps(source, destination),
             flash_tensor_view(source, sizeof(ggml_bf16_t)), 0, 0);
     return plan.direct;
@@ -2079,7 +1952,7 @@ static const elem_t * flash_bf16_slice(
                   "FlashAttention BF16 input must match Gemmini elements");
     const ggml_gemmini_flash_direct_slice_plan plan =
         ggml_gemmini_flash_make_direct_bf16_input_slice(
-            true, false, source->type == GGML_TYPE_BF16, true, true,
+            true, source->type == GGML_TYPE_BF16, true, true,
             flash_tensor_view(source, sizeof(ggml_bf16_t)), head, batch);
     GGML_ASSERT(plan.direct);
     return reinterpret_cast<const elem_t *>(plan.address);
@@ -2091,29 +1964,13 @@ static const elem_t * stage_flash_matrix(
         size_t columns,
         size_t head,
         size_t batch,
-        flash_storage_layout layout,
         elem_t * destination) {
-    const size_t source_element_bytes = staging_type_size(source->type);
     for (size_t row = 0; row < rows; ++row) {
         const uint8_t * source_row =
             tensor_element_address(source, 0, row, head, batch);
-        if (layout == flash_storage_layout::linear) {
-            encode_flash_input_span(
-                source_row, source->type,
-                destination + row * columns, columns);
-            continue;
-        }
-
-        for (size_t column = 0; column < columns; column += DIM) {
-            const size_t valid_columns =
-                std::min(static_cast<size_t>(DIM), columns - column);
-            elem_t * destination_span = flash_staging_row_span(
-                destination, row, column, columns, layout);
-            GGML_ASSERT(destination_span != nullptr);
-            encode_flash_input_span(
-                source_row + column * source_element_bytes,
-                source->type, destination_span, valid_columns);
-        }
+        encode_flash_input_span(
+            source_row, source->type,
+            destination + row * columns, columns);
     }
     return destination;
 }
@@ -2160,9 +2017,20 @@ static float * flash_direct_output_base(
     return reinterpret_cast<float *>(plan.address);
 }
 
-static size_t flash_config_stride(size_t logical_width, bool page_packed) {
-    return page_packed ? GEMMINI_PAGE_PACKED_STRIDE(logical_width)
-                       : logical_width;
+static gemmini_partition_axis_t flash_partition_axis_from_env(
+        const char * name) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return GEMMINI_PARTITION_AXIS_M;
+    }
+    char * end = nullptr;
+    const long axis = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' ||
+            axis < GEMMINI_PARTITION_AXIS_M ||
+            axis > GEMMINI_PARTITION_AXIS_K) {
+        return static_cast<gemmini_partition_axis_t>(3);
+    }
+    return static_cast<gemmini_partition_axis_t>(axis);
 }
 
 static vpu_flashattention_config_t make_flash_config(
@@ -2178,7 +2046,6 @@ static vpu_flashattention_config_t make_flash_config(
         size_t output_stride,
         size_t query_base,
         unsigned logical_mask,
-        const ggml_gemmini_flash_page_packing_config & packing,
         float * causal_workspace) {
     vpu_flashattention_config_t config{};
     config.queries = queries;
@@ -2192,11 +2059,15 @@ static vpu_flashattention_config_t make_flash_config(
     config.value_dim = value_dim;
     config.score_scale = score_scale;
     config.query_base = query_base;
-    config.query_stride = flash_config_stride(q_dim, packing.queries);
-    config.key_stride = flash_config_stride(q_dim, packing.keys);
-    config.value_stride = flash_config_stride(value_dim, packing.values);
+    config.query_stride = q_dim;
+    config.key_stride = q_dim;
+    config.value_stride = value_dim;
     config.output_stride = output_stride;
     config.gemmini_mask = logical_mask;
+    config.qk_partition_axis = flash_partition_axis_from_env(
+        "GGML_GEMMINI_FLASH_QK_PARTITION_AXIS");
+    config.pv_partition_axis = flash_partition_axis_from_env(
+        "GGML_GEMMINI_FLASH_PV_PARTITION_AXIS");
     config.causal_mask_workspace = causal_workspace;
     config.causal_mask_workspace_elements = VPU_FLASHATTENTION_CAUSAL_MASK_ELEMENTS;
     return config;
@@ -2204,8 +2075,7 @@ static vpu_flashattention_config_t make_flash_config(
 
 static ggml_gemmini_vpu_result compute_flash_attention(
         ggml_tensor * op,
-        unsigned      logical_mask,
-        uint8_t       requested_flash_page_packing_mask) {
+        unsigned      logical_mask) {
     const ggml_tensor * q = op->src[0];
     const ggml_tensor * k = op->src[1];
     const ggml_tensor * v = op->src[2];
@@ -2219,21 +2089,10 @@ static ggml_gemmini_vpu_result compute_flash_attention(
     const size_t kv_batches = static_cast<size_t>(k->ne[3]);
     const size_t value_dim = static_cast<size_t>(v->ne[0]);
     const float scale = op_param_f32(op, 0);
-    const auto packing = flash_page_packing_for_shape(
-        requested_flash_page_packing_mask, query_rows, d, sequence);
-    const flash_storage_layout q_layout = packing.queries
-        ? flash_storage_layout::page_packed_a
-        : flash_storage_layout::linear;
-    const flash_storage_layout k_layout = packing.keys
-        ? flash_storage_layout::page_packed_b
-        : flash_storage_layout::linear;
-    const flash_storage_layout v_layout = packing.values
-        ? flash_storage_layout::page_packed_b
-        : flash_storage_layout::linear;
     const bool direct_k_input = flash_linear_bf16_zero_copy_eligible(
-        k, sequence, d, k_layout, op);
+        k, sequence, d, op);
     const bool direct_v_input = flash_linear_bf16_zero_copy_eligible(
-        v, sequence, value_dim, v_layout, op);
+        v, sequence, value_dim, op);
     size_t direct_output_stride = 0;
     const bool direct_output = flash_direct_output_layout(
         op, q, k, v, mask, query_rows, value_dim, &direct_output_stride);
@@ -2312,11 +2171,11 @@ static ggml_gemmini_vpu_result compute_flash_attention(
     size_t k_storage_elements = 0;
     size_t v_storage_elements = 0;
     if (!flash_storage_elements(
-            query_rows, d, q_layout, sizeof(elem_t), &q_storage_elements) ||
+            query_rows, d, &q_storage_elements) ||
         !flash_storage_elements(
-            sequence, d, k_layout, sizeof(elem_t), &k_storage_elements) ||
+            sequence, d, &k_storage_elements) ||
         !flash_storage_elements(
-            sequence, value_dim, v_layout, sizeof(elem_t), &v_storage_elements)) {
+            sequence, value_dim, &v_storage_elements)) {
         workspace_prepare_timer.finish(
             &breakdown.workspace_prepare_us,
             &breakdown.workspace_prepare_cycles);
@@ -2325,14 +2184,11 @@ static ggml_gemmini_vpu_result compute_flash_attention(
     }
 
     if (!allocate_overwritten_flash_workspace(
-            &workspace.staged_q, q_storage_elements,
-            packing.queries ? k_page_packed_alignment : k_workspace_alignment) ||
+            &workspace.staged_q, q_storage_elements) ||
         (!direct_k_input && !allocate_overwritten_flash_workspace(
-            &workspace.staged_k, k_storage_elements,
-            packing.keys ? k_page_packed_alignment : k_workspace_alignment)) ||
+            &workspace.staged_k, k_storage_elements)) ||
         (!direct_v_input && !allocate_overwritten_flash_workspace(
-            &workspace.staged_v, v_storage_elements,
-            packing.values ? k_page_packed_alignment : k_workspace_alignment)) ||
+            &workspace.staged_v, v_storage_elements)) ||
         !allocate_overwritten_flash_workspace(
             &workspace.causal_mask, VPU_FLASHATTENTION_CAUSAL_MASK_ELEMENTS)) {
         workspace_prepare_timer.finish(
@@ -2380,7 +2236,7 @@ static ggml_gemmini_vpu_result compute_flash_attention(
             invocation_output(0, 0),
             query_rows, sequence, d, value_dim, scale, config_output_stride,
             query_base,
-            logical_mask, packing, workspace.causal_mask.data());
+            logical_mask, workspace.causal_mask.data());
         vpu_flashattention_plan_t plan{};
         vpu_flashattention_status_t status = vpu_flashattention_make_plan(&config, &plan);
         if (status == VPU_FLASHATTENTION_OK) {
@@ -2416,12 +2272,12 @@ static ggml_gemmini_vpu_result compute_flash_attention(
                         ? flash_bf16_slice(k, kv_head, kv_batch)
                         : stage_flash_matrix(
                               k, sequence, d, kv_head, kv_batch,
-                              k_layout, workspace.staged_k.data());
+                              workspace.staged_k.data());
                     staged_v_input = direct_v_input
                         ? flash_bf16_slice(v, kv_head, kv_batch)
                         : stage_flash_matrix(
                               v, sequence, value_dim, kv_head, kv_batch,
-                              v_layout, workspace.staged_v.data());
+                              workspace.staged_v.data());
                     input_pack_timer.finish(
                         &breakdown.input_pack_us,
                         &breakdown.input_pack_cycles);
@@ -2430,8 +2286,7 @@ static ggml_gemmini_vpu_result compute_flash_attention(
                 }
                 flash_phase_timer input_pack_timer;
                 const elem_t * staged_q_input = stage_flash_matrix(
-                    q, query_rows, d, head, batch, q_layout,
-                    workspace.staged_q.data());
+                    q, query_rows, d, head, batch, workspace.staged_q.data());
                 input_pack_timer.finish(
                     &breakdown.input_pack_us,
                     &breakdown.input_pack_cycles);
@@ -2441,7 +2296,7 @@ static ggml_gemmini_vpu_result compute_flash_attention(
                     invocation_output(batch, head),
                     query_rows, sequence, d, value_dim, scale, config_output_stride,
                     workspace.query_bases[batch * heads + head], logical_mask,
-                    packing, workspace.causal_mask.data());
+                    workspace.causal_mask.data());
                 flash_phase_timer fused_attention_run_timer;
                 const vpu_flashattention_result_t flash = vpu_flashattention_auto(&config);
                 fused_attention_run_timer.finish(
@@ -2482,7 +2337,6 @@ static bool require_compute_data(
 extern "C" bool ggml_gemmini_vpu_can_compute(
         const ggml_tensor * op,
         unsigned            logical_gemmini_mask,
-        uint8_t             requested_flash_page_packing_mask,
         char *              reason,
         size_t              reason_capacity) {
     clear_reason(reason, reason_capacity);
@@ -2506,8 +2360,7 @@ extern "C" bool ggml_gemmini_vpu_can_compute(
             return can_compute_rope(op, reason, reason_capacity);
         case GGML_OP_FLASH_ATTN_EXT:
             return can_compute_flash_attention(
-                op, logical_gemmini_mask, requested_flash_page_packing_mask,
-                reason, reason_capacity);
+                op, logical_gemmini_mask, reason, reason_capacity);
         default:
             return reject(reason, reason_capacity,
                           "ggml op %d has no VPU adapter", static_cast<int>(op->op));
@@ -2517,12 +2370,10 @@ extern "C" bool ggml_gemmini_vpu_can_compute(
 #if !defined(GGML_GEMMINI_VPU_ADMISSION_ONLY)
 extern "C" ggml_gemmini_vpu_result ggml_gemmini_vpu_compute(
         ggml_tensor * op,
-        unsigned      logical_gemmini_mask,
-        uint8_t       requested_flash_page_packing_mask) {
+        unsigned      logical_gemmini_mask) {
     char reason[GGML_GEMMINI_VPU_REASON_CAPACITY] = {};
     if (!ggml_gemmini_vpu_can_compute(
-            op, logical_gemmini_mask, requested_flash_page_packing_mask,
-            reason, sizeof(reason))) {
+            op, logical_gemmini_mask, reason, sizeof(reason))) {
         return make_result(GGML_GEMMINI_VPU_STATUS_UNSUPPORTED, 0, "%s", reason);
     }
 
@@ -2564,8 +2415,7 @@ extern "C" ggml_gemmini_vpu_result ggml_gemmini_vpu_compute(
             return compute_rms_norm_impl(op->src[0], nullptr, op, op_param_f32(op, 0));
         case GGML_OP_ROPE:          return compute_rope(op);
         case GGML_OP_FLASH_ATTN_EXT:
-            return compute_flash_attention(
-                op, logical_gemmini_mask, requested_flash_page_packing_mask);
+            return compute_flash_attention(op, logical_gemmini_mask);
         default:
             return make_result(GGML_GEMMINI_VPU_STATUS_UNSUPPORTED, 0,
                                "operation changed after admission");

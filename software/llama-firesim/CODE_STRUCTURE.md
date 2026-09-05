@@ -215,15 +215,10 @@ Page-packed 설정은 shape별로 다시 admission한다. A/C/D는 `M > 1`, B는
 이하에서는 요청 옵션과 무관하게 row-major로 staging한다.
 
 FlashAttention adapter는 일반 matmul의 `GGML_GEMMINI_PAGE_PACKED_{A,B,C,D}`를
-재사용하지 않는다. Q, K, V는 각각 `Flash_Q_PAGE_PACKED`(기본값 `0`),
-`Flash_K_PAGE_PACKED`(기본값 `1`), `Flash_V_PAGE_PACKED`(기본값 `1`)로
-독립 제어한다. Q는 A layout, 원본 형태의 K/V는 각각 B source layout이며
-`query_rows > 1`, `q_dim > 1`, `sequence > 1`인 경우에만 해당 요청을 실제
-packing으로 적용한다. adapter와 low-level kernel 사이에서도
-`query_stride`, `key_stride`, `value_stride`가 각 layout을 독립적으로
-encode하므로 K와 V 설정을 서로 다르게 줄 수 있다. K의 transpose는
-page-packed source를 읽는 QK job에서 수행한다. FlashAttention output에는
-packing 옵션이 없고 VPU H_STORE가 최종 FP32 row를 ggml dst에 직접
+재사용하지 않으며 Q/K/V 전용 page-packing 옵션도 제공하지 않는다. adapter는
+세 입력을 linear BF16 matrix로 전달한다. dense BF16 K/V head slice는 직접
+사용하고, type 변환이나 gather가 필요한 view만 재사용 가능한 linear staging
+workspace에 기록한다. VPU H_STORE는 최종 FP32 row를 ggml dst에 직접
 row-major로 기록한다. online accumulator는 host D matrix가 아니라 VSRAM
 내부 상태다.
 

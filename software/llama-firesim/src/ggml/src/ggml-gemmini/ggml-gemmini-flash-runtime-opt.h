@@ -178,17 +178,15 @@ ggml_gemmini_flash_make_direct_output_slice(
     return plan;
 }
 
-// Plan a direct K/V input slice.  Input views use [width, rows, heads,
-// batches].  The runtime may bypass BF16 conversion only when no scaling or
-// other transform is required and the hardware was not asked for a packed-B
-// source.  The current fusion config encodes logical width for a linear
-// source, so padded/strided rows retain staging.  Read-only source slices may
-// overlap one another (broadcast views),
+// Plan a direct K/V input slice. Input views use [width, rows, heads,
+// batches]. The runtime may bypass BF16 conversion only when no scaling or
+// other transform is required. The current fusion config encodes logical
+// width for a linear source, so padded/strided rows retain staging. Read-only
+// source slices may overlap one another (broadcast views),
 // but they must not overlap the selected direct output.
 static inline ggml_gemmini_flash_direct_slice_plan
 ggml_gemmini_flash_make_direct_bf16_input_slice(
         bool enabled,
-        bool page_packed_input,
         bool bf16_source,
         bool identity_transform,
         bool source_disjoint_from_output,
@@ -199,7 +197,7 @@ ggml_gemmini_flash_make_direct_bf16_input_slice(
     constexpr size_t bf16_bytes = sizeof(uint16_t);
     using namespace ggml_gemmini_flash_runtime_detail;
 
-    if (!enabled || page_packed_input || !bf16_source || !identity_transform ||
+    if (!enabled || !bf16_source || !identity_transform ||
             !source_disjoint_from_output || view.base == 0 ||
             view.element_bytes != bf16_bytes || view.nb[0] != bf16_bytes ||
             !valid_nonzero_shape(view) || head >= view.ne[2] ||

@@ -211,13 +211,25 @@ cache_K_l[position : position + T] = K_rope_l
 cache_V_l[position : position + T] = V_l
 ```
 
-In ggml this appears as `SET_ROWS` nodes. The KV cache dtype comes from
-`llama_context_default_params()`:
+In ggml this appears as `SET_ROWS` nodes. The upstream default is F16, while
+`llama-firesim-cli` explicitly selects BF16 for both caches:
 
 | cache | dtype |
 | --- | --- |
-| K cache | `F16` |
-| V cache | `F16` |
+| K cache | `BF16` |
+| V cache | `BF16` |
+
+With FlashAttention and BF16 K/V, the local cache patch allocates each layer
+as ggml `[C, Tcap, Hkv, S]`, physically
+`[stream][KV head][token][channel]`. The token index tensor is broadcast over
+the head and stream dimensions by one `SET_ROWS`, so the projection result is
+written directly into HTC without a separate repack. Reads retain llama.cpp's
+logical `[C, Hkv, n_kv, S]` contract; the existing `(0,2,1,3)` permute then
+gives FlashAttention `[C, n_kv, Hkv, S]` with a dense `C*sizeof(BF16)` token
+stride. Other dtype or non-Flash cache configurations retain the upstream
+layout. New HTC state payloads use an explicit layout marker and bulk
+head-major ranges; the reader still accepts legacy cell-major,
+non-transposed cache state files.
 
 This is CPU fallback today. It is a cache write/copy, not a Gemmini mvin into
 scratchpad.
@@ -259,17 +271,12 @@ Current graph behavior:
 | Gemmini visibility | the fused kernel internally issues `QK^T` and `P*V` Gemmini jobs |
 
 Fused FlashAttention does not reuse the ordinary matmul
-`GGML_GEMMINI_PAGE_PACKED_{A,B,C,D}` settings. It independently reads
-`Flash_Q_PAGE_PACKED` (default `0`), `Flash_K_PAGE_PACKED` (default `1`), and
-`Flash_V_PAGE_PACKED` (default `1`). The adapter stages Q in A layout and K/V
-in their respective B source layouts. K is packed as `[S_l, D]` and transposed
-by the QK job. The normal `M/K > 1` thresholds are applied independently to Q,
-K, and V. The adapter passes those three choices independently in the
-low-level `query_stride`, `key_stride`, and `value_stride` encodings, so K and
-V may use different layouts. FlashAttention has no output-packing option:
-after final normalization the VPU writes FP32 rows directly to the final ggml
-destination in row-major order. The online accumulator stays in VSRAM and has
-no host page layout.
+`GGML_GEMMINI_PAGE_PACKED_{A,B,C,D}` settings and exposes no Q/K/V
+page-packing option. The adapter supplies linear BF16 Q, K, and V matrices.
+Dense BF16 K/V head slices can be consumed directly; incompatible views are
+gathered into reusable linear staging workspaces. After final normalization
+the VPU writes FP32 rows directly to the final ggml destination in row-major
+order. The online accumulator stays in VSRAM and has no host page layout.
 
 If FlashAttention is disabled, llama.cpp can build explicit `kq = mul_mat(k,q)`,
 `softmax`, and `kqv = mul_mat(v,kq)` nodes. In the current default path,

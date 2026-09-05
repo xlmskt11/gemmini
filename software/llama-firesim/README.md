@@ -27,13 +27,12 @@ LLAMA_FIRESIM_HW_PROFILE=multi ./llama-firesim-build.sh
 ```
 
 For example, a multi-Gemmini Llama 3.2 1B image with ordinary matmul B packed
-and independently selected FlashAttention layouts is built with:
+is built with:
 
 ```bash
 LLAMA_FIRESIM_MODEL=Llama-3.2-1B \
 GGML_GEMMINI_PAGE_PACKED_A=0 GGML_GEMMINI_PAGE_PACKED_B=1 \
 GGML_GEMMINI_PAGE_PACKED_C=0 GGML_GEMMINI_PAGE_PACKED_D=0 \
-Flash_Q_PAGE_PACKED=0 Flash_K_PAGE_PACKED=1 Flash_V_PAGE_PACKED=1 \
 LLAMA_FIRESIM_HW_PROFILE=multi ./llama-firesim-build.sh
 ```
 
@@ -155,7 +154,7 @@ The older guest-side non-interactive mode still exists as
 `LLAMA_FIRESIM_MODE=sweep`, but the REPL-driven script avoids rebuilding the
 workload just to change prompt-token, decode-token, or Gemmini-mask cases.
 
-## Page-Packed Matmul and FlashAttention Layouts
+## Page-Packed Matmul and FlashAttention Inputs
 
 Set A, B, C, and D independently before process startup:
 
@@ -190,37 +189,18 @@ disjoint from the output is passed directly to Gemmini. This bypasses the
 path; F32/F16, padded, packed-A, overlapping, or invalid-span inputs always
 retain staging.
 
-Fused FlashAttention has three independent, case-sensitive input-packing
-requests. Their defaults are Q=`0`, K=`1`, and V=`1`:
-
-```bash
-export Flash_Q_PAGE_PACKED=0
-export Flash_K_PAGE_PACKED=1
-export Flash_V_PAGE_PACKED=1
-```
-
-The equivalent CLI overrides are `--flash-q-page-packed`,
-`--flash-k-page-packed`, and `--flash-v-page-packed` with a `0|1` value.
-
-The all-uppercase `FLASH_Q_PAGE_PACKED`, `FLASH_K_PAGE_PACKED`, and
-`FLASH_V_PAGE_PACKED` spellings are accepted as aliases when the corresponding
-`Flash_*` variable is unset; the exact `Flash_*` names above take precedence.
-
-These settings are independent of `GGML_GEMMINI_PAGE_PACKED_{A,B,C,D}`. The
-generic variables continue to control only ordinary `MUL_MAT`; changing them
-does not change fused FlashAttention Q/K/V layouts. Flash Q uses the
-page-packed A layout, while Flash K and V each use the page-packed B source
-layout. The low-level kernel receives their choices independently through
-`query_stride`, `key_stride`, and `value_stride`, so K and V need not use the
-same layout. Packing is disabled for Q when `query_rows <= 1`, for K when
-`q_dim <= 1`, and for V when `sequence <= 1`, even if the corresponding Flash
-option is enabled. K is packed as `[sequence][q_dim]`; Gemmini QK applies its
-transpose after reading that source layout.
+Fused FlashAttention has no Q/K/V page-packing option. The adapter supplies
+ordinary linear BF16 matrices and linear `query_stride`, `key_stride`, and
+`value_stride` values to the fused kernel. A dense, disjoint BF16 K/V head
+slice is consumed directly; other types or incompatible views are converted
+or gathered into reusable linear BF16 workspaces. The generic
+`GGML_GEMMINI_PAGE_PACKED_{A,B,C,D}` variables continue to control only
+ordinary `MUL_MAT` and do not change fused FlashAttention input layouts.
 
 FlashAttention has no output-packing option. The online accumulator remains
-internal to VSRAM, and the VPU always H_STOREs each final FP32 row directly
-into the ggml destination in row-major order. General `MUL_MAT` C/D packing
-behavior is unchanged.
+internal to the shared Gemmini accumulator, and the VPU always H_STOREs each
+final FP32 row directly into the ggml destination in row-major order. General
+`MUL_MAT` C/D packing behavior is unchanged.
 
 The offline weight pack is v4 BF16-RNE and records the selected profile, `DIM`,
 B layout, page size, `MAX_BYTES`, model fingerprint, and per-tensor role. It

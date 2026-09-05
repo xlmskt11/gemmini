@@ -57,15 +57,13 @@ struct ggml_gemmini_vpu_result {
 // issued. FlashAttention assumes finite Q/K/V and deliberately avoids a full
 // input scan. logical_gemmini_mask names VPU matrix ports, not physical custom
 // opcodes (the single-Gemmini profile therefore passes bit 0, not custom3).
-// requested_flash_page_packing_mask has a FlashAttention-only namespace:
-// bit 0 selects Q, bit 1 selects K, and bit 2 selects V. Generic Gemmini
-// A/B/C/D settings never enter this interface. The VPU always H_STOREs final
-// FP32 rows directly to dst; its online accumulator remains internal VSRAM
-// state. The adapter applies the shared M/K <= 1 policy.
+// FlashAttention inputs use ordinary linear row-major storage. Generic
+// Gemmini A/B/C/D page-packing settings never enter this interface. The VPU
+// always H_STOREs final FP32 rows directly to dst; its online accumulator
+// remains internal VSRAM state.
 bool ggml_gemmini_vpu_can_compute(
         const struct ggml_tensor * op,
         unsigned                   logical_gemmini_mask,
-        uint8_t                    requested_flash_page_packing_mask,
         char *                     reason,
         size_t                     reason_capacity);
 
@@ -76,8 +74,7 @@ bool ggml_gemmini_vpu_can_compute(
 // fallback_safe=false and must be surfaced instead of retried.
 struct ggml_gemmini_vpu_result ggml_gemmini_vpu_compute(
         struct ggml_tensor * op,
-        unsigned             logical_gemmini_mask,
-        uint8_t              requested_flash_page_packing_mask);
+        unsigned             logical_gemmini_mask);
 
 // The public VPU RMSNorm primitive includes the learned weight multiply while
 // ggml normally represents RMS_NORM and MUL as two graph nodes. These helpers

@@ -7,7 +7,6 @@ import freechips.rocketchip.tile.RoCCCommand
 import org.chipsalliance.cde.config.Parameters
 import GemminiISA._
 import LocalAddr._
-import VpuLocalAddr._
 import Util._
 
 // LdA
@@ -16,10 +15,12 @@ class LoopMatmulLdAReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
                        val concurrent_loops: Int, val use_shared_res_entries: Boolean) extends Bundle {
   val max_i = UInt(iterator_bitwidth.W)
   val max_k = UInt(iterator_bitwidth.W)
-  val max_fi = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None // made
+  val global_i = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val global_k = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val i_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val k_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
   val pad_i = UInt(log2Up(block_size).W)
   val pad_k = UInt(log2Up(block_size).W)
-  val laddrR_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None // made
   val dram_addr = UInt(coreMaxAddrBits.W)
   val dram_stride = UInt(coreMaxAddrBits.W)
   val tile_row_offset = UInt(iterator_bitwidth.W)
@@ -40,6 +41,7 @@ class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     val idle = Output(Bool())
     val rob_overloaded = Input(Bool())
     val loop_id = Output(UInt(log2Up(concurrent_loops).W))
+    val admission_blocked = if (use_shared_res_entries) Some(Input(Bool())) else None
   })
 
   object State extends ChiselEnum {
@@ -60,7 +62,7 @@ class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   val max_col_iterator = Mux(req.transpose, req.max_i, req.max_k)
 
   val spad_stride = if (use_shared_res_entries) {
-    Mux(req.transpose, req.max_fi.get, req.max_k)
+    Mux(req.transpose, req.global_i.get, req.global_k.get)
   } else {
     Mux(req.transpose, req.max_i, req.max_k)
   }
@@ -71,23 +73,17 @@ class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   val max_col_dim = Mux(req.transpose, req.max_i, req.max_k)
   val max_blocks_without_page_limit = Mux(max_col_dim <= max_block_len.U, max_col_dim, max_block_len.U)
 
-  // changed
-  // val sp_addr_start = req.addr_start
-  val sp_addr_start = if (use_shared_res_entries) {
-    req.addr_start + Mux(req.transpose, req.laddrR_offset.get, req.laddrR_offset.get * req.max_k) * block_size.U
-  } else {
-    req.addr_start
-  }
+  val global_i = if (use_shared_res_entries) i + req.i_offset.get else i
+  val global_k = if (use_shared_res_entries) k + req.k_offset.get else k
+  val sp_row_iterator = Mux(req.transpose, global_k, global_i)
+  val sp_col_iterator = Mux(req.transpose, global_i, global_k)
 
   val dram_stride = LoopMatmul.pagePackedStridePayload(req.dram_stride)
   val page_packed = LoopMatmul.isPagePackedStride(req.dram_stride)
-  val shared_page_packed_offset = if (use_shared_res_entries) req.laddrR_offset.get else 0.U(iterator_bitwidth.W)
   val page_packed_row_base = Mux(req.transpose, req.tile_col_offset, req.tile_row_offset)
   val page_packed_col_base = Mux(req.transpose, req.tile_row_offset, req.tile_col_offset)
-  val page_packed_row_iterator = page_packed_row_base + row_iterator +
-    Mux(req.transpose, 0.U(iterator_bitwidth.W), shared_page_packed_offset)
-  val page_packed_col_iterator = page_packed_col_base + col_iterator +
-    Mux(req.transpose, shared_page_packed_offset, 0.U(iterator_bitwidth.W))
+  val page_packed_row_iterator = page_packed_row_base + sp_row_iterator
+  val page_packed_col_iterator = page_packed_col_base + sp_col_iterator
   val page_packed_col_blocks = LoopMatmul.pagePacked2DColBlocks(block_size, input_w/8, max_block_len)
   val page_packed_blocks_left = page_packed_col_blocks.U - page_packed_col_iterator % page_packed_col_blocks.U
   val max_blocks = Mux(page_packed && page_packed_blocks_left < max_blocks_without_page_limit,
@@ -97,7 +93,8 @@ class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     LoopMatmul.pagePacked2DOffset(page_packed_row_iterator, page_packed_col_iterator, dram_stride, block_size, input_w/8, max_block_len)
   val dram_offset = Mux(page_packed, page_packed_dram_offset, row_major_dram_offset)
   val dram_addr = req.dram_addr + LoopMatmul.castDramOffset(dram_offset)
-  val sp_addr = sp_addr_start + (row_iterator * spad_stride + col_iterator) * block_size.U
+  val sp_addr = req.addr_start +
+    (sp_row_iterator * spad_stride + sp_col_iterator) * block_size.U
   val blocks = Mux(col_iterator + max_blocks <= max_col_iterator, max_blocks, max_col_iterator-col_iterator)
   val cols = (blocks * block_size.U) - Mux(col_iterator + blocks >= max_col_iterator, col_pad, 0.U)
   val rows = block_size.U - Mux(row_iterator === max_row_iterator-1.U, row_pad, 0.U)
@@ -119,10 +116,9 @@ class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   io.k := k
   io.idle := state === idle
 
-  // changed
-  // io.cmd.valid := state =/= idle && !io.rob_overloaded
   if (use_shared_res_entries) {
-    io.cmd.valid := state =/= idle && !io.rob_overloaded && req.max_i =/= 0.U
+    io.cmd.valid := state =/= idle && !io.rob_overloaded &&
+      !io.admission_blocked.get && req.max_i =/= 0.U && req.max_k =/= 0.U
   } else {
     io.cmd.valid := state =/= idle && !io.rob_overloaded
   }
@@ -130,7 +126,8 @@ class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 
   io.loop_id := req.loop_id
 
-  when (req.max_i === 0.U) {
+  val admissionOpen = if (use_shared_res_entries) !io.admission_blocked.get else true.B
+  when ((req.max_i === 0.U || req.max_k === 0.U) && admissionOpen) {
     state := idle
   }.elsewhen (io.cmd.fire) {
     // The order here is k, j, i
@@ -159,18 +156,16 @@ class LoopMatmulLdA(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 // LdB
 
 class LoopMatmulLdBReq(val block_size: Int, val coreMaxAddrBits: Int, val iterator_bitwidth: Int, val max_addr: Int,
-                       val concurrent_loops: Int, val group_w: Int, val nSharers: Int,
-                       val use_shared_res_entries: Boolean, val use_vpu_fusion: Boolean) extends Bundle {
-  private val use_group_control = use_shared_res_entries || use_vpu_fusion
+                       val concurrent_loops: Int,
+                       val use_shared_res_entries: Boolean) extends Bundle {
   val max_k = UInt(iterator_bitwidth.W)
-  val max_fk = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None // made
   val max_j = UInt(iterator_bitwidth.W)
+  val global_k = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val global_j = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val k_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val j_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
   val pad_k = UInt(log2Up(block_size).W)
   val pad_j = UInt(log2Up(block_size).W)
-  val laddrR_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None // made
-  val group_id = if (use_group_control) Some(UInt(group_w.W)) else None // made
-  val group_list = if (use_group_control) Some(UInt(nSharers.W)) else None // made
-  val has_gemv_followup = if (use_vpu_fusion) Some(Bool()) else None
   val dram_addr = UInt(coreMaxAddrBits.W)
   val dram_stride = UInt(coreMaxAddrBits.W)
   val tile_row_offset = UInt(iterator_bitwidth.W)
@@ -182,14 +177,12 @@ class LoopMatmulLdBReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
 
 class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: Int, max_addr: Int, input_w: Int,
                     max_block_len: Int, concurrent_loops: Int, mvin_rs2_t: MvinRs2,
-                    use_shared_res_entries: Boolean, use_vpu_fusion: Boolean,
-                    group_w: Int, nSharers: Int)
+                    use_shared_res_entries: Boolean, use_vpu_fusion: Boolean)
                    (implicit p: Parameters) extends Module {
-  private val use_group_control = use_shared_res_entries || use_vpu_fusion
+  private val use_group_control = use_shared_res_entries
   val io = IO(new Bundle {
     val req = Flipped(Decoupled(new LoopMatmulLdBReq(block_size, coreMaxAddrBits,
-      iterator_bitwidth, max_addr, concurrent_loops, group_w, nSharers,
-      use_shared_res_entries, use_vpu_fusion)))
+      iterator_bitwidth, max_addr, concurrent_loops, use_shared_res_entries)))
     val cmd = Decoupled(Output(new RoCCCommand))
 
     val k = Output(UInt(iterator_bitwidth.W))
@@ -200,12 +193,7 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 
     val loop_id = Output(UInt(log2Up(concurrent_loops).W))
 
-    val laddrK_offset = if (use_group_control) Some(Output(UInt(iterator_bitwidth.W))) else None // made
-    val group_id = if (use_group_control) Some(Output(UInt(group_w.W))) else None // made
-    val group_list = if (use_group_control) Some(Output(UInt(nSharers.W))) else None // made
-    val has_gemv_followup = if (use_vpu_fusion) Some(Output(Bool())) else None
-    val max_k = if (use_group_control) Some(Output(UInt(iterator_bitwidth.W))) else None // made
-    val loop_full = if (use_group_control) Some(Input(Bool())) else None // made
+    val admission_blocked = if (use_group_control) Some(Input(Bool())) else None
   })
 
   object State extends ChiselEnum {
@@ -215,8 +203,7 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   val state = RegInit(idle)
 
   val req = Reg(new LoopMatmulLdBReq(block_size, coreMaxAddrBits,
-    iterator_bitwidth, max_addr, concurrent_loops, group_w, nSharers,
-    use_shared_res_entries, use_vpu_fusion))
+    iterator_bitwidth, max_addr, concurrent_loops, use_shared_res_entries))
 
   val k = Reg(UInt(iterator_bitwidth.W))
   val j = Reg(UInt(iterator_bitwidth.W))
@@ -228,7 +215,7 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   val max_col_iterator = Mux(req.transpose, req.max_k, req.max_j)
 
   val spad_stride = if (use_shared_res_entries) {
-    Mux(req.transpose, req.max_fk.get, req.max_j)
+    Mux(req.transpose, req.global_k.get, req.global_j.get)
   } else {
     Mux(req.transpose, req.max_k, req.max_j)
   }
@@ -239,23 +226,22 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   val max_col_dim = Mux(req.transpose, req.max_k, req.max_j)
   val max_blocks_without_page_limit = Mux(max_col_dim <= max_block_len.U, max_col_dim, max_block_len.U)
 
-  // changed
-  // val sp_addr_start = req.addr_end - req.max_k * req.max_j * block_size.U
+  val global_k = if (use_shared_res_entries) k + req.k_offset.get else k
+  val global_j = if (use_shared_res_entries) j + req.j_offset.get else j
+  val sp_row_iterator = Mux(req.transpose, global_j, global_k)
+  val sp_col_iterator = Mux(req.transpose, global_k, global_j)
   val sp_addr_start = if (use_shared_res_entries) {
-    req.addr_end - (req.max_fk.get * req.max_j - Mux(req.transpose, req.laddrR_offset.get, req.laddrR_offset.get * req.max_j)) * block_size.U
+    req.addr_end - req.global_k.get * req.global_j.get * block_size.U
   } else {
     req.addr_end - req.max_k * req.max_j * block_size.U
   }
 
   val dram_stride = LoopMatmul.pagePackedStridePayload(req.dram_stride)
   val page_packed = LoopMatmul.isPagePackedStride(req.dram_stride)
-  val shared_page_packed_offset = if (use_shared_res_entries) req.laddrR_offset.get else 0.U(iterator_bitwidth.W)
   val page_packed_row_base = Mux(req.transpose, req.tile_col_offset, req.tile_row_offset)
   val page_packed_col_base = Mux(req.transpose, req.tile_row_offset, req.tile_col_offset)
-  val page_packed_row_iterator = page_packed_row_base + row_iterator +
-    Mux(req.transpose, 0.U(iterator_bitwidth.W), shared_page_packed_offset)
-  val page_packed_col_iterator = page_packed_col_base + col_iterator +
-    Mux(req.transpose, shared_page_packed_offset, 0.U(iterator_bitwidth.W))
+  val page_packed_row_iterator = page_packed_row_base + sp_row_iterator
+  val page_packed_col_iterator = page_packed_col_base + sp_col_iterator
   val page_packed_col_blocks = LoopMatmul.pagePackedBColBlocks(block_size, input_w/8)
   val page_packed_blocks_left = page_packed_col_blocks.U - page_packed_col_iterator % page_packed_col_blocks.U
   val max_blocks = Mux(page_packed && page_packed_blocks_left < max_blocks_without_page_limit,
@@ -265,7 +251,8 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     LoopMatmul.pagePackedBOffset(page_packed_row_iterator, page_packed_col_iterator, dram_stride, block_size, input_w/8)
   val dram_offset = Mux(page_packed, page_packed_dram_offset, row_major_dram_offset)
   val dram_addr = req.dram_addr + LoopMatmul.castDramOffset(dram_offset)
-  val sp_addr = sp_addr_start + (row_iterator * spad_stride + col_iterator) * block_size.U
+  val sp_addr = sp_addr_start +
+    (sp_row_iterator * spad_stride + sp_col_iterator) * block_size.U
   val blocks = Mux(col_iterator + max_blocks <= max_col_iterator, max_blocks, max_col_iterator-col_iterator)
   val cols = (blocks * block_size.U) - Mux(col_iterator + blocks >= max_col_iterator, col_pad, 0.U)
   val rows = block_size.U - Mux(row_iterator === max_row_iterator-1.U, row_pad, 0.U)
@@ -287,10 +274,9 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   io.j := j
   io.idle := state === idle
 
-  // changed
-  // io.cmd.valid := state =/= idle && !io.rob_overloaded
   if (use_group_control) {
-    io.cmd.valid := state =/= idle && !io.rob_overloaded && !io.loop_full.get && req.max_k =/= 0.U
+    io.cmd.valid := state =/= idle && !io.rob_overloaded &&
+      !io.admission_blocked.get && req.max_k =/= 0.U && req.max_j =/= 0.U
   } else {
     io.cmd.valid := state =/= idle && !io.rob_overloaded
   }
@@ -298,19 +284,15 @@ class LoopMatmulLdB(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 
   io.loop_id := req.loop_id
 
-  if (use_group_control) {
-    io.laddrK_offset.get := (if (use_shared_res_entries) req.laddrR_offset.get else 0.U) // made
-    io.group_id.get := req.group_id.get // made
-    io.group_list.get := req.group_list.get // made
-    io.max_k.get := req.max_k // made
-  }
-  if (use_vpu_fusion) {
-    io.has_gemv_followup.get := req.has_gemv_followup.get
+  val loop_has_room = if (use_group_control) !io.admission_blocked.get else true.B
+
+  val empty_stream = if (use_group_control) {
+    req.max_k === 0.U || req.max_j === 0.U
+  } else {
+    req.max_k === 0.U
   }
 
-  val loop_has_room = if (use_group_control) !io.loop_full.get else true.B
-
-  when (req.max_k === 0.U && loop_has_room) {
+  when (empty_stream && loop_has_room) {
     state := idle
   }.elsewhen (io.cmd.fire) {
     // The order here is k, j, i
@@ -343,15 +325,16 @@ class LoopMatmulLdDReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
                        val use_vpu_fusion: Boolean) extends Bundle {
   val max_j = UInt(iterator_bitwidth.W)
   val max_i = UInt(iterator_bitwidth.W)
+  val global_j = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val j_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val i_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
   val pad_j = UInt(log2Up(block_size).W)
   val pad_i = UInt(log2Up(block_size).W)
-  val laddrI_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None // made
   val dram_addr = UInt(coreMaxAddrBits.W)
   val dram_stride = UInt(coreMaxAddrBits.W)
   val tile_row_offset = UInt(iterator_bitwidth.W)
   val tile_col_offset = UInt(iterator_bitwidth.W)
   val low_d = Bool()
-  val d_from_vsram = if (use_vpu_fusion) Some(Bool()) else None
   val addr_start = UInt(log2Up(max_acc_addr).W)
   val loop_id = UInt(log2Up(concurrent_loops).W)
 }
@@ -383,36 +366,34 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     iterator_bitwidth, max_acc_addr, concurrent_loops,
     use_shared_res_entries, use_vpu_fusion))
 
-  val ordinaryMaxBlocks = Mux(req.low_d,
+  val max_blocks_without_page_limit = Mux(req.low_d,
     Mux(req.max_j <= max_block_len.U, req.max_j, max_block_len.U),
     Mux(req.max_j <= max_block_len_acc.U, req.max_j, max_block_len_acc.U))
-  val max_blocks_without_page_limit = if (use_vpu_fusion) {
-    Mux(req.d_from_vsram.get, 1.U, ordinaryMaxBlocks)
-  } else {
-    ordinaryMaxBlocks
-  }
 
   val j = Reg(UInt(iterator_bitwidth.W))
   val i = Reg(UInt(iterator_bitwidth.W))
 
-  // changed
-  // val acc_addr_start = req.addr_start
-  val acc_addr_start = if (use_shared_res_entries) {
-    req.addr_start + req.laddrI_offset.get * req.max_j * block_size.U
-  } else {
-    req.addr_start
-  }
-  // end
+  val global_i = if (use_shared_res_entries) req.i_offset.get + i else i
+  val global_j = if (use_shared_res_entries) req.j_offset.get + j else j
+  val global_j_bound = if (use_shared_res_entries) req.global_j.get else req.max_j
+  val acc_addr_start = req.addr_start
 
   val dram_stride = LoopMatmul.pagePackedStridePayload(req.dram_stride)
   val page_packed = LoopMatmul.isPagePackedStride(req.dram_stride)
-  val page_packed_i_offset = if (use_shared_res_entries) req.laddrI_offset.get else 0.U(iterator_bitwidth.W)
-  val page_packed_i = req.tile_row_offset + i + page_packed_i_offset
-  val page_packed_j = req.tile_col_offset + j
+  val page_packed_i = req.tile_row_offset + global_i
+  val page_packed_j = req.tile_col_offset + global_j
   val input_page_col_blocks = LoopMatmul.pagePacked2DColBlocks(block_size, input_w/8, max_block_len)
   val acc_page_col_blocks = LoopMatmul.pagePacked2DColBlocks(block_size, acc_w/8, max_block_len_acc)
-  val page_packed_col_blocks = Mux(req.low_d, input_page_col_blocks.U, acc_page_col_blocks.U)
-  val page_packed_blocks_left = page_packed_col_blocks - page_packed_j % page_packed_col_blocks
+  require(input_page_col_blocks > 0 && acc_page_col_blocks > 0,
+    "page-packed D tiles must fit at least one column block per page")
+  // Keep both divisors elaboration-time constants. Selecting a divisor first
+  // turns this into a costly variable modulo in the generated RTL.
+  val input_page_blocks_left =
+    input_page_col_blocks.U - page_packed_j % input_page_col_blocks.U
+  val acc_page_blocks_left =
+    acc_page_col_blocks.U - page_packed_j % acc_page_col_blocks.U
+  val page_packed_blocks_left = Mux(req.low_d,
+    input_page_blocks_left, acc_page_blocks_left)
   val max_blocks = Mux(page_packed && page_packed_blocks_left < max_blocks_without_page_limit,
     page_packed_blocks_left, max_blocks_without_page_limit)
   val row_major_dram_offset = Mux(req.low_d, (i * dram_stride + j) * block_size.U * (input_w/8).U,
@@ -421,24 +402,8 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     LoopMatmul.pagePacked2DOffset(page_packed_i, page_packed_j, dram_stride, block_size, input_w/8, max_block_len),
     LoopMatmul.pagePacked2DOffset(page_packed_i, page_packed_j, dram_stride, block_size, acc_w/8, max_block_len_acc))
   val dram_offset = Mux(page_packed, page_packed_dram_offset, row_major_dram_offset)
-  val sp_addr = acc_addr_start + (i * req.max_j + j) * block_size.U
-  val ordinaryDramAddr = req.dram_addr + LoopMatmul.castDramOffset(dram_offset)
-  val dram_addr = if (use_vpu_fusion) {
-    // In D_FROM_VSRAM mode the configured D address is a VSRAM matrix-row
-    // base, not a byte address. One LOAD3 covers one DIM-wide tile, and its
-    // row source advances in the same tile-major order as C_TO_VSRAM.
-    val vsram_i = if (use_shared_res_entries) {
-      req.laddrI_offset.get + i
-    } else {
-      i
-    }
-    val vsram_row_offset = (vsram_i * req.max_j + j) * block_size.U
-    Mux(req.d_from_vsram.get,
-      req.dram_addr + vsram_row_offset.pad(coreMaxAddrBits),
-      ordinaryDramAddr)
-  } else {
-    ordinaryDramAddr
-  }
+  val sp_addr = acc_addr_start + (global_i * global_j_bound + global_j) * block_size.U
+  val dram_addr = req.dram_addr + LoopMatmul.castDramOffset(dram_offset)
   val blocks = Mux(j + max_blocks <= req.max_j, max_blocks, req.max_j-j)
   val cols = (blocks * block_size.U) - Mux(j + blocks >= req.max_j, req.pad_j, 0.U)
   val rows = block_size.U - Mux(i === req.max_i-1.U, req.pad_i, 0.U)
@@ -454,27 +419,16 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   mvin_cmd_rs2.num_cols := cols.asUInt
   val acc_local_addr = cast_to_acc_addr(mvin_cmd_rs2.local_addr, sp_addr,
     accumulate = false.B, read_full = false.B)
-  mvin_cmd_rs2.local_addr := (if (use_vpu_fusion) {
-    with_d_from_vsram(acc_local_addr, req.d_from_vsram.get)
-  } else {
-    acc_local_addr
-  })
+  mvin_cmd_rs2.local_addr := acc_local_addr
   mvin_cmd.rs2 := mvin_cmd_rs2.asUInt
 
   io.req.ready := state === idle
   io.idle := state === idle
 
   // The order here is k, j, i
-  // changed
-  // io.cmd.valid := state =/= idle && !io.rob_overloaded && req.dram_addr =/= 0.U
   if (use_shared_res_entries) {
-    val hasDSource = if (use_vpu_fusion) {
-      req.d_from_vsram.get || req.dram_addr =/= 0.U
-    } else {
-      req.dram_addr =/= 0.U
-    }
     io.cmd.valid := state =/= idle && !io.rob_overloaded &&
-      hasDSource && req.max_i =/= 0.U
+      req.dram_addr =/= 0.U && req.max_i =/= 0.U && req.max_j =/= 0.U
   } else {
     io.cmd.valid := state =/= idle && !io.rob_overloaded && req.dram_addr =/= 0.U
   }
@@ -482,12 +436,7 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 
   io.loop_id := req.loop_id
 
-  val noDSource = if (use_vpu_fusion) {
-    !req.d_from_vsram.get && req.dram_addr === 0.U
-  } else {
-    req.dram_addr === 0.U
-  }
-  when (noDSource || req.max_i === 0.U) {
+  when (req.dram_addr === 0.U || req.max_i === 0.U || req.max_j === 0.U) {
     state := idle
   }.elsewhen (io.cmd.fire) {
     // The order here is k, j, i
@@ -503,10 +452,6 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   }
 
   when (io.req.fire) {
-    if (use_vpu_fusion) {
-      assert(!(io.req.bits.d_from_vsram.get && io.req.bits.low_d),
-        "D_FROM_VSRAM is an FP32 accumulator load and cannot use low_D")
-    }
     req := io.req.bits
     state := ld
     j := 0.U
@@ -516,43 +461,45 @@ class LoopMatmulLdD(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 
 // Compute
 class LoopMatmulExecuteReq(val block_size: Int, val coreMaxAddrBits: Int, val iterator_bitwidth: Int, val max_addr: Int,
-                           val max_acc_addr: Int, val concurrent_loops: Int, val group_w: Int, val nSharers: Int,
+                           val max_acc_addr: Int, val concurrent_loops: Int,
                            val use_shared_res_entries: Boolean,
                            val use_vpu_fusion: Boolean) extends Bundle {
-  private val use_group_control = use_shared_res_entries || use_vpu_fusion
   val max_j = UInt(iterator_bitwidth.W)
   val max_k = UInt(iterator_bitwidth.W)
   val max_i = UInt(iterator_bitwidth.W)
-  val max_fi = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None // made
+  val global_j = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val global_k = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val global_i = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val j_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val k_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val i_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val partition_axis = if (use_shared_res_entries) Some(UInt(2.W)) else None
   val pad_j = UInt(log2Up(block_size).W)
   val pad_k = UInt(log2Up(block_size).W)
   val pad_i = UInt(log2Up(block_size).W)
   val a_tranpose = Bool()
   val b_tranpose = Bool()
   val accumulate = Bool()
-  val a_from_vsram = if (use_vpu_fusion) Some(Bool()) else None
-  val c_to_vsram = if (use_vpu_fusion) Some(Bool()) else None
-  val a_addr_start = UInt(log2Up(max_addr).W)
+  val a_from_acc = Bool()
+  val a_addr_start = UInt(log2Up(max_addr max max_acc_addr).W)
   val b_addr_end = UInt(log2Up(max_addr+1).W)
   val c_addr_start = UInt(log2Up(max_acc_addr).W)
-  // made
-  val laddrI_ex_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
-  val group_id = if (use_group_control) Some(UInt(group_w.W)) else None
-  val group_list = if (use_group_control) Some(UInt(nSharers.W)) else None
-  // end
   val loop_id = UInt(log2Up(concurrent_loops).W)
 }
 
 class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: Int, max_addr: Int, max_acc_addr: Int, concurrent_loops: Int,
                         preload_rs1_t: PreloadRs, preload_rs2_t: PreloadRs,
                         compute_rs1_t: ComputeRs, compute_rs2_t: ComputeRs, use_shared_res_entries: Boolean,
-                       use_vpu_fusion: Boolean, group_w: Int, nSharers: Int)
+                       use_vpu_fusion: Boolean)
                        (implicit p: Parameters) extends Module {
-  private val use_group_control = use_shared_res_entries || use_vpu_fusion
+  // Cooperative operand readiness and the K pair scheduler belong to the MNK
+  // shared-loop path.  Fusion-only grouping waits at the outer LoopMatmul
+  // lifecycle gate and must not elaborate these datapaths.
+  private val use_mnk_scheduler = use_shared_res_entries
   val io = IO(new Bundle {
     val req = Flipped(Decoupled(new LoopMatmulExecuteReq(block_size,
       coreMaxAddrBits, iterator_bitwidth, max_addr, max_acc_addr,
-      concurrent_loops, group_w, nSharers, use_shared_res_entries,
+      concurrent_loops, use_shared_res_entries,
       use_vpu_fusion)))
     val cmd = Decoupled(Output(new RoCCCommand))
 
@@ -561,11 +508,11 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
     val i = Output(UInt(iterator_bitwidth.W))
 
     val ld_ka = Input(UInt(iterator_bitwidth.W))
-    val ld_kb = if (use_group_control) None else Some(Input(UInt(iterator_bitwidth.W)))
-    val ld_j = if (use_group_control) None else Some(Input(UInt(iterator_bitwidth.W)))
+    val ld_kb = Input(UInt(iterator_bitwidth.W))
+    val ld_j = Input(UInt(iterator_bitwidth.W))
     val ld_i = Input(UInt(iterator_bitwidth.W))
     val lda_completed = Input(Bool())
-    val ldb_completed = if (use_group_control) None else Some(Input(Bool()))
+    val ldb_completed = Input(Bool())
     val ldd_completed = Input(Bool())
 
     val idle = Output(Bool())
@@ -573,9 +520,12 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
 
     val loop_id = Output(UInt(log2Up(concurrent_loops).W))
 
-    val group_id = if (use_group_control) Some(Output(UInt(group_w.W))) else None // made
-    val group_list = if (use_group_control) Some(Output(UInt(nSharers.W))) else None // made
-    val ldb_ahead = if (use_group_control) Some(Input(Bool())) else None // made
+    val coop_operand_registered = if (use_mnk_scheduler) Some(Input(Bool())) else None
+    // K partitioning keeps each PRELOAD/COMPUTE pair indivisible. This grant
+    // also includes the all-member D-load registration barrier.
+    val k_execute_ready = if (use_mnk_scheduler) Some(Input(Bool())) else None
+    val is_compute = if (use_mnk_scheduler) Some(Output(Bool())) else None
+    val is_last_local_k = if (use_mnk_scheduler) Some(Output(Bool())) else None
   })
 
   object State extends ChiselEnum {
@@ -585,55 +535,38 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
   val state = RegInit(idle)
 
   val req = Reg(new LoopMatmulExecuteReq(block_size, coreMaxAddrBits,
-    iterator_bitwidth, max_addr, max_acc_addr, concurrent_loops, group_w,
-    nSharers, use_shared_res_entries, use_vpu_fusion))
+    iterator_bitwidth, max_addr, max_acc_addr, concurrent_loops,
+    use_shared_res_entries, use_vpu_fusion))
 
-  if (use_vpu_fusion) {
-    require(compute_rs1_t.local_addr.garbage.getWidth >= 2,
-      "Gemmini/VPU fusion requires two LocalAddr garbage bits")
-    require(preload_rs2_t.local_addr.garbage.getWidth >= 2,
-      "Gemmini/VPU fusion requires two LocalAddr garbage bits")
-  }
+  val global_i_bound = if (use_shared_res_entries) req.global_i.get else req.max_i
+  val global_j_bound = if (use_shared_res_entries) req.global_j.get else req.max_j
+  val global_k_bound = if (use_shared_res_entries) req.global_k.get else req.max_k
+  val i_offset = if (use_shared_res_entries) req.i_offset.get else 0.U(iterator_bitwidth.W)
+  val j_offset = if (use_shared_res_entries) req.j_offset.get else 0.U(iterator_bitwidth.W)
+  val k_offset = if (use_shared_res_entries) req.k_offset.get else 0.U(iterator_bitwidth.W)
 
-  // changed
-  // val c_addr_start = /*(BigInt(1) << 31).U |*/ req.c_addr_start
-  val c_addr_start = if (use_shared_res_entries) {
-    /*(BigInt(1) << 31).U |*/ req.c_addr_start + req.laddrI_ex_offset.get * req.max_j * block_size.U
-  } else {
-    /*(BigInt(1) << 31).U |*/ req.c_addr_start
-  }
-  // end
-  val b_addr_start = req.b_addr_end - req.max_k * req.max_j * block_size.U
-  // made
-  val a_addr_start = if (use_shared_res_entries) {
-    req.a_addr_start + Mux(req.a_tranpose, req.laddrI_ex_offset.get, req.laddrI_ex_offset.get * req.max_k) * block_size.U
-  } else {
-    req.a_addr_start
-  }
-  // end
+  val c_addr_start = req.c_addr_start
+  val b_addr_start = req.b_addr_end - global_k_bound * global_j_bound * block_size.U
+  val a_addr_start = req.a_addr_start
 
   val k = Reg(UInt(iterator_bitwidth.W))
   val j = Reg(UInt(iterator_bitwidth.W))
   val i = Reg(UInt(iterator_bitwidth.W))
 
-  val a_row = Mux(req.a_tranpose, k, i)
-  val a_col = Mux(req.a_tranpose, i, k)
-  val b_row = Mux(req.b_tranpose, j, k)
-  val b_col = Mux(req.b_tranpose, k, j)
+  val global_i = i_offset + i
+  val global_j = j_offset + j
+  val global_k = k_offset + k
+  val a_row = Mux(req.a_tranpose, global_k, global_i)
+  val a_col = Mux(req.a_tranpose, global_i, global_k)
+  val b_row = Mux(req.b_tranpose, global_j, global_k)
+  val b_col = Mux(req.b_tranpose, global_k, global_j)
 
-  val a_max_col = if (use_shared_res_entries) {
-    Mux(req.a_tranpose, req.max_fi.get, req.max_k)
-  } else {
-    Mux(req.a_tranpose, req.max_i, req.max_k)
-  } // changed
-  val b_max_col = Mux(req.b_tranpose, req.max_k, req.max_j)
+  val a_max_col = Mux(req.a_tranpose, global_i_bound, global_k_bound)
+  val b_max_col = Mux(req.b_tranpose, global_k_bound, global_j_bound)
 
-  // changed
-  // val a_addr = req.a_addr_start + (a_row * a_max_col + a_col) * block_size.U
   val a_addr = a_addr_start + (a_row * a_max_col + a_col) * block_size.U
-  // end
   val b_addr = b_addr_start + (b_row * b_max_col + b_col) * block_size.U
-  val c_addr = c_addr_start + (i * req.max_j + j) * block_size.U
+  val c_addr = c_addr_start + (global_i * global_j_bound + global_j) * block_size.U
 
   val a_cols = block_size.U - Mux(k === req.max_k - 1.U, req.pad_k, 0.U)
   val a_rows = block_size.U - Mux(i === req.max_i - 1.U, req.pad_i, 0.U)
@@ -659,14 +592,7 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
   pre_cmd_rs2.num_cols := c_cols.asUInt
   val pre_c_addr = cast_to_acc_addr(pre_cmd_rs2.local_addr, c_addr,
     accumulate = req.accumulate || k =/= 0.U, read_full = false.B)
-  if (use_vpu_fusion) {
-    // Only the final K tile owns the fully accumulated C value. Earlier K
-    // tiles must continue to write their FP32 partial sums to the ACC SRAM.
-    pre_cmd_rs2.local_addr := with_c_to_vsram(pre_c_addr,
-      req.c_to_vsram.get && k === req.max_k - 1.U)
-  } else {
-    pre_cmd_rs2.local_addr := pre_c_addr
-  }
+  pre_cmd_rs2.local_addr := pre_c_addr
 
   pre_cmd.rs1 := pre_cmd_rs1.asUInt
   pre_cmd.rs2 := pre_cmd_rs2.asUInt
@@ -679,13 +605,10 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
   comp_cmd_rs1 := DontCare
   comp_cmd_rs1.num_rows := a_rows.asUInt
   comp_cmd_rs1.num_cols := a_cols.asUInt
-  val comp_a_addr = cast_to_sp_addr(comp_cmd_rs1.local_addr, a_addr)
-  if (use_vpu_fusion) {
-    comp_cmd_rs1.local_addr := with_a_from_vsram(comp_a_addr,
-      req.a_from_vsram.get)
-  } else {
-    comp_cmd_rs1.local_addr := comp_a_addr
-  }
+  comp_cmd_rs1.local_addr := Mux(req.a_from_acc,
+    cast_to_acc_addr(comp_cmd_rs1.local_addr, a_addr,
+      accumulate = false.B, read_full = false.B),
+    cast_to_sp_addr(comp_cmd_rs1.local_addr, a_addr))
 
   val comp_cmd_rs2 = Wire(compute_rs2_t.cloneType)
   comp_cmd_rs2 := DontCare
@@ -702,27 +625,40 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
   io.i := i
   io.idle := state === idle
 
-  if (use_group_control) {
-    io.group_id.get := req.group_id.get // made
-    io.group_list.get := req.group_list.get // made
+  if (use_mnk_scheduler) {
+    io.is_compute.get := state === comp
+    io.is_last_local_k.get := k === req.max_k - 1.U
   }
 
   // The order here is k, j, i
-  val lda_ahead = io.lda_completed || io.ld_ka > k || (io.ld_ka === k && io.ld_i > i)
-  val ldb_ahead = if (use_group_control) {
-    io.ldb_ahead.get
+  val local_a_load_ahead = io.lda_completed || io.ld_ka > k ||
+    (io.ld_ka === k && io.ld_i > i)
+  val local_b_load_ahead = io.ldb_completed || io.ld_kb > k ||
+    (io.ld_kb === k && io.ld_j > j)
+  val (operands_ahead, groupReady) = if (use_mnk_scheduler) {
+    val axis = req.partition_axis.get
+    val cooperativeOperandRegistered = io.coop_operand_registered.get
+    val aLoadAhead = Mux(axis === GemminiISA.PartitionAxis.N,
+      cooperativeOperandRegistered, local_a_load_ahead)
+    val bLoadAhead = Mux(axis === GemminiISA.PartitionAxis.M,
+      cooperativeOperandRegistered, local_b_load_ahead)
+    // The K group grant below already includes the all-member D-load barrier.
+    val dLoadAhead = Mux(axis === GemminiISA.PartitionAxis.K,
+      true.B, io.ldd_completed)
+    val ready = Mux(axis === GemminiISA.PartitionAxis.K,
+      io.k_execute_ready.get, true.B)
+    (aLoadAhead && bLoadAhead && dLoadAhead, ready)
   } else {
-    io.ldb_completed.get || io.ld_kb.get > k || (io.ld_kb.get === k && io.ld_j.get > j)
+    (local_a_load_ahead && local_b_load_ahead && io.ldd_completed, true.B)
   }
-  val ldd_ahead = io.ldd_completed
-  val ld_ahead = lda_ahead && ldb_ahead && ldd_ahead
-
-  io.cmd.valid := state =/= idle && !io.rob_overloaded && ld_ahead && req.max_i =/= 0.U
+  io.cmd.valid := state =/= idle && !io.rob_overloaded && operands_ahead &&
+    groupReady &&
+    req.max_i =/= 0.U && req.max_j =/= 0.U && req.max_k =/= 0.U
   io.cmd.bits := Mux(state === pre, pre_cmd, comp_cmd)
 
   io.loop_id := req.loop_id
 
-  when (req.max_i === 0.U) {
+  when (req.max_i === 0.U || req.max_j === 0.U || req.max_k === 0.U) {
     state := idle
   }.elsewhen (io.cmd.fire) {
     when (state === pre) {
@@ -754,15 +690,16 @@ class LoopMatmulExecute(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth
 // StC
 
 class LoopMatmulStCReq(val block_size: Int, val coreMaxAddrBits: Int, val iterator_bitwidth: Int, val max_acc_addr: Int,
-                       val concurrent_loops: Int, val group_w: Int, val use_shared_res_entries: Boolean,
+                       val concurrent_loops: Int, val use_shared_res_entries: Boolean,
                        val use_vpu_fusion: Boolean) extends Bundle {
-  private val use_group_control = use_shared_res_entries || use_vpu_fusion
   val max_k = UInt(iterator_bitwidth.W)
   val max_j = UInt(iterator_bitwidth.W)
   val max_i = UInt(iterator_bitwidth.W)
+  val global_j = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val j_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val i_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
   val pad_j = UInt(log2Up(block_size).W)
   val pad_i = UInt(log2Up(block_size).W)
-  val laddrI_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None // made
   val dram_addr = UInt(coreMaxAddrBits.W)
   val dram_stride = UInt(coreMaxAddrBits.W)
   val tile_row_offset = UInt(iterator_bitwidth.W)
@@ -771,16 +708,19 @@ class LoopMatmulStCReq(val block_size: Int, val coreMaxAddrBits: Int, val iterat
   val act = UInt(Activation.bitwidth.W)
   val addr_start = UInt(log2Up(max_acc_addr).W)
   val loop_id = UInt(log2Up(concurrent_loops).W)
-  val group_id = if (use_group_control) Some(UInt(group_w.W)) else None // made
+  val partition_axis = if (use_shared_res_entries) Some(UInt(2.W)) else None
 }
 
 class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: Int, max_acc_addr: Int, input_w: Int, acc_w: Int,
-                    max_block_len: Int, max_block_len_acc: Int, concurrent_loops: Int, mvout_rs2_t: MvoutRs2, group_w: Int,
-                    use_shared_res_entries: Boolean, use_vpu_fusion: Boolean)
+                    max_block_len: Int, max_block_len_acc: Int, concurrent_loops: Int, mvout_rs2_t: MvoutRs2,
+                   use_shared_res_entries: Boolean, use_vpu_fusion: Boolean,
+                    has_normalizations: Boolean = true)
                    (implicit p: Parameters) extends Module {
-  private val use_group_control = use_shared_res_entries || use_vpu_fusion
+  private val use_mnk_scheduler = use_shared_res_entries
   val io = IO(new Bundle {
-    val req = Flipped(Decoupled(new LoopMatmulStCReq(block_size, coreMaxAddrBits, iterator_bitwidth, max_acc_addr, concurrent_loops, group_w, use_shared_res_entries, use_vpu_fusion)))
+    val req = Flipped(Decoupled(new LoopMatmulStCReq(block_size, coreMaxAddrBits,
+      iterator_bitwidth, max_acc_addr, concurrent_loops,
+      use_shared_res_entries, use_vpu_fusion)))
     val cmd = Decoupled(Output(new RoCCCommand))
 
     val ex_k = Input(UInt(iterator_bitwidth.W))
@@ -788,15 +728,19 @@ class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     val ex_i = Input(UInt(iterator_bitwidth.W))
     val ex_completed = Input(Bool())
 
-    val j = Output(UInt(iterator_bitwidth.W))
-    val i = Output(UInt(iterator_bitwidth.W))
+    val global_j = Output(UInt(iterator_bitwidth.W))
+    val global_i = Output(UInt(iterator_bitwidth.W))
+    val store_j_blocks = Output(UInt(iterator_bitwidth.W))
+    // This request intentionally excludes k_store_grant to avoid a
+    // combinational request/grant loop in the group controller.
+    val registration_request = Output(Bool())
 
     val idle = Output(Bool())
     val rob_overloaded = Input(Bool())
 
     val loop_id = Output(UInt(log2Up(concurrent_loops).W))
 
-    val group_id = if (use_group_control) Some(Output(UInt(group_w.W))) else None // made
+    val k_store_grant = if (use_mnk_scheduler) Some(Input(Bool())) else None
   })
 
   object State extends ChiselEnum {
@@ -805,7 +749,9 @@ class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   import State._
   val state = RegInit(idle)
 
-  val req = Reg(new LoopMatmulStCReq(block_size, coreMaxAddrBits, iterator_bitwidth, max_acc_addr, concurrent_loops, group_w, use_shared_res_entries, use_vpu_fusion))
+  val req = Reg(new LoopMatmulStCReq(block_size, coreMaxAddrBits,
+    iterator_bitwidth, max_acc_addr, concurrent_loops,
+    use_shared_res_entries, use_vpu_fusion))
 
   val max_blocks_without_page_limit = Mux(req.full_c, 1.U, Mux(req.max_j <= max_block_len.U, req.max_j, max_block_len.U))
 
@@ -813,23 +759,27 @@ class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   val j = Reg(UInt(iterator_bitwidth.W))
   val i = Reg(UInt(iterator_bitwidth.W))
 
-  // changed
-  // val acc_addr_start = /*(BigInt(1) << 31).U | (req.full_c << 29.U).asUInt |*/ req.addr_start
-  val acc_addr_start = if (use_shared_res_entries) {
-    /*(BigInt(1) << 31).U | (req.full_c << 29.U).asUInt |*/ req.addr_start + req.laddrI_offset.get * req.max_j * block_size.U
-  } else {
-    /*(BigInt(1) << 31).U | (req.full_c << 29.U).asUInt |*/ req.addr_start
-  }
+  val global_i = if (use_shared_res_entries) req.i_offset.get + i else i
+  val global_j = if (use_shared_res_entries) req.j_offset.get + j else j
+  val global_j_bound = if (use_shared_res_entries) req.global_j.get else req.max_j
+  val acc_addr_start = req.addr_start
 
   val dram_stride = LoopMatmul.pagePackedStridePayload(req.dram_stride)
   val page_packed = LoopMatmul.isPagePackedStride(req.dram_stride)
-  val page_packed_i_offset = if (use_shared_res_entries) req.laddrI_offset.get else 0.U(iterator_bitwidth.W)
-  val page_packed_i = req.tile_row_offset + i + page_packed_i_offset
-  val page_packed_j = req.tile_col_offset + j
+  val page_packed_i = req.tile_row_offset + global_i
+  val page_packed_j = req.tile_col_offset + global_j
   val input_page_col_blocks = LoopMatmul.pagePacked2DColBlocks(block_size, input_w/8, max_block_len)
   val acc_page_col_blocks = LoopMatmul.pagePacked2DColBlocks(block_size, acc_w/8, max_block_len_acc)
-  val page_packed_col_blocks = Mux(req.full_c, acc_page_col_blocks.U, input_page_col_blocks.U)
-  val page_packed_blocks_left = page_packed_col_blocks - page_packed_j % page_packed_col_blocks
+  require(input_page_col_blocks > 0 && acc_page_col_blocks > 0,
+    "page-packed C tiles must fit at least one column block per page")
+  // Keep both divisors elaboration-time constants so `%` becomes constant
+  // arithmetic rather than a variable-divisor modulo network.
+  val input_page_blocks_left =
+    input_page_col_blocks.U - page_packed_j % input_page_col_blocks.U
+  val acc_page_blocks_left =
+    acc_page_col_blocks.U - page_packed_j % acc_page_col_blocks.U
+  val page_packed_blocks_left = Mux(req.full_c,
+    acc_page_blocks_left, input_page_blocks_left)
   val max_blocks = Mux(page_packed && page_packed_blocks_left < max_blocks_without_page_limit,
     page_packed_blocks_left, max_blocks_without_page_limit)
   val row_major_dram_offset = Mux(req.full_c, (i * dram_stride + j) * block_size.U * (acc_w/8).U,
@@ -839,7 +789,7 @@ class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
     LoopMatmul.pagePacked2DOffset(page_packed_i, page_packed_j, dram_stride, block_size, input_w/8, max_block_len))
   val dram_offset = Mux(page_packed, page_packed_dram_offset, row_major_dram_offset)
   val dram_addr = req.dram_addr + LoopMatmul.castDramOffset(dram_offset)
-  val sp_addr = acc_addr_start + (i * req.max_j + j) * block_size.U
+  val sp_addr = acc_addr_start + (global_i * global_j_bound + global_j) * block_size.U
   val blocks = Mux(j + max_blocks <= req.max_j, max_blocks, req.max_j-j)
   val cols = (blocks * block_size.U) - Mux(j + blocks >= req.max_j, req.pad_j, 0.U)
   val rows = block_size.U - Mux(i === req.max_i-1.U, req.pad_i, 0.U)
@@ -856,126 +806,169 @@ class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
   mvout_cmd_rs2.local_addr := cast_to_acc_addr(mvout_cmd_rs2.local_addr, sp_addr, accumulate = false.B, read_full = req.full_c)
   mvout_cmd.rs2 := mvout_cmd_rs2.asUInt
 
-  // Layernorm iterators and calculations
-  val ln_row = Reg(UInt(iterator_bitwidth.W))
-  val ln_cmd = Reg(UInt(iterator_bitwidth.W))
-  val ln_stat_id = Reg(UInt(iterator_bitwidth.W))
-
-  val NORM_STAT_IDS = 4 // TODO magic number
-
-  val ln_norm_cmds = VecInit(VecInit(NormCmd.SUM, NormCmd.MEAN), VecInit(NormCmd.VARIANCE, NormCmd.INV_STDDEV),
-    VecInit(NormCmd.RESET, NormCmd.RESET))
-
-  val sm_norm_cmds = VecInit(VecInit(NormCmd.MAX, NormCmd.MAX), VecInit(NormCmd.SUM_EXP, NormCmd.INV_SUM_EXP),
-    VecInit(NormCmd.RESET, NormCmd.RESET))
-
-  val ln_stat_ids = Mux(rows -& ln_row > NORM_STAT_IDS.U, NORM_STAT_IDS.U, rows -& ln_row)
-
-  val ln_r = ln_row +& ln_stat_id
-
-  val ln_sp_addr = acc_addr_start +& (i * req.max_j +& j) * block_size.U +& ln_r
-  val ln_norm_cmd = Mux(j +& blocks >= req.max_j,
-    Mux(req.act === Activation.LAYERNORM, ln_norm_cmds(ln_cmd)(1), sm_norm_cmds(ln_cmd)(1)),
-    Mux(req.act === Activation.LAYERNORM, ln_norm_cmds(ln_cmd)(0), sm_norm_cmds(ln_cmd)(0)))
-
-  // TODO we assume for now that full_C and layernorm aren't true at the same
-  val ln_dram_offset = ((i * dram_stride +& j) * block_size.U +& ln_r * dram_stride) * (input_w/8).U
-  val ln_dram_addr = req.dram_addr + LoopMatmul.castDramOffset(ln_dram_offset)
-
-  val ln_config_norm_rs1 = Wire(new GemminiISA.ConfigNormRs1)
-  ln_config_norm_rs1 := DontCare
-  ln_config_norm_rs1.set_stats_id_only := 1.U
-  ln_config_norm_rs1.cmd_type := CONFIG_NORM
-  ln_config_norm_rs1.norm_stats_id := ln_stat_id
-
-  val ln_config_norm = Wire(new RoCCCommand)
-  ln_config_norm := DontCare
-  ln_config_norm.inst.funct := CONFIG_CMD
-  ln_config_norm.rs1 := ln_config_norm_rs1.asUInt
-  ln_config_norm.rs2 := DontCare
-
-  val ln_mvout_cmd = Wire(new RoCCCommand)
-  ln_mvout_cmd := DontCare
-  ln_mvout_cmd.inst.funct := STORE_CMD
-  ln_mvout_cmd.rs1 := ln_dram_addr
-
-  val ln_mvout_cmd_rs2 = Wire(mvout_rs2_t.cloneType)
-  ln_mvout_cmd_rs2 := DontCare
-  ln_mvout_cmd_rs2.num_rows := 1.U
-  ln_mvout_cmd_rs2.num_cols := cols.asUInt
-  ln_mvout_cmd_rs2.local_addr := cast_to_acc_addr(ln_mvout_cmd_rs2.local_addr, ln_sp_addr, accumulate = false.B, read_full = req.full_c)
-  ln_mvout_cmd_rs2.local_addr.norm_cmd := ln_norm_cmd
-  ln_mvout_cmd.rs2 := ln_mvout_cmd_rs2.asUInt
-
   io.req.ready := state === idle
-  io.j := j
-  io.i := i
+  io.global_j := global_j
+  io.global_i := global_i
+  io.store_j_blocks := blocks
   io.idle := state === idle
 
-  if (use_group_control) {
-    io.group_id.get := req.group_id.get // made
-  }
+  // The order here is k, j, i. Normalization configs retain their original
+  // completion-only gate; configs without normalization elaborate no act
+  // comparators or normalization command path at all.
+  val ordinaryExAhead = io.ex_k === req.max_k - 1.U &&
+    (io.ex_j >= j + blocks ||
+      (io.ex_j === j + blocks - 1.U && io.ex_i > i))
+  val ex_ahead = io.ex_completed || (if (has_normalizations) {
+    req.act =/= Activation.LAYERNORM &&
+      req.act =/= Activation.SOFTMAX && ordinaryExAhead
+  } else ordinaryExAhead)
 
-  // The order here is k, j, i when not doing LAYERNORM or SOFTMAX
-  val ex_ahead = io.ex_completed ||
-    ((req.act =/= Activation.LAYERNORM) && (req.act =/= Activation.SOFTMAX) &&
-      (io.ex_k === req.max_k - 1.U &&
-        (io.ex_j >= j + blocks ||
-          ((io.ex_j === j + blocks - 1.U) && io.ex_i > i))))
-
-  io.cmd.valid := state =/= idle && !io.rob_overloaded && ex_ahead && req.dram_addr =/= 0.U && req.max_i =/= 0.U
-  io.cmd.bits := MuxCase(mvout_cmd, Seq(
-    (state === ln_config) -> ln_config_norm,
-    (state === ln_st) -> ln_mvout_cmd,
-  ))
-
+  // K uses the group controller's per-range final-K frontier instead of this
+  // pod's legacy local Execute cursor. M/N retain the original ex_ahead gate.
+  val storeRegistrationAhead = if (use_mnk_scheduler) {
+    Mux(req.partition_axis.get === GemminiISA.PartitionAxis.K,
+      true.B, ex_ahead)
+  } else ex_ahead
+  val storeRequest = state =/= idle && !io.rob_overloaded &&
+    storeRegistrationAhead &&
+    req.dram_addr =/= 0.U && req.max_i =/= 0.U &&
+    req.max_j =/= 0.U && blocks =/= 0.U
+  val kStoreGranted = if (use_mnk_scheduler) {
+    Mux(req.partition_axis.get === GemminiISA.PartitionAxis.K,
+      io.k_store_grant.get, true.B)
+  } else true.B
+  io.registration_request := storeRequest
+  io.cmd.valid := storeRequest && kStoreGranted
   io.loop_id := req.loop_id
 
-  when (req.dram_addr === 0.U || req.max_i === 0.U) {
-    state := idle
-  }.elsewhen (io.cmd.fire() && state === st) {
-    // The order here is k, j, i
-    val next_i = floorAdd(i, 1.U, req.max_i)
-    val next_j = floorAdd(j, blocks, req.max_j, next_i === 0.U)
+  if (has_normalizations) {
+    // Layernorm/softmax state and datapath are generated only for configs
+    // whose StoreController can consume normalization commands.
+    val ln_row = Reg(UInt(iterator_bitwidth.W))
+    val ln_cmd = Reg(UInt(iterator_bitwidth.W))
+    val ln_stat_id = Reg(UInt(iterator_bitwidth.W))
+    val NORM_STAT_IDS = 4
+    val ln_norm_cmds = VecInit(
+      VecInit(NormCmd.SUM, NormCmd.MEAN),
+      VecInit(NormCmd.VARIANCE, NormCmd.INV_STDDEV),
+      VecInit(NormCmd.RESET, NormCmd.RESET))
+    val sm_norm_cmds = VecInit(
+      VecInit(NormCmd.MAX, NormCmd.MAX),
+      VecInit(NormCmd.SUM_EXP, NormCmd.INV_SUM_EXP),
+      VecInit(NormCmd.RESET, NormCmd.RESET))
+    val ln_stat_ids = Mux(rows -& ln_row > NORM_STAT_IDS.U,
+      NORM_STAT_IDS.U, rows -& ln_row)
+    val ln_r = ln_row +& ln_stat_id
+    val ln_sp_addr = acc_addr_start +&
+      (global_i * global_j_bound +& global_j) * block_size.U +& ln_r
+    val ln_norm_cmd = Mux(j +& blocks >= req.max_j,
+      Mux(req.act === Activation.LAYERNORM,
+        ln_norm_cmds(ln_cmd)(1), sm_norm_cmds(ln_cmd)(1)),
+      Mux(req.act === Activation.LAYERNORM,
+        ln_norm_cmds(ln_cmd)(0), sm_norm_cmds(ln_cmd)(0)))
+    val ln_dram_offset =
+      ((i * dram_stride +& j) * block_size.U +& ln_r * dram_stride) *
+        (input_w/8).U
+    val ln_dram_addr = req.dram_addr +
+      LoopMatmul.castDramOffset(ln_dram_offset)
 
-    i := next_i
-    j := next_j
+    val ln_config_norm_rs1 = Wire(new GemminiISA.ConfigNormRs1)
+    ln_config_norm_rs1 := DontCare
+    ln_config_norm_rs1.set_stats_id_only := 1.U
+    ln_config_norm_rs1.cmd_type := CONFIG_NORM
+    ln_config_norm_rs1.norm_stats_id := ln_stat_id
+    val ln_config_norm = Wire(new RoCCCommand)
+    ln_config_norm := DontCare
+    ln_config_norm.inst.funct := CONFIG_CMD
+    ln_config_norm.rs1 := ln_config_norm_rs1.asUInt
+    ln_config_norm.rs2 := DontCare
 
-    when (next_i === 0.U && next_j === 0.U) {
+    val ln_mvout_cmd = Wire(new RoCCCommand)
+    ln_mvout_cmd := DontCare
+    ln_mvout_cmd.inst.funct := STORE_CMD
+    ln_mvout_cmd.rs1 := ln_dram_addr
+    val ln_mvout_cmd_rs2 = Wire(mvout_rs2_t.cloneType)
+    ln_mvout_cmd_rs2 := DontCare
+    ln_mvout_cmd_rs2.num_rows := 1.U
+    ln_mvout_cmd_rs2.num_cols := cols.asUInt
+    ln_mvout_cmd_rs2.local_addr := cast_to_acc_addr(
+      ln_mvout_cmd_rs2.local_addr, ln_sp_addr,
+      accumulate = false.B, read_full = req.full_c)
+    ln_mvout_cmd_rs2.local_addr.norm_cmd := ln_norm_cmd
+    ln_mvout_cmd.rs2 := ln_mvout_cmd_rs2.asUInt
+
+    io.cmd.bits := MuxCase(mvout_cmd, Seq(
+      (state === ln_config) -> ln_config_norm,
+      (state === ln_st) -> ln_mvout_cmd))
+
+    when (req.dram_addr === 0.U || req.max_i === 0.U ||
+        req.max_j === 0.U) {
       state := idle
+    }.elsewhen (io.cmd.fire() && state === st) {
+      val next_i = floorAdd(i, 1.U, req.max_i)
+      val next_j = floorAdd(j, blocks, req.max_j, next_i === 0.U)
+      i := next_i
+      j := next_j
+      when (next_i === 0.U && next_j === 0.U) {
+        state := idle
+      }
+    }.elsewhen (io.cmd.fire() && state === ln_config) {
+      state := ln_st
+    }.elsewhen (io.cmd.fire() && state === ln_st) {
+      val next_j = floorAdd(j, blocks, req.max_j)
+      val next_stat_id = floorAdd(ln_stat_id, 1.U, ln_stat_ids,
+        next_j === 0.U)
+      val next_cmd = floorAdd(ln_cmd, 1.U, ln_norm_cmds.size.U,
+        next_j === 0.U && next_stat_id === 0.U)
+      val next_row = floorAdd(ln_row, NORM_STAT_IDS.U, rows,
+        next_j === 0.U && next_stat_id === 0.U && next_cmd === 0.U)
+      val next_i = floorAdd(i, 1.U, req.max_i,
+        next_j === 0.U && next_stat_id === 0.U && next_cmd === 0.U &&
+          next_row === 0.U)
+      j := next_j
+      ln_stat_id := next_stat_id
+      ln_cmd := next_cmd
+      ln_row := next_row
+      i := next_i
+      when (next_i === 0.U && next_row === 0.U && next_cmd === 0.U &&
+          next_stat_id === 0.U && next_j === 0.U) {
+        state := idle
+      }.elsewhen (next_j === 0.U) {
+        state := ln_config
+      }
     }
-  }.elsewhen (io.cmd.fire() && state === ln_config) {
-    state := ln_st
-  }.elsewhen (io.cmd.fire() && state === ln_st) {
-    val next_j = floorAdd(j, blocks, req.max_j)
-    val next_stat_id = floorAdd(ln_stat_id, 1.U, ln_stat_ids, next_j === 0.U)
-    val next_cmd = floorAdd(ln_cmd, 1.U, ln_norm_cmds.size.U, next_j === 0.U && next_stat_id === 0.U)
-    val next_row = floorAdd(ln_row, NORM_STAT_IDS.U, rows, next_j === 0.U && next_stat_id === 0.U && next_cmd === 0.U)
-    val next_i = floorAdd(i, 1.U, req.max_i,
-      next_j === 0.U && next_stat_id === 0.U && next_cmd === 0.U && next_row === 0.U)
 
-    j := next_j
-    ln_stat_id := next_stat_id
-    ln_cmd := next_cmd
-    ln_row := next_row
-    i := next_i
-
-    when (next_i === 0.U && next_row === 0.U && next_cmd === 0.U && next_stat_id === 0.U && next_j === 0.U) {
+    when (io.req.fire) {
+      req := io.req.bits
+      state := Mux(io.req.bits.act === Activation.LAYERNORM ||
+        io.req.bits.act === Activation.SOFTMAX, ln_config, st)
+      j := 0.U
+      i := 0.U
+      ln_row := 0.U
+      ln_cmd := 0.U
+      ln_stat_id := 0.U
+    }
+  } else {
+    io.cmd.bits := mvout_cmd
+    when (req.dram_addr === 0.U || req.max_i === 0.U ||
+        req.max_j === 0.U) {
       state := idle
-    }.elsewhen (next_j === 0.U) {
-      state := ln_config
+    }.elsewhen (io.cmd.fire() && state === st) {
+      val next_i = floorAdd(i, 1.U, req.max_i)
+      val next_j = floorAdd(j, blocks, req.max_j, next_i === 0.U)
+      i := next_i
+      j := next_j
+      when (next_i === 0.U && next_j === 0.U) {
+        state := idle
+      }
     }
-  }
 
-  when (io.req.fire) {
-    req := io.req.bits
-    state := Mux((io.req.bits.act === Activation.LAYERNORM) || (io.req.bits.act === Activation.SOFTMAX), ln_config, st)
-
-    j := 0.U
-    i := 0.U
-    ln_row := 0.U
-    ln_cmd := 0.U
-    ln_stat_id := 0.U
+    when (io.req.fire) {
+      req := io.req.bits
+      state := st
+      j := 0.U
+      i := 0.U
+    }
   }
 }
 
@@ -983,21 +976,22 @@ class LoopMatmulStC(block_size: Int, coreMaxAddrBits: Int, iterator_bitwidth: In
 class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val max_addr: Int, val max_acc_addr: Int,
                       val group_w: Int, val nSharers: Int, val use_shared_res_entries: Boolean,
                       val use_vpu_fusion: Boolean) extends Bundle {
-  private val use_group_control = use_shared_res_entries || use_vpu_fusion
-  // made
-  // val sp_addr_start = UInt(log2Up(max_addr).W)
-  // val sp_addr_end = UInt(log2Up(max_addr+1).W)
-  val acc_addr_start = if (use_shared_res_entries) Some(UInt(log2Up(max_acc_addr).W)) else None
+  private val use_group_control = use_shared_res_entries
+  // Fusion still programs the shared/local ACC base explicitly even when the
+  // MNK/shared-reservation dialect is disabled.
+  val acc_addr_start = if (use_shared_res_entries || use_vpu_fusion) Some(UInt(log2Up(max_acc_addr).W)) else None
 
-  val mv_K = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
-  val mv_pad_K = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
-  val ex_I = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
-
-  val laddrRB_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
-  val laddrRA_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  // funct=24 partition descriptor.  The bit positions are intentionally the
+  // same as the legacy ex_I/mv_K dialect; only their names and axis-dependent
+  // interpretation are generalized.
+  val partition_axis = if (use_shared_res_entries) Some(UInt(2.W)) else None
+  val partition_extent = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val partition_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val aux_extent = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val aux_offset = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
+  val aux_pad = if (use_shared_res_entries) Some(UInt(iterator_bitwidth.W)) else None
   val group_id = if (use_group_control) Some(UInt(group_w.W)) else None
-  val group_list = if (use_group_control) Some(UInt(nSharers.W)) else None
-  // made end
+  val member_mask = if (use_group_control) Some(UInt(nSharers.W)) else None
   val max_k = UInt(iterator_bitwidth.W)
   val max_j = UInt(iterator_bitwidth.W)
   val max_i = UInt(iterator_bitwidth.W)
@@ -1033,14 +1027,13 @@ class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val 
   val low_d = Bool()
   val full_c = Bool()
   val ex_accumulate = Bool()
-  val a_from_vsram = if (use_vpu_fusion) Some(Bool()) else None
-  val c_to_vsram = if (use_vpu_fusion) Some(Bool()) else None
-  val d_from_vsram = if (use_vpu_fusion) Some(Bool()) else None
-  val has_gemv_followup = if (use_vpu_fusion) Some(Bool()) else None
+  val wait_event_valid = if (use_vpu_fusion) Some(Bool()) else None
+  val wait_event_id = if (use_vpu_fusion) Some(UInt(EventTracker.IdWidth.W)) else None
+  val produce_event_valid = if (use_vpu_fusion) Some(Bool()) else None
+  val produce_event_id = if (use_vpu_fusion) Some(UInt(EventTracker.IdWidth.W)) else None
+  val produce_event_seal = if (use_vpu_fusion) Some(Bool()) else None
 
   val configured = Bool()
-
-  val running = Bool()
 
   val lda_started = Bool()
   val ldb_started = Bool()
@@ -1054,15 +1047,14 @@ class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val 
   val ldd_completed = Bool()
   val st_completed = Bool()
 
-  def all_completed(dummy: Int=0): Bool = lda_completed && ldb_completed && ldd_completed && ex_completed && st_completed
+  def allCompleted: Bool =
+    lda_completed && ldb_completed && ldd_completed && ex_completed && st_completed
 
-  val a_addr_start = UInt(log2Up(max_addr).W)
+  val a_addr_start = UInt(log2Up(max_addr max max_acc_addr).W)
   val b_addr_end = UInt(log2Up(max_addr+1).W)
 
   def reset(): Unit = {
     configured := false.B
-
-    running := false.B
 
     lda_started := false.B
     ldb_started := false.B
@@ -1077,17 +1069,19 @@ class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val 
     st_completed := false.B
 
     acc_addr_start.foreach(_ := 0.U)
-    mv_K.foreach(_ := 0.U)
-    mv_pad_K.foreach(_ := 0.U)
-    ex_I.foreach(_ := 0.U)
-    laddrRB_offset.foreach(_ := 0.U)
-    laddrRA_offset.foreach(_ := 0.U)
+    partition_axis.foreach(_ := GemminiISA.PartitionAxis.M)
+    partition_extent.foreach(_ := 0.U)
+    partition_offset.foreach(_ := 0.U)
+    aux_extent.foreach(_ := 0.U)
+    aux_offset.foreach(_ := 0.U)
+    aux_pad.foreach(_ := 0.U)
     group_id.foreach(_ := 0.U)
-    group_list.foreach(_ := 0.U)
-    a_from_vsram.foreach(_ := false.B)
-    c_to_vsram.foreach(_ := false.B)
-    d_from_vsram.foreach(_ := false.B)
-    has_gemv_followup.foreach(_ := false.B)
+    member_mask.foreach(_ := 0.U)
+    wait_event_valid.foreach(_ := false.B)
+    wait_event_id.foreach(_ := 0.U)
+    produce_event_valid.foreach(_ := false.B)
+    produce_event_id.foreach(_ := 0.U)
+    produce_event_seal.foreach(_ := false.B)
 
     a_tile_row_offset := 0.U
     a_tile_col_offset := 0.U
@@ -1104,19 +1098,21 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
                  max_addr: Int, max_acc_addr: Int, input_w: Int, acc_w: Int, dma_max_bytes: Int,
                  mvin_rs2_t: MvinRs2, preload_rs1_t: PreloadRs, preload_rs2_t: PreloadRs,
                  compute_rs1_t: ComputeRs, compute_rs2_t: ComputeRs, mvout_rs2_t: MvoutRs2, use_shared_res_entries: Boolean,
-                 use_vpu_fusion: Boolean, nSharers: Int)
+                 use_vpu_fusion: Boolean, nSharers: Int,
+                 has_normalizations: Boolean = true)
                 (implicit p: Parameters) extends Module {
-  // The fusion software intentionally reuses the multi-Gemmini LOOP_WS
-  // configuration dialect (explicit SPAD/ACC bases, matrix bounds and row
-  // offsets), even when this Gemmini keeps its ordinary local reservation
-  // station.  Keep that command/address dialect independent from whether the
-  // reservation station exports SPAD/ACC dependencies to SharedExtEntries.
-  private val use_shared_loop_dialect = use_shared_res_entries || use_vpu_fusion
-  private val use_group_control = use_shared_res_entries || use_vpu_fusion
+  // MNK sync groups and producer/consumer events are independent. Shared
+  // builds attach events when a sync-group slot is allocated; private builds
+  // attach them directly when their local LOOP_WS slot is configured.
+  private val use_mnk_partitioning = use_shared_res_entries
+  private val use_group_lifecycle = use_shared_res_entries
+  private val use_local_events = use_vpu_fusion && !use_shared_res_entries
+  private val use_explicit_local_addrs =
+    use_shared_res_entries || use_vpu_fusion
   val iterator_bitwidth = 16
   val concurrent_loops = 2
   val group_num = nSharers * concurrent_loops
-  val group_w = if (use_vpu_fusion) 3 else log2Up(group_num)
+  val group_w = log2Up(group_num)
   val max_block_len = (dma_max_bytes / (block_size * input_w / 8)) max 1
   val max_block_len_acc = (dma_max_bytes / (block_size * acc_w / 8)) max 1
 
@@ -1128,22 +1124,27 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
     val ex_completed = Input(UInt(log2Up(reservation_station_size+1).W))
     val busy = Output(Bool())
 
-    val ext_loop_ws = if (use_group_control) {
-      Some(new LdBExIO(group_w, nSharers, iterator_bitwidth,
+    val ext_loop_ws = if (use_shared_res_entries) {
+      Some(new LoopMatmulGroupIO(group_w, nSharers, iterator_bitwidth,
         use_vpu_fusion))
     } else {
       None
     }
+    val event_admission = if (use_local_events) {
+      Some(Flipped(new EventTrackerAdmissionPort))
+    } else None
+    val event_completion = if (use_local_events) {
+      Some(Flipped(new EventTrackerCompletionPort))
+    } else None
   })
 
   // Create states
   val loops = Reg(Vec(concurrent_loops, new LoopMatmulState(iterator_bitwidth,
     coreMaxAddrBits, max_addr, max_acc_addr, group_w, nSharers,
-    use_shared_loop_dialect, use_vpu_fusion)))
+    use_shared_res_entries, use_vpu_fusion)))
   val head_loop_id = Reg(UInt(log2Up(concurrent_loops).W))
   val tail_loop_id = (~head_loop_id).asUInt // This is the loop that we always try to configure if available
   val head_loop = loops(head_loop_id)
-  val tail_loop = loops(tail_loop_id)
 
   val loop_configured = loops.map(_.configured).reduce(_ || _)
 
@@ -1151,16 +1152,24 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   val loop_being_configured = loops(loop_being_configured_id)
 
   // Create inner modules
-  val ldA = Module(new LoopMatmulLdA(block_size, coreMaxAddrBits, iterator_bitwidth, max_addr, input_w, max_block_len, concurrent_loops, mvin_rs2_t, use_shared_loop_dialect))
+  val ldA = Module(new LoopMatmulLdA(block_size, coreMaxAddrBits,
+    iterator_bitwidth, max_addr, input_w, max_block_len, concurrent_loops,
+    mvin_rs2_t, use_mnk_partitioning))
   val ldB = Module(new LoopMatmulLdB(block_size, coreMaxAddrBits,
     iterator_bitwidth, max_addr, input_w, max_block_len, concurrent_loops,
-    mvin_rs2_t, use_shared_loop_dialect, use_vpu_fusion, group_w, nSharers))
+    mvin_rs2_t, use_mnk_partitioning, use_vpu_fusion))
   val ldD = Module(new LoopMatmulLdD(block_size, coreMaxAddrBits,
     iterator_bitwidth, max_acc_addr, input_w, acc_w, max_block_len,
     max_block_len_acc, concurrent_loops, mvin_rs2_t,
-    use_shared_loop_dialect, use_vpu_fusion))
-  val ex = Module(new LoopMatmulExecute(block_size, coreMaxAddrBits, iterator_bitwidth, max_addr, max_acc_addr, concurrent_loops, preload_rs1_t, preload_rs2_t, compute_rs1_t, compute_rs2_t, use_shared_loop_dialect, use_vpu_fusion, group_w, nSharers))
-  val stC = Module(new LoopMatmulStC(block_size, coreMaxAddrBits, iterator_bitwidth, max_acc_addr, input_w, acc_w, max_block_len, max_block_len_acc, concurrent_loops, mvout_rs2_t, group_w, use_shared_loop_dialect, use_vpu_fusion))
+    use_mnk_partitioning, use_vpu_fusion))
+  val ex = Module(new LoopMatmulExecute(block_size, coreMaxAddrBits,
+    iterator_bitwidth, max_addr, max_acc_addr, concurrent_loops,
+    preload_rs1_t, preload_rs2_t, compute_rs1_t, compute_rs2_t,
+    use_mnk_partitioning, use_vpu_fusion))
+  val stC = Module(new LoopMatmulStC(block_size, coreMaxAddrBits,
+    iterator_bitwidth, max_acc_addr, input_w, acc_w, max_block_len,
+    max_block_len_acc, concurrent_loops, mvout_rs2_t,
+    use_mnk_partitioning, use_vpu_fusion, has_normalizations))
 
   // Create command queue
   val cmd = Queue(io.in)
@@ -1208,14 +1217,18 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
 
   // Wire up unrolled command output
   val is_loop_run_cmd = cmd.bits.cmd.inst.funct === LOOP_WS
-  val shared_loop_config_cmd = if (use_shared_loop_dialect) {
-    cmd.bits.cmd.inst.funct >= LOOP_WS_CONFIG_MV_BOUNDS_1 && cmd.bits.cmd.inst.funct <= LOOP_WS_CONFIG_SPADDR
-  } else {
-    false.B
-  }
+  val partition_loop_config_cmd = if (use_mnk_partitioning) {
+    cmd.bits.cmd.inst.funct === LOOP_WS_CONFIG_PARTITION_BOUNDS
+  } else false.B
+  // Fusion-only kernels still select their explicit SPAD/ACC allocation but do
+  // not expose funct=24 partition state.
+  val explicit_spaddr_config_cmd = if (use_explicit_local_addrs) {
+    cmd.bits.cmd.inst.funct === LOOP_WS_CONFIG_SPADDR
+  } else false.B
   val page_offset_config_cmd = cmd.bits.cmd.inst.funct === LOOP_WS_CONFIG_PAGE_OFFSETS
   val is_loop_config_cmd = (cmd.bits.cmd.inst.funct >= LOOP_WS_CONFIG_BOUNDS && cmd.bits.cmd.inst.funct <= LOOP_WS_CONFIG_STRIDES_DC) ||
-    shared_loop_config_cmd || page_offset_config_cmd
+    partition_loop_config_cmd || explicit_spaddr_config_cmd ||
+      page_offset_config_cmd
   val is_loop_cmd = is_loop_run_cmd || is_loop_config_cmd
 
   io.out.bits.cmd := Mux(loop_configured, unrolled_cmd.bits, cmd.bits.cmd)
@@ -1225,14 +1238,67 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   io.out.bits.from_conv_fsm := Mux(loop_configured, false.B, cmd.bits.from_conv_fsm)
   io.out.valid := Mux(loop_configured, unrolled_cmd.valid, cmd.valid && !is_loop_config_cmd && !is_loop_run_cmd)
 
-  cmd.ready := Mux(is_loop_cmd, !loop_being_configured.configured, !loop_configured && io.out.ready)
+  val localEventMetadataValid = if (use_local_events) {
+    cmd.bits.cmd.rs1(38) || cmd.bits.cmd.rs1(6)
+  } else false.B
+  val localEventReady = if (use_local_events) {
+    val event = io.event_admission.get
+    event.request := cmd.valid && is_loop_run_cmd &&
+      !loop_being_configured.configured && localEventMetadataValid
+    event.waitValid := cmd.bits.cmd.rs1(38)
+    event.waitId := cmd.bits.cmd.rs1(37, 35)
+    event.produceValid := cmd.bits.cmd.rs1(6)
+    event.produceId := cmd.bits.cmd.rs1(5, 3)
+    event.produceSeal := cmd.bits.cmd.rs1(7)
+    event.commit := event.request && event.ready
+    !localEventMetadataValid || event.ready
+  } else true.B
+
+  cmd.ready := Mux(is_loop_cmd,
+    !loop_being_configured.configured &&
+      (!is_loop_run_cmd || localEventReady),
+    !loop_configured && io.out.ready)
   arb.io.out.ready := io.out.ready
 
-  def groupControlLoopBlocked(loopId: UInt): Bool = if (use_group_control) {
-    loopId === ldB.io.loop_id && io.ext_loop_ws.get.loop_full && !ldB.io.idle
+  // The group controller admits the stream that owns the cooperative load:
+  // LdB for M/K and LdA for N.  Keep the legacy M timing (the other loop
+  // engines start only after LdB has joined its group), while allowing N to
+  // use LdA as the symmetric admission anchor.
+  def groupAdmissionOpen(loopId: UInt, axis: UInt): Bool = if (use_mnk_partitioning) {
+    // Once an anchor stream has drained (or the load engine has advanced to
+    // the other loop slot), the group is already allocated and must not hold
+    // back that loop's D/Execute/Store engines. This is the exact lifetime
+    // convention used by the legacy `loop_full` predicate.
+    val ldaOpen = !(loopId === ldA.io.loop_id && !ldA.io.idle &&
+      io.ext_loop_ws.get.lda_admission_blocked)
+    val ldbOpen = !(loopId === ldB.io.loop_id && !ldB.io.idle &&
+      io.ext_loop_ws.get.ldb_admission_blocked)
+    Mux(axis === GemminiISA.PartitionAxis.N, ldaOpen, ldbOpen)
   } else {
-    false.B
+    true.B
   }
+
+  // Map a global logical dimension to the range owned by this pod. Most
+  // operands use the primary partition range on one axis; A(N) and D/C(K)
+  // additionally use the auxiliary ownership range on a second axis.
+  def axisRange(axis: UInt, globalExtent: UInt,
+                partitionAxis: UInt, partitionExtent: UInt,
+                partitionOffset: UInt,
+                auxiliary: Option[(UInt, UInt, UInt)] = None): (UInt, UInt) = {
+    val defaultOffset = 0.U(iterator_bitwidth.W)
+    val (fallbackExtent, fallbackOffset) = auxiliary match {
+      case Some((auxAxis, auxExtent, auxOffset)) =>
+        (Mux(axis === auxAxis, auxExtent, globalExtent),
+          Mux(axis === auxAxis, auxOffset, defaultOffset))
+      case None => (globalExtent, defaultOffset)
+    }
+    (Mux(axis === partitionAxis, partitionExtent, fallbackExtent),
+      Mux(axis === partitionAxis, partitionOffset, fallbackOffset))
+  }
+
+  def tailPad(offset: UInt, extent: UInt,
+              globalExtent: UInt, globalPad: UInt): UInt =
+    Mux(offset +& extent === globalExtent, globalPad, 0.U)
 
   // Wire up overloaded signals
   ldA.io.rob_overloaded := ld_utilization >= max_lds.U
@@ -1243,68 +1309,162 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
 
   // Wire up iterator inputs
   ex.io.lda_completed := (ldA.io.loop_id =/= ex.io.loop_id) || ldA.io.idle
+  ex.io.ldb_completed := (ldB.io.loop_id =/= ex.io.loop_id) || ldB.io.idle
   ex.io.ldd_completed := (ldD.io.loop_id =/= ex.io.loop_id) || ldD.io.idle
   ex.io.ld_ka := ldA.io.k
-  if (use_group_control) {
-    io.ext_loop_ws.get.ldb.k := ldB.io.k
-    io.ext_loop_ws.get.ldb.j := ldB.io.j
-    io.ext_loop_ws.get.ldb.k_offset := ldB.io.laddrK_offset.get
-    io.ext_loop_ws.get.ldb.group_id := ldB.io.group_id.get
-    io.ext_loop_ws.get.ldb.max_k := ldB.io.max_k.get
-    io.ext_loop_ws.get.ldb.idle := ldB.io.idle
-    io.ext_loop_ws.get.ldb.group_list := ldB.io.group_list.get
-    if (use_vpu_fusion) {
-      io.ext_loop_ws.get.ldb.has_gemv_followup.get :=
-        ldB.io.has_gemv_followup.get
-    }
-    ldB.io.loop_full.get := io.ext_loop_ws.get.loop_full
-  } else {
-    ex.io.ldb_completed.get := (ldB.io.loop_id =/= ex.io.loop_id) || ldB.io.idle
-    ex.io.ld_kb.get := ldB.io.k
-    ex.io.ld_j.get := ldB.io.j
-  }
-  // end
+  ex.io.ld_kb := ldB.io.k
+  ex.io.ld_j := ldB.io.j
   ex.io.ld_i := ldA.io.i
+
+  if (use_mnk_partitioning) {
+    val ldaLoop = loops(ldA.io.loop_id)
+    val ldbLoop = loops(ldB.io.loop_id)
+    val exLoop = loops(ex.io.loop_id)
+    val lddLoop = loops(ldD.io.loop_id)
+    val stcLoop = loops(stC.io.loop_id)
+
+    // Canonical cooperative-load cursors. For N, aux is the A/I ownership
+    // range. For M, aux is the B/K ownership range. K also uses LdB as
+    // its admission anchor, but its progress is deliberately not consumed by
+    // Execute readiness.
+    io.ext_loop_ws.get.lda.axis := ldaLoop.partition_axis.get
+    io.ext_loop_ws.get.lda.group_id := ldaLoop.group_id.get
+    io.ext_loop_ws.get.lda.member_mask := ldaLoop.member_mask.get
+    io.ext_loop_ws.get.lda.next_outer := ldA.io.k
+    io.ext_loop_ws.get.lda.next_inner := ldA.io.i
+    io.ext_loop_ws.get.lda.owner_offset := ldaLoop.aux_offset.get
+    io.ext_loop_ws.get.lda.owner_extent := ldaLoop.aux_extent.get
+    io.ext_loop_ws.get.lda.idle := ldA.io.idle
+
+    io.ext_loop_ws.get.ldb.axis := ldbLoop.partition_axis.get
+    io.ext_loop_ws.get.ldb.group_id := ldbLoop.group_id.get
+    io.ext_loop_ws.get.ldb.member_mask := ldbLoop.member_mask.get
+    io.ext_loop_ws.get.ldb.next_outer := ldB.io.k
+    io.ext_loop_ws.get.ldb.next_inner := ldB.io.j
+    // LdB owns the auxiliary K range for M and the partition K range for K.
+    // N uses its full private-B K range; its cooperative producer is LdA.
+    val (ldbOwnerExtent, ldbOwnerOffset) = axisRange(
+      ldbLoop.partition_axis.get, ldbLoop.max_k,
+      GemminiISA.PartitionAxis.K,
+      ldbLoop.partition_extent.get, ldbLoop.partition_offset.get,
+      Some((GemminiISA.PartitionAxis.M,
+        ldbLoop.aux_extent.get, ldbLoop.aux_offset.get)))
+    io.ext_loop_ws.get.ldb.owner_offset := ldbOwnerOffset
+    io.ext_loop_ws.get.ldb.owner_extent := ldbOwnerExtent
+    io.ext_loop_ws.get.ldb.idle := ldB.io.idle
+
+    if (use_vpu_fusion) {
+      io.ext_loop_ws.get.lda.wait_event_valid.get :=
+        ldaLoop.wait_event_valid.get
+      io.ext_loop_ws.get.lda.wait_event_id.get :=
+        ldaLoop.wait_event_id.get
+      io.ext_loop_ws.get.lda.produce_event_valid.get :=
+        ldaLoop.produce_event_valid.get
+      io.ext_loop_ws.get.lda.produce_event_id.get :=
+        ldaLoop.produce_event_id.get
+      io.ext_loop_ws.get.lda.produce_event_seal.get :=
+        ldaLoop.produce_event_seal.get
+      io.ext_loop_ws.get.ldb.wait_event_valid.get :=
+        ldbLoop.wait_event_valid.get
+      io.ext_loop_ws.get.ldb.wait_event_id.get :=
+        ldbLoop.wait_event_id.get
+      io.ext_loop_ws.get.ldb.produce_event_valid.get :=
+        ldbLoop.produce_event_valid.get
+      io.ext_loop_ws.get.ldb.produce_event_id.get :=
+        ldbLoop.produce_event_id.get
+      io.ext_loop_ws.get.ldb.produce_event_seal.get :=
+        ldbLoop.produce_event_seal.get
+    }
+
+    ldA.io.admission_blocked.get :=
+      io.ext_loop_ws.get.lda_admission_blocked
+    ldB.io.admission_blocked.get :=
+      io.ext_loop_ws.get.ldb_admission_blocked
+
+    io.ext_loop_ws.get.ldd.axis := lddLoop.partition_axis.get
+    io.ext_loop_ws.get.ldd.group_id := lddLoop.group_id.get
+    io.ext_loop_ws.get.ldd.idle := ldD.io.idle
+
+    io.ext_loop_ws.get.ex.axis := exLoop.partition_axis.get
+    io.ext_loop_ws.get.ex.k := ex.io.k
+    io.ext_loop_ws.get.ex.j := ex.io.j
+    io.ext_loop_ws.get.ex.i := ex.io.i
+    io.ext_loop_ws.get.ex.is_first_k_shard :=
+      exLoop.partition_axis.get === GemminiISA.PartitionAxis.K &&
+        exLoop.partition_offset.get === 0.U
+    io.ext_loop_ws.get.ex.group_id := exLoop.group_id.get
+    io.ext_loop_ws.get.ex.member_mask := exLoop.member_mask.get
+    io.ext_loop_ws.get.ex.is_compute := ex.io.is_compute.get
+    io.ext_loop_ws.get.ex.registration_fire := ex.io.cmd.fire
+    io.ext_loop_ws.get.ex.is_last_local_k := ex.io.is_last_local_k.get
+    val exHasDSource = exLoop.d_dram_addr =/= 0.U
+    io.ext_loop_ws.get.ex.first_k_overwrites :=
+      exLoop.partition_axis.get === GemminiISA.PartitionAxis.K &&
+        !exHasDSource && !exLoop.ex_accumulate
+    io.ext_loop_ws.get.ex.idle := ex.io.idle
+    ex.io.coop_operand_registered.get :=
+      io.ext_loop_ws.get.coop_operand_registered
+    ex.io.k_execute_ready.get := io.ext_loop_ws.get.k_execute_ready
+
+    io.ext_loop_ws.get.stc.axis := stcLoop.partition_axis.get
+    io.ext_loop_ws.get.stc.idle := stC.io.idle
+    io.ext_loop_ws.get.stc.group_id := stcLoop.group_id.get
+    io.ext_loop_ws.get.stc.global_j := stC.io.global_j
+    io.ext_loop_ws.get.stc.global_i := stC.io.global_i
+    io.ext_loop_ws.get.stc.j_blocks := stC.io.store_j_blocks
+    io.ext_loop_ws.get.stc.registration_request :=
+      stC.io.registration_request
+    io.ext_loop_ws.get.stc.registration_fire := stC.io.cmd.fire
+    stC.io.k_store_grant.get := io.ext_loop_ws.get.k_store_grant
+  }
+
+  if (use_local_events) {
+    io.event_completion.get.valid := head_loop.configured &&
+      head_loop.allCompleted && head_loop.produce_event_valid.get
+    io.event_completion.get.id := head_loop.produce_event_id.get
+  }
 
   stC.io.ex_completed := (ex.io.loop_id =/= stC.io.loop_id) || ex.io.idle
   stC.io.ex_k := ex.io.k
   stC.io.ex_j := ex.io.j
-  // made
-  if (use_group_control) {
-    io.ext_loop_ws.get.ex.k := ex.io.k
-    io.ext_loop_ws.get.ex.j := ex.io.j
-    io.ext_loop_ws.get.ex.group_id := ex.io.group_id.get
-    io.ext_loop_ws.get.ex.group_list := ex.io.group_list.get
-    io.ext_loop_ws.get.ex.idle := ex.io.idle
-    ex.io.ldb_ahead.get := io.ext_loop_ws.get.ldb_ahead
-    io.ext_loop_ws.get.stc.idle := stC.io.idle
-    io.ext_loop_ws.get.stc.group_id := stC.io.group_id.get
-  }
   stC.io.ex_i := ex.io.i
 
-  val loops_configured = RegInit(0.U(16.W))
-  dontTouch(loops_configured)
-
   // Create config registers
-  when(cmd.valid && is_loop_cmd && !loop_being_configured.configured) {
+  // Configuration state may only advance with the Decoupled handshake.  This
+  // matters for LOOP_WS when its event wait holds cmd.ready low.
+  when(cmd.fire && is_loop_cmd && !loop_being_configured.configured) {
 
     switch (cmd.bits.cmd.inst.funct) {
       is (LOOP_WS_CONFIG_SPADDR) {
-        if (use_shared_loop_dialect) {
+        if (use_explicit_local_addrs) {
           loop_being_configured.b_addr_end := cmd.bits.cmd.rs2(iterator_bitwidth + log2Up(max_addr+1) - 1, iterator_bitwidth)
-          loop_being_configured.a_addr_start := cmd.bits.cmd.rs2(log2Up(max_addr)-1, 0)
+          loop_being_configured.a_addr_start := cmd.bits.cmd.rs2(
+            log2Up(max_addr max max_acc_addr)-1, 0)
 
           loop_being_configured.acc_addr_start.get := cmd.bits.cmd.rs1(log2Up(max_acc_addr)-1, 0)
         }
       }
-      is (LOOP_WS_CONFIG_MV_BOUNDS_1) {
-        if (use_shared_loop_dialect) {
-          loop_being_configured.mv_K.get := cmd.bits.cmd.rs2(iterator_bitwidth * 3 - 1, iterator_bitwidth * 2)
-          loop_being_configured.mv_pad_K.get := cmd.bits.cmd.rs2(iterator_bitwidth * 2 - 1, iterator_bitwidth)
-          loop_being_configured.ex_I.get := cmd.bits.cmd.rs2(iterator_bitwidth - 1, 0)
+      is (LOOP_WS_CONFIG_PARTITION_BOUNDS) {
+        if (use_mnk_partitioning) {
+          val axis = cmd.bits.cmd.rs1(33, 32)
+          assert(axis =/= 3.U, "reserved LOOP_WS partition axis")
+          assert(cmd.bits.cmd.rs1(63, 34) === 0.U,
+            "reserved LOOP_WS partition rs1 bits must be zero")
+          assert(cmd.bits.cmd.rs2(63, 48) === 0.U,
+            "reserved LOOP_WS partition rs2 bits must be zero")
 
-          loop_being_configured.laddrRB_offset.get := cmd.bits.cmd.rs1(iterator_bitwidth * 2 - 1, iterator_bitwidth)
-          loop_being_configured.laddrRA_offset.get := cmd.bits.cmd.rs1(iterator_bitwidth - 1, 0)
+          loop_being_configured.partition_axis.get := axis
+          loop_being_configured.aux_extent.get :=
+            cmd.bits.cmd.rs2(iterator_bitwidth * 3 - 1, iterator_bitwidth * 2)
+          loop_being_configured.aux_pad.get :=
+            cmd.bits.cmd.rs2(iterator_bitwidth * 2 - 1, iterator_bitwidth)
+          loop_being_configured.partition_extent.get :=
+            cmd.bits.cmd.rs2(iterator_bitwidth - 1, 0)
+
+          loop_being_configured.aux_offset.get :=
+            cmd.bits.cmd.rs1(iterator_bitwidth * 2 - 1, iterator_bitwidth)
+          loop_being_configured.partition_offset.get :=
+            cmd.bits.cmd.rs1(iterator_bitwidth - 1, 0)
         }
       }
       is (LOOP_WS_CONFIG_BOUNDS) {
@@ -1354,47 +1514,97 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
         loop_being_configured.full_c := cmd.bits.cmd.rs1(1)
         loop_being_configured.low_d := cmd.bits.cmd.rs1(2)
         if (use_vpu_fusion) {
-          loop_being_configured.a_from_vsram.get := cmd.bits.cmd.rs1(3)
-          loop_being_configured.c_to_vsram.get := cmd.bits.cmd.rs1(4)
-          loop_being_configured.has_gemv_followup.get := cmd.bits.cmd.rs1(5)
-          loop_being_configured.d_from_vsram.get := cmd.bits.cmd.rs1(6)
+          loop_being_configured.produce_event_id.get := cmd.bits.cmd.rs1(5, 3)
+          loop_being_configured.produce_event_valid.get := cmd.bits.cmd.rs1(6)
+          loop_being_configured.produce_event_seal.get := cmd.bits.cmd.rs1(7)
+          loop_being_configured.wait_event_id.get := cmd.bits.cmd.rs1(37, 35)
+          loop_being_configured.wait_event_valid.get := cmd.bits.cmd.rs1(38)
+          assert(!cmd.bits.cmd.rs1(7) || cmd.bits.cmd.rs1(6),
+            "LOOP_WS cannot seal an absent producer event")
         }
         loop_being_configured.act := cmd.bits.cmd.rs1(8+Activation.bitwidth-1, 8) // TODO magic numbers
 
         loop_being_configured.a_transpose := cmd.bits.cmd.rs2(0)
         loop_being_configured.b_transpose := cmd.bits.cmd.rs2(1)
-        if (use_group_control) {
-          loop_being_configured.group_list.get := cmd.bits.cmd.rs1(iterator_bitwidth * 3 + nSharers - 1, iterator_bitwidth * 3)
+        if (use_group_lifecycle) {
+          loop_being_configured.member_mask.get :=
+            cmd.bits.cmd.rs1(iterator_bitwidth * 3 + nSharers - 1,
+              iterator_bitwidth * 3)
           loop_being_configured.group_id.get := cmd.bits.cmd.rs1(iterator_bitwidth * 2 + group_w - 1, iterator_bitwidth * 2)
+        }
+
+        if (use_mnk_partitioning) {
+          val axis = loop_being_configured.partition_axis.get
+          val partitionBound = MuxLookup(axis, loop_being_configured.max_i, Seq(
+            GemminiISA.PartitionAxis.N -> loop_being_configured.max_j,
+            GemminiISA.PartitionAxis.K -> loop_being_configured.max_k))
+          val auxBound = Mux(axis === GemminiISA.PartitionAxis.M,
+            loop_being_configured.max_k, loop_being_configured.max_i)
+          assert(loop_being_configured.partition_offset.get +&
+            loop_being_configured.partition_extent.get <= partitionBound,
+            "LOOP_WS partition range exceeds global bound")
+          assert(loop_being_configured.aux_offset.get +&
+            loop_being_configured.aux_extent.get <= auxBound,
+            "LOOP_WS auxiliary range exceeds global bound")
+          when(axis =/= GemminiISA.PartitionAxis.M) {
+            assert(cmd.bits.cmd.rs1(8 + Activation.bitwidth - 1, 8) === Activation.NONE,
+              "N/K partition currently requires NO_ACTIVATION")
+          }
         }
 
         loop_being_configured.configured := true.B
 
-        loops_configured := loops_configured + 1.U
       }
     }
   }
 
   // Wire up request signals
-  val ld_d_addr_start = if (use_shared_loop_dialect) None else Some(RegInit(0.U(log2Up(max_acc_addr).W)))
-  val ex_c_addr_start = if (use_shared_loop_dialect) None else Some(RegInit(0.U(log2Up(max_acc_addr).W)))
-  val st_c_addr_start = if (use_shared_loop_dialect) None else Some(RegInit(0.U(log2Up(max_acc_addr).W)))
+  val ld_d_addr_start = if (use_explicit_local_addrs) None else Some(RegInit(0.U(log2Up(max_acc_addr).W)))
+  val ex_c_addr_start = if (use_explicit_local_addrs) None else Some(RegInit(0.U(log2Up(max_acc_addr).W)))
+  val st_c_addr_start = if (use_explicit_local_addrs) None else Some(RegInit(0.U(log2Up(max_acc_addr).W)))
 
   val loop_requesting_ldA_id = Mux(head_loop.lda_started, tail_loop_id, head_loop_id)
   val loop_requesting_ldA = loops(loop_requesting_ldA_id)
-  val ldAMaxI = if (use_shared_loop_dialect) loop_requesting_ldA.ex_I.get else loop_requesting_ldA.max_i
-  ldA.io.req.bits.max_k := loop_requesting_ldA.max_k
-  // A_FROM_VSRAM retains the ordinary LdA request/started/completed protocol,
-  // but turns its payload into the existing zero-row no-op. This preserves
-  // group allocation and execute-start dependencies without ever issuing a
-  // LOAD command or touching the (software may pass NULL) host A pointer.
+  val ldAAxis = if (use_mnk_partitioning) loop_requesting_ldA.partition_axis.get else GemminiISA.PartitionAxis.M
+  val (ldAMaxI, ldAIOffset, ldAMaxK, ldAKOffset, ldAPadI, ldAPadK) =
+    if (use_mnk_partitioning) {
+      val partExtent = loop_requesting_ldA.partition_extent.get
+      val partOffset = loop_requesting_ldA.partition_offset.get
+      val auxExtent = loop_requesting_ldA.aux_extent.get
+      val auxOffset = loop_requesting_ldA.aux_offset.get
+      val (maxI, iOffset) = axisRange(
+        ldAAxis, loop_requesting_ldA.max_i,
+        GemminiISA.PartitionAxis.M, partExtent, partOffset,
+        Some((GemminiISA.PartitionAxis.N, auxExtent, auxOffset)))
+      val (maxK, kOffset) = axisRange(
+        ldAAxis, loop_requesting_ldA.max_k,
+        GemminiISA.PartitionAxis.K, partExtent, partOffset)
+      (maxI, iOffset, maxK, kOffset,
+        tailPad(iOffset, maxI, loop_requesting_ldA.max_i,
+          loop_requesting_ldA.pad_i),
+        tailPad(kOffset, maxK, loop_requesting_ldA.max_k,
+          loop_requesting_ldA.pad_k))
+    } else {
+      (loop_requesting_ldA.max_i, 0.U(iterator_bitwidth.W),
+        loop_requesting_ldA.max_k, 0.U(iterator_bitwidth.W),
+        loop_requesting_ldA.pad_i, loop_requesting_ldA.pad_k)
+    }
+  ldA.io.req.bits.max_k := ldAMaxK
+  // In fusion, a null host A pointer means that SPADDR's A base names an
+  // existing accumulator allocation. Preserve the ordinary LdA lifecycle but
+  // turn its payload into the existing zero-row no-op.
+  val ldAFromAcc = if (use_vpu_fusion) {
+    loop_requesting_ldA.a_dram_addr === 0.U
+  } else false.B
   ldA.io.req.bits.max_i :=
-    (if (use_vpu_fusion) Mux(loop_requesting_ldA.a_from_vsram.get, 0.U, ldAMaxI)
-     else ldAMaxI)
-  ldA.io.req.bits.pad_k := loop_requesting_ldA.pad_k
-  ldA.io.req.bits.pad_i := loop_requesting_ldA.pad_i
-  if (use_shared_loop_dialect) {
-    ldA.io.req.bits.max_fi.get := loop_requesting_ldA.max_i
+    Mux(ldAFromAcc, 0.U, ldAMaxI)
+  ldA.io.req.bits.pad_k := ldAPadK
+  ldA.io.req.bits.pad_i := ldAPadI
+  if (use_mnk_partitioning) {
+    ldA.io.req.bits.global_i.get := loop_requesting_ldA.max_i
+    ldA.io.req.bits.global_k.get := loop_requesting_ldA.max_k
+    ldA.io.req.bits.i_offset.get := ldAIOffset
+    ldA.io.req.bits.k_offset.get := ldAKOffset
   }
   ldA.io.req.bits.dram_addr := loop_requesting_ldA.a_dram_addr
   ldA.io.req.bits.dram_stride := loop_requesting_ldA.a_dram_stride
@@ -1403,29 +1613,59 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   ldA.io.req.bits.transpose := loop_requesting_ldA.a_transpose
   ldA.io.req.bits.addr_start := loop_requesting_ldA.a_addr_start
   val ldACanStart = !loop_requesting_ldA.lda_started && loop_requesting_ldA.configured
-  if (use_shared_loop_dialect) {
-    ldA.io.req.bits.laddrR_offset.get := loop_requesting_ldA.laddrRA_offset.get
-  }
-  if (use_group_control) {
-    ldA.io.req.valid := ldACanStart && loop_requesting_ldA.ldb_started && !groupControlLoopBlocked(loop_requesting_ldA_id)
+  if (use_group_lifecycle) {
+    val dependencyStarted = Mux(ldAAxis === GemminiISA.PartitionAxis.N,
+      true.B, loop_requesting_ldA.ldb_started)
+    val admissionReady = Mux(ldAAxis === GemminiISA.PartitionAxis.N,
+      true.B, groupAdmissionOpen(loop_requesting_ldA_id, ldAAxis))
+    ldA.io.req.valid := ldACanStart && dependencyStarted && admissionReady
   } else {
     ldA.io.req.valid := ldACanStart
   }
   ldA.io.req.bits.loop_id := loop_requesting_ldA_id
 
   when (ldA.io.req.fire) {
-    loop_requesting_ldA.running := true.B
     loop_requesting_ldA.lda_started := true.B
   }
 
   val loop_requesting_ldB_id = Mux(head_loop.ldb_started, tail_loop_id, head_loop_id)
   val loop_requesting_ldB = loops(loop_requesting_ldB_id)
-  val ldBMaxK = if (use_shared_loop_dialect) loop_requesting_ldB.mv_K.get else loop_requesting_ldB.max_k
-  val ldBPadK = if (use_shared_loop_dialect) loop_requesting_ldB.mv_pad_K.get else loop_requesting_ldB.pad_k
-  ldB.io.req.bits.max_j := loop_requesting_ldB.max_j
-  ldB.io.req.bits.pad_j := loop_requesting_ldB.pad_j
-  if (use_shared_loop_dialect) {
-    ldB.io.req.bits.max_fk.get := loop_requesting_ldB.max_k
+  val ldBAxis = if (use_mnk_partitioning) loop_requesting_ldB.partition_axis.get else GemminiISA.PartitionAxis.M
+  // M keeps its compute/output partition on I, but distributes the shared B
+  // producer over B's K rows. N continues to use its compute J partition
+  // for private B, while K distributes B over its compute K partition.
+  val (ldBMaxK, ldBKOffset, ldBMaxJ, ldBJOffset, ldBPadK, ldBPadJ) =
+    if (use_mnk_partitioning) {
+      val partExtent = loop_requesting_ldB.partition_extent.get
+      val partOffset = loop_requesting_ldB.partition_offset.get
+      val auxExtent = loop_requesting_ldB.aux_extent.get
+      val auxOffset = loop_requesting_ldB.aux_offset.get
+      val (maxK, kOffset) = axisRange(
+        ldBAxis, loop_requesting_ldB.max_k,
+        GemminiISA.PartitionAxis.K, partExtent, partOffset,
+        Some((GemminiISA.PartitionAxis.M, auxExtent, auxOffset)))
+      val (maxJ, jOffset) = axisRange(
+        ldBAxis, loop_requesting_ldB.max_j,
+        GemminiISA.PartitionAxis.N, partExtent, partOffset)
+      val padK = Mux(ldBAxis === GemminiISA.PartitionAxis.M,
+        loop_requesting_ldB.aux_pad.get,
+        tailPad(kOffset, maxK, loop_requesting_ldB.max_k,
+          loop_requesting_ldB.pad_k))
+      (maxK, kOffset, maxJ, jOffset, padK,
+        tailPad(jOffset, maxJ, loop_requesting_ldB.max_j,
+          loop_requesting_ldB.pad_j))
+    } else {
+      (loop_requesting_ldB.max_k, 0.U(iterator_bitwidth.W),
+        loop_requesting_ldB.max_j, 0.U(iterator_bitwidth.W),
+        loop_requesting_ldB.pad_k, loop_requesting_ldB.pad_j)
+    }
+  ldB.io.req.bits.max_j := ldBMaxJ
+  ldB.io.req.bits.pad_j := ldBPadJ
+  if (use_mnk_partitioning) {
+    ldB.io.req.bits.global_k.get := loop_requesting_ldB.max_k
+    ldB.io.req.bits.global_j.get := loop_requesting_ldB.max_j
+    ldB.io.req.bits.k_offset.get := ldBKOffset
+    ldB.io.req.bits.j_offset.get := ldBJOffset
   }
   ldB.io.req.bits.dram_addr := loop_requesting_ldB.b_dram_addr
   ldB.io.req.bits.dram_stride := loop_requesting_ldB.b_dram_stride
@@ -1435,57 +1675,83 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   ldB.io.req.bits.addr_end := loop_requesting_ldB.b_addr_end
   ldB.io.req.bits.max_k := ldBMaxK
   ldB.io.req.bits.pad_k := ldBPadK
-  if (use_shared_loop_dialect) {
-    ldB.io.req.bits.laddrR_offset.get := loop_requesting_ldB.laddrRB_offset.get
-  }
-  if (use_group_control) {
-    ldB.io.req.bits.group_id.get := loop_requesting_ldB.group_id.get
-    ldB.io.req.bits.group_list.get := loop_requesting_ldB.group_list.get
-    if (use_vpu_fusion) {
-      ldB.io.req.bits.has_gemv_followup.get :=
-        loop_requesting_ldB.has_gemv_followup.get
-    }
-  }
   ldB.io.req.bits.loop_id := loop_requesting_ldB_id
 
   ldB.io.req.valid := !loop_requesting_ldB.ldb_started && loop_requesting_ldB.configured
 
   when (ldB.io.req.fire) {
-    loop_requesting_ldB.running := true.B
     loop_requesting_ldB.ldb_started := true.B
   }
 
   val loop_requesting_ex_id = Mux(head_loop.ex_started, tail_loop_id, head_loop_id)
   val loop_requesting_ex = loops(loop_requesting_ex_id)
-  val exMaxI = if (use_shared_loop_dialect) loop_requesting_ex.ex_I.get else loop_requesting_ex.max_i
-  ex.io.req.bits.max_j := loop_requesting_ex.max_j
-  ex.io.req.bits.max_k := loop_requesting_ex.max_k
+  val exAxis = if (use_mnk_partitioning) loop_requesting_ex.partition_axis.get else GemminiISA.PartitionAxis.M
+  val (exMaxI, exIOffset, exMaxJ, exJOffset, exMaxK, exKOffset,
+      exPadI, exPadJ, exPadK) = if (use_mnk_partitioning) {
+    val partExtent = loop_requesting_ex.partition_extent.get
+    val partOffset = loop_requesting_ex.partition_offset.get
+    val (maxI, iOffset) = axisRange(exAxis, loop_requesting_ex.max_i,
+      GemminiISA.PartitionAxis.M, partExtent, partOffset)
+    val (maxJ, jOffset) = axisRange(exAxis, loop_requesting_ex.max_j,
+      GemminiISA.PartitionAxis.N, partExtent, partOffset)
+    val (maxK, kOffset) = axisRange(exAxis, loop_requesting_ex.max_k,
+      GemminiISA.PartitionAxis.K, partExtent, partOffset)
+    (maxI, iOffset, maxJ, jOffset, maxK, kOffset,
+      tailPad(iOffset, maxI, loop_requesting_ex.max_i,
+        loop_requesting_ex.pad_i),
+      tailPad(jOffset, maxJ, loop_requesting_ex.max_j,
+        loop_requesting_ex.pad_j),
+      tailPad(kOffset, maxK, loop_requesting_ex.max_k,
+        loop_requesting_ex.pad_k))
+  } else {
+    (loop_requesting_ex.max_i, 0.U(iterator_bitwidth.W),
+      loop_requesting_ex.max_j, 0.U(iterator_bitwidth.W),
+      loop_requesting_ex.max_k, 0.U(iterator_bitwidth.W),
+      loop_requesting_ex.pad_i, loop_requesting_ex.pad_j,
+      loop_requesting_ex.pad_k)
+  }
+  ex.io.req.bits.max_j := exMaxJ
+  ex.io.req.bits.max_k := exMaxK
   ex.io.req.bits.max_i := exMaxI
-  if (use_shared_loop_dialect) {
-    ex.io.req.bits.max_fi.get := loop_requesting_ex.max_i
+  if (use_mnk_partitioning) {
+    ex.io.req.bits.global_i.get := loop_requesting_ex.max_i
+    ex.io.req.bits.global_j.get := loop_requesting_ex.max_j
+    ex.io.req.bits.global_k.get := loop_requesting_ex.max_k
+    ex.io.req.bits.i_offset.get := exIOffset
+    ex.io.req.bits.j_offset.get := exJOffset
+    ex.io.req.bits.k_offset.get := exKOffset
+    ex.io.req.bits.partition_axis.get := exAxis
   }
-  ex.io.req.bits.pad_j := loop_requesting_ex.pad_j
-  ex.io.req.bits.pad_k := loop_requesting_ex.pad_k
-  ex.io.req.bits.pad_i := loop_requesting_ex.pad_i
+  ex.io.req.bits.pad_j := exPadJ
+  ex.io.req.bits.pad_k := exPadK
+  ex.io.req.bits.pad_i := exPadI
   ex.io.req.bits.a_addr_start := loop_requesting_ex.a_addr_start
+  ex.io.req.bits.a_from_acc := (if (use_vpu_fusion) {
+    loop_requesting_ex.a_dram_addr === 0.U
+  } else false.B)
   ex.io.req.bits.b_addr_end := loop_requesting_ex.b_addr_end
-  ex.io.req.bits.accumulate := loop_requesting_ex.ex_accumulate
-  if (use_vpu_fusion) {
-    ex.io.req.bits.a_from_vsram.get := loop_requesting_ex.a_from_vsram.get
-    ex.io.req.bits.c_to_vsram.get := loop_requesting_ex.c_to_vsram.get
-  }
+  // A fresh, bias-free K reduction is initialized by the offset-zero shard's
+  // local-k-zero overwrite. LoopMatmulExecute still turns local k>0 into
+  // accumulate operations through its existing `req.accumulate || k =/= 0`.
+  ex.io.req.bits.accumulate := (if (use_mnk_partitioning) {
+    val firstOverwriteOwner =
+      exAxis === GemminiISA.PartitionAxis.K &&
+        loop_requesting_ex.partition_offset.get === 0.U &&
+        loop_requesting_ex.d_dram_addr === 0.U &&
+        !loop_requesting_ex.ex_accumulate
+    Mux(exAxis === GemminiISA.PartitionAxis.K,
+      !firstOverwriteOwner, loop_requesting_ex.ex_accumulate)
+  } else loop_requesting_ex.ex_accumulate)
   val exCanStart = !loop_requesting_ex.ex_started && loop_requesting_ex.lda_started &&
     loop_requesting_ex.ldb_started && loop_requesting_ex.ldd_started && loop_requesting_ex.configured
-  if (use_shared_loop_dialect) {
+  if (use_explicit_local_addrs) {
     ex.io.req.bits.c_addr_start := loop_requesting_ex.acc_addr_start.get
-    ex.io.req.bits.laddrI_ex_offset.get := loop_requesting_ex.laddrRA_offset.get
   } else {
     ex.io.req.bits.c_addr_start := ex_c_addr_start.get
   }
-  if (use_group_control) {
-    ex.io.req.bits.group_id.get := loop_requesting_ex.group_id.get
-    ex.io.req.bits.group_list.get := loop_requesting_ex.group_list.get
-    ex.io.req.valid := exCanStart && !groupControlLoopBlocked(loop_requesting_ex_id)
+  if (use_group_lifecycle) {
+    ex.io.req.valid := exCanStart &&
+      groupAdmissionOpen(loop_requesting_ex_id, exAxis)
   } else {
     ex.io.req.valid := exCanStart
   }
@@ -1494,10 +1760,15 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   ex.io.req.bits.loop_id := loop_requesting_ex_id
 
   when (ex.io.req.fire) {
-    loop_requesting_ex.running := true.B
+    if (use_vpu_fusion) {
+      when(ex.io.req.bits.a_from_acc) {
+        assert(ex.io.req.bits.a_addr_start < max_acc_addr.U,
+          "fusion ACC A base escaped accumulator capacity")
+      }
+    }
     loop_requesting_ex.ex_started := true.B
 
-    if (!use_shared_loop_dialect) {
+    if (!use_explicit_local_addrs) {
       when (loop_requesting_ex.c_dram_addr =/= 0.U) {
         ex_c_addr_start.get := floorAdd(ex_c_addr_start.get, (max_acc_addr / concurrent_loops).U, max_acc_addr.U)
       }
@@ -1506,38 +1777,66 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
 
   val loop_requesting_ldD_id = Mux(head_loop.ldd_started, tail_loop_id, head_loop_id)
   val loop_requesting_ldD = loops(loop_requesting_ldD_id)
-  val ldDMaxI = if (use_shared_loop_dialect) loop_requesting_ldD.ex_I.get else loop_requesting_ldD.max_i
-  ldD.io.req.bits.max_j := loop_requesting_ldD.max_j
+  val ldDAxis = if (use_mnk_partitioning) loop_requesting_ldD.partition_axis.get else GemminiISA.PartitionAxis.M
+  val (ldDMaxI, ldDIOffset, ldDMaxJ, ldDJOffset, ldDPadI, ldDPadJ) =
+    if (use_mnk_partitioning) {
+      val partExtent = loop_requesting_ldD.partition_extent.get
+      val partOffset = loop_requesting_ldD.partition_offset.get
+      val (maxI, iOffset) = axisRange(
+        ldDAxis, loop_requesting_ldD.max_i,
+        GemminiISA.PartitionAxis.M, partExtent, partOffset,
+        Some((GemminiISA.PartitionAxis.K,
+          loop_requesting_ldD.aux_extent.get,
+          loop_requesting_ldD.aux_offset.get)))
+      val (maxJ, jOffset) = axisRange(
+        ldDAxis, loop_requesting_ldD.max_j,
+        GemminiISA.PartitionAxis.N, partExtent, partOffset)
+      val padI = Mux(ldDAxis === GemminiISA.PartitionAxis.K,
+        loop_requesting_ldD.aux_pad.get,
+        tailPad(iOffset, maxI, loop_requesting_ldD.max_i,
+          loop_requesting_ldD.pad_i))
+      (maxI, iOffset, maxJ, jOffset, padI,
+        tailPad(jOffset, maxJ, loop_requesting_ldD.max_j,
+          loop_requesting_ldD.pad_j))
+    } else {
+      (loop_requesting_ldD.max_i, 0.U(iterator_bitwidth.W),
+        loop_requesting_ldD.max_j, 0.U(iterator_bitwidth.W),
+        loop_requesting_ldD.pad_i, loop_requesting_ldD.pad_j)
+    }
+  ldD.io.req.bits.max_j := ldDMaxJ
   ldD.io.req.bits.max_i := ldDMaxI
-  ldD.io.req.bits.pad_j := loop_requesting_ldD.pad_j
-  ldD.io.req.bits.pad_i := loop_requesting_ldD.pad_i
+  ldD.io.req.bits.pad_j := ldDPadJ
+  ldD.io.req.bits.pad_i := ldDPadI
   ldD.io.req.bits.dram_addr := loop_requesting_ldD.d_dram_addr
   ldD.io.req.bits.dram_stride := loop_requesting_ldD.d_dram_stride
   ldD.io.req.bits.tile_row_offset := loop_requesting_ldD.d_tile_row_offset
   ldD.io.req.bits.tile_col_offset := loop_requesting_ldD.d_tile_col_offset
   ldD.io.req.bits.low_d := loop_requesting_ldD.low_d
-  if (use_vpu_fusion) {
-    ldD.io.req.bits.d_from_vsram.get := loop_requesting_ldD.d_from_vsram.get
-  }
   val ldDCanStart = !loop_requesting_ldD.ldd_started && loop_requesting_ldD.configured
-  if (use_shared_loop_dialect) {
-    ldD.io.req.bits.laddrI_offset.get := loop_requesting_ldD.laddrRA_offset.get
+  if (use_mnk_partitioning) {
+    ldD.io.req.bits.global_j.get := loop_requesting_ldD.max_j
+    ldD.io.req.bits.i_offset.get := ldDIOffset
+    ldD.io.req.bits.j_offset.get := ldDJOffset
+    ldD.io.req.bits.addr_start := loop_requesting_ldD.acc_addr_start.get
+  } else if (use_explicit_local_addrs) {
     ldD.io.req.bits.addr_start := loop_requesting_ldD.acc_addr_start.get
   } else {
     ldD.io.req.bits.addr_start := ld_d_addr_start.get
   }
-  if (use_group_control) {
-    ldD.io.req.valid := ldDCanStart && loop_requesting_ldD.ldb_started && !groupControlLoopBlocked(loop_requesting_ldD_id)
+  if (use_group_lifecycle) {
+    val admissionStarted = Mux(ldDAxis === GemminiISA.PartitionAxis.N,
+      loop_requesting_ldD.lda_started, loop_requesting_ldD.ldb_started)
+    ldD.io.req.valid := ldDCanStart && admissionStarted &&
+      groupAdmissionOpen(loop_requesting_ldD_id, ldDAxis)
   } else {
     ldD.io.req.valid := ldDCanStart
   }
   ldD.io.req.bits.loop_id := loop_requesting_ldD_id
 
   when (ldD.io.req.fire) {
-    loop_requesting_ldD.running := true.B
     loop_requesting_ldD.ldd_started := true.B
 
-    if (!use_shared_loop_dialect) {
+    if (!use_explicit_local_addrs) {
       when (loop_requesting_ldD.c_dram_addr =/= 0.U) {
         ld_d_addr_start.get := floorAdd(ld_d_addr_start.get, (max_acc_addr / concurrent_loops).U, max_acc_addr.U)
       }
@@ -1546,46 +1845,69 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
 
   val loop_requesting_st_id = Mux(head_loop.st_started, tail_loop_id, head_loop_id)
   val loop_requesting_st = loops(loop_requesting_st_id)
-  val stMaxI = if (use_shared_loop_dialect) loop_requesting_st.ex_I.get else loop_requesting_st.max_i
+  val stAxis = if (use_mnk_partitioning) loop_requesting_st.partition_axis.get else GemminiISA.PartitionAxis.M
+  val (stMaxI, stIOffset, stMaxJ, stJOffset, stPadI, stPadJ) =
+    if (use_mnk_partitioning) {
+      val partExtent = loop_requesting_st.partition_extent.get
+      val partOffset = loop_requesting_st.partition_offset.get
+      val (maxI, iOffset) = axisRange(
+        stAxis, loop_requesting_st.max_i,
+        GemminiISA.PartitionAxis.M, partExtent, partOffset,
+        Some((GemminiISA.PartitionAxis.K,
+          loop_requesting_st.aux_extent.get,
+          loop_requesting_st.aux_offset.get)))
+      val (maxJ, jOffset) = axisRange(
+        stAxis, loop_requesting_st.max_j,
+        GemminiISA.PartitionAxis.N, partExtent, partOffset)
+      val padI = Mux(stAxis === GemminiISA.PartitionAxis.K,
+        loop_requesting_st.aux_pad.get,
+        tailPad(iOffset, maxI, loop_requesting_st.max_i,
+          loop_requesting_st.pad_i))
+      (maxI, iOffset, maxJ, jOffset, padI,
+        tailPad(jOffset, maxJ, loop_requesting_st.max_j,
+          loop_requesting_st.pad_j))
+    } else {
+      (loop_requesting_st.max_i, 0.U(iterator_bitwidth.W),
+        loop_requesting_st.max_j, 0.U(iterator_bitwidth.W),
+        loop_requesting_st.pad_i, loop_requesting_st.pad_j)
+    }
   stC.io.req.bits.max_k := loop_requesting_st.max_k
-  stC.io.req.bits.max_j := loop_requesting_st.max_j
+  stC.io.req.bits.max_j := stMaxJ
   stC.io.req.bits.max_i := stMaxI
-  stC.io.req.bits.pad_j := loop_requesting_st.pad_j
-  stC.io.req.bits.pad_i := loop_requesting_st.pad_i
-  // C_TO_VSRAM is a redirect, not a dual destination.  Suppress Store-C even
-  // if software left a nonzero C pointer, because ACC intentionally retains
-  // the pre-final value while the post-RMW FP32 row is written to VSRAM.
-  stC.io.req.bits.dram_addr := (if (use_vpu_fusion) {
-    Mux(loop_requesting_st.c_to_vsram.get, 0.U,
-      loop_requesting_st.c_dram_addr)
-  } else {
-    loop_requesting_st.c_dram_addr
-  })
+  stC.io.req.bits.pad_j := stPadJ
+  stC.io.req.bits.pad_i := stPadI
+  stC.io.req.bits.dram_addr := loop_requesting_st.c_dram_addr
   stC.io.req.bits.dram_stride := loop_requesting_st.c_dram_stride
   stC.io.req.bits.tile_row_offset := loop_requesting_st.c_tile_row_offset
   stC.io.req.bits.tile_col_offset := loop_requesting_st.c_tile_col_offset
   stC.io.req.bits.full_c := loop_requesting_st.full_c
   stC.io.req.bits.act := loop_requesting_st.act
   val stCanStart = !loop_requesting_st.st_started && loop_requesting_st.ex_started && loop_requesting_st.configured
-  if (use_shared_loop_dialect) {
-    stC.io.req.bits.laddrI_offset.get := loop_requesting_st.laddrRA_offset.get
+  if (use_mnk_partitioning) {
+    stC.io.req.bits.global_j.get := loop_requesting_st.max_j
+    stC.io.req.bits.i_offset.get := stIOffset
+    stC.io.req.bits.j_offset.get := stJOffset
+    stC.io.req.bits.addr_start := loop_requesting_st.acc_addr_start.get
+  } else if (use_explicit_local_addrs) {
     stC.io.req.bits.addr_start := loop_requesting_st.acc_addr_start.get
   } else {
     stC.io.req.bits.addr_start := st_c_addr_start.get
   }
-  if (use_group_control) {
-    stC.io.req.bits.group_id.get := loop_requesting_st.group_id.get
-    stC.io.req.valid := stCanStart && !groupControlLoopBlocked(loop_requesting_st_id)
+  if (use_group_lifecycle) {
+    stC.io.req.valid := stCanStart &&
+      groupAdmissionOpen(loop_requesting_st_id, stAxis)
+    if (use_mnk_partitioning) {
+      stC.io.req.bits.partition_axis.get := stAxis
+    }
   } else {
     stC.io.req.valid := stCanStart
   }
   stC.io.req.bits.loop_id := loop_requesting_st_id
 
   when (stC.io.req.fire) {
-    loop_requesting_st.running := true.B
     loop_requesting_st.st_started := true.B
 
-    if (!use_shared_loop_dialect) {
+    if (!use_explicit_local_addrs) {
       when (loop_requesting_st.c_dram_addr =/= 0.U) {
         st_c_addr_start.get := floorAdd(st_c_addr_start.get, (max_acc_addr / concurrent_loops).U, max_acc_addr.U)
       }
@@ -1593,27 +1915,27 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   }
 
   // Handle completed signals
-  when (ldA.io.idle && loops(ldA.io.loop_id).running && loops(ldA.io.loop_id).lda_started) {
+  when (ldA.io.idle && loops(ldA.io.loop_id).lda_started) {
     loops(ldA.io.loop_id).lda_completed := true.B
   }
 
-  when (ldB.io.idle && loops(ldB.io.loop_id).running && loops(ldB.io.loop_id).ldb_started) {
+  when (ldB.io.idle && loops(ldB.io.loop_id).ldb_started) {
     loops(ldB.io.loop_id).ldb_completed := true.B
   }
 
-  when (ex.io.idle && loops(ex.io.loop_id).running && loops(ex.io.loop_id).ex_started) {
+  when (ex.io.idle && loops(ex.io.loop_id).ex_started) {
     loops(ex.io.loop_id).ex_completed := true.B
   }
 
-  when (ldD.io.idle && loops(ldD.io.loop_id).running && loops(ldD.io.loop_id).ldd_started) {
+  when (ldD.io.idle && loops(ldD.io.loop_id).ldd_started) {
     loops(ldD.io.loop_id).ldd_completed := true.B
   }
 
-  when (stC.io.idle && loops(stC.io.loop_id).running && loops(stC.io.loop_id).st_started) {
+  when (stC.io.idle && loops(stC.io.loop_id).st_started) {
     loops(stC.io.loop_id).st_completed := true.B
   }
 
-  when (head_loop.running && head_loop.all_completed()) {
+  when (head_loop.configured && head_loop.allCompleted) {
     head_loop.reset()
     head_loop_id := ~head_loop_id
   }
@@ -1622,7 +1944,7 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
   when (reset.asBool) {
     loops.zipWithIndex.foreach { case (l, i) =>
       l.reset()
-      if (!use_shared_loop_dialect) {
+      if (!use_explicit_local_addrs) {
         l.a_addr_start := (i * (max_addr / concurrent_loops)).U
         l.b_addr_end := ((i+1) * (max_addr / concurrent_loops)).U
       }
@@ -1699,21 +2021,34 @@ object LoopMatmul {
             max_addr: Int, max_acc_addr: Int, input_w: Int, acc_w: Int, dma_max_bytes: Int,
             mvin_rs2_t: MvinRs2, preload_rs1_t: PreloadRs, preload_rs2_t: PreloadRs,
             compute_rs1_t: ComputeRs, compute_rs2_t: ComputeRs, mvout_rs2_t: MvoutRs2, use_shared_res_entries: Boolean,
-            use_vpu_fusion: Boolean, nSharers: Int)
-           (implicit p: Parameters): (DecoupledIO[GemminiCmd], Bool, Option[LdBExIO]) = {
+           use_vpu_fusion: Boolean, nSharers: Int,
+            has_normalizations: Boolean = true)
+           (implicit p: Parameters): (DecoupledIO[GemminiCmd], Bool,
+             Option[LoopMatmulGroupIO], Option[EventTrackerAdmissionPort],
+             Option[EventTrackerCompletionPort]) = {
     val mod = Module(new LoopMatmul(block_size, coreMaxAddrBits, rob_size, max_lds, max_exs, max_sts,
       max_addr, max_acc_addr, input_w, acc_w, dma_max_bytes,
       mvin_rs2_t, preload_rs1_t, preload_rs2_t, compute_rs1_t, compute_rs2_t, mvout_rs2_t,
-      use_shared_res_entries, use_vpu_fusion, nSharers))
+      use_shared_res_entries, use_vpu_fusion, nSharers,
+      has_normalizations))
     mod.io.in <> in
     mod.io.ld_completed := ld_completed
     mod.io.st_completed := st_completed
     mod.io.ex_completed := ex_completed
 
-    val extOpt: Option[LdBExIO] =
-      if (use_shared_res_entries || use_vpu_fusion) Some(mod.io.ext_loop_ws.get) else None
+    val sharedGroupOpt: Option[LoopMatmulGroupIO] =
+      if (use_shared_res_entries) Some(mod.io.ext_loop_ws.get) else None
+    val eventAdmissionOpt: Option[EventTrackerAdmissionPort] =
+      if (use_vpu_fusion && !use_shared_res_entries) {
+        Some(mod.io.event_admission.get)
+      } else None
+    val eventCompletionOpt: Option[EventTrackerCompletionPort] =
+      if (use_vpu_fusion && !use_shared_res_entries) {
+        Some(mod.io.event_completion.get)
+      } else None
 
-    (mod.io.out, mod.io.busy, extOpt)
+    (mod.io.out, mod.io.busy, sharedGroupOpt, eventAdmissionOpt,
+      eventCompletionOpt)
   }
 
   def castDramOffset(dram_offset: UInt): UInt = {

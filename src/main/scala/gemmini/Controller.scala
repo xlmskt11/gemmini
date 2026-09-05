@@ -12,7 +12,6 @@ import freechips.rocketchip.tile._
 import freechips.rocketchip.util.ClockGate
 import freechips.rocketchip.tilelink.TLIdentityNode
 import GemminiISA._
-import VpuLocalAddr._
 import Util._
 
 class GemminiCmd(rob_entries: Int)(implicit p: Parameters) extends Bundle {
@@ -75,29 +74,19 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val spad_w = inputType.getWidth *  block_cols
   val sp_mask_len = (spad_w / (aligned_to * 8)) max 1
   val acc_row_t = Vec(meshColumns, Vec(tileColumns, accType))
-  private val vpuRowAddrBits = if (use_vpu_fusion) {
-    Some(1 max log2Ceil(acc_banks * acc_bank_entries))
-  } else {
-    None
-  }
   val ext_mem_io = if (use_shared_ext_mem) Some(IO(new ExtMemIO_new(
     sp_banks, sp_sub_banks, sp_bank_entries / sp_sub_banks, spad_w, sp_mask_len,
-    acc_banks, acc_sub_banks, acc_bank_entries / acc_sub_banks, acc_row_t,
-    use_vpu_fusion
+    acc_banks, acc_sub_banks, acc_bank_entries / acc_sub_banks, acc_row_t
   ))) else None
   ext_mem_io.foreach(_ <> outer.spad.module.io.ext_mem.get)
-  val vpu_matrix_read_io = if (use_vpu_fusion) Some(IO(
-    new GemminiVpuMatrixReadIO(
-      vpuRowAddrBits.get, block_cols, accType.getWidth))) else None
-  val vpu_matrix_write_io = if (use_vpu_fusion && !use_shared_ext_mem) {
-    Some(IO(Valid(new GemminiVpuMatrixWriteReq(
-      vpuRowAddrBits.get, block_cols, accType.getWidth))))
-  } else {
-    None
-  }
-  if (use_vpu_fusion && !use_shared_ext_mem) {
-    vpu_matrix_write_io.get <> outer.spad.module.io.acc.vpu_write.get
-  }
+
+  // Private-memory fusion exposes only the raw accumulator backend. The SPAD
+  // remains an ordinary private Scratchpad and has no external memory port.
+  val vpu_mem_io = if (outer.spad.privateVpuFusion) Some(IO(Flipped(
+    new GemminiVpuMemoryIO(
+      outer.spad.vpuElementAddrBits, outer.spad.vpuLanes,
+      accType.getWidth, outer.spad.vpuTagBits)))) else None
+  vpu_mem_io.foreach(_ <> outer.spad.module.io.vpu_mem.get)
 
   val tagWidth = 32
 
@@ -204,16 +193,12 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   */
 
   val reservation_station = withClock (gated_clock) { Module(new ReservationStation(outer.config, new GemminiCmd(reservation_station_entries))) }
-  val ext_deps_io = if (use_shared_res_entries) Some(IO(new EntriesForDeps(
+  private val use_external_deps = use_shared_res_entries || use_vpu_fusion
+  val ext_deps_io = if (use_external_deps) Some(IO(new EntriesForDeps(
     local_addr_t, reservation_station_entries_ld,
     reservation_station_entries_ex, reservation_station_entries_st,
     res_max_per_type))) else None
   ext_deps_io.foreach(_ <> reservation_station.io.ext_deps.get)
-  val vsram_deps_io = if (use_vpu_fusion) Some(IO(
-    new VsramEntriesForDeps(local_addr_t, reservation_station_entries_ld,
-      reservation_station_entries_ex, reservation_station_entries_st,
-      res_max_per_type))) else None
-  vsram_deps_io.foreach(_ <> reservation_station.io.vsram_deps.get)
   counters.io.event_io.collect(reservation_station.io.counter)
 
   if (use_profiler) {
@@ -255,22 +240,30 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t),
     has_training_convs, has_max_pool, has_first_layer_optimizations, has_dw_convs, use_shared_res_entries, nSharers) }
 
-  val (loop_cmd, loop_matmul_unroller_busy, ext_loop_ws) = withClock (gated_clock) { LoopMatmul(conv_cmd, reservation_station.io.matmul_ld_completed, reservation_station.io.matmul_st_completed, reservation_station.io.matmul_ex_completed,
+  val (loop_cmd, loop_matmul_unroller_busy, ext_loop_ws,
+      loop_event_admission, loop_event_completion) = withClock (gated_clock) { LoopMatmul(conv_cmd, reservation_station.io.matmul_ld_completed, reservation_station.io.matmul_st_completed, reservation_station.io.matmul_ex_completed,
     meshRows*tileRows, coreMaxAddrBits, reservation_station_entries, max_lds, max_exs, max_sts, sp_banks * sp_bank_entries, acc_banks * acc_bank_entries,
     inputType.getWidth, accType.getWidth, dma_maxbytes, new MvinRs2(mvin_rows_bits, mvin_cols_bits, local_addr_t),
     new PreloadRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new PreloadRs(mvout_rows_bits, mvout_cols_bits, local_addr_t),
     new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t), new ComputeRs(mvin_rows_bits, mvin_cols_bits, local_addr_t),
-    new MvoutRs2(mvout_rows_bits, mvout_cols_bits, local_addr_t), use_shared_res_entries, use_vpu_fusion, nSharers) }
+    new MvoutRs2(mvout_rows_bits, mvout_cols_bits, local_addr_t), use_shared_res_entries, use_vpu_fusion, nSharers,
+    has_normalizations) }
 
   val iterator_bitwidth = 16
   val concurrent_loops = 2
   val group_num = nSharers * concurrent_loops
-  val group_w = if (use_vpu_fusion) 3 else log2Up(group_num)
-  val use_group_control = use_shared_res_entries || use_vpu_fusion
-
-  val ext_loop_ws_io = if (use_group_control) Some(IO(new LdBExIO(
+  val group_w = log2Up(group_num)
+  val ext_loop_ws_io = if (use_shared_res_entries) Some(IO(new LoopMatmulGroupIO(
     group_w, nSharers, iterator_bitwidth, use_vpu_fusion))) else None
   ext_loop_ws_io.foreach(_ <> ext_loop_ws.get)
+  val loop_event_admission_io = if (use_vpu_fusion && !use_shared_res_entries) {
+    Some(IO(Flipped(new EventTrackerAdmissionPort)))
+  } else None
+  loop_event_admission_io.foreach(_ <> loop_event_admission.get)
+  val loop_event_completion_io = if (use_vpu_fusion && !use_shared_res_entries) {
+    Some(IO(Flipped(new EventTrackerCompletionPort)))
+  } else None
+  loop_event_completion_io.foreach(_ <> loop_event_completion.get)
   val ext_loop_conv_ws_io = if (use_shared_res_entries) Some(IO(new LdIExIO(group_w, nSharers, iterator_bitwidth))) else None
   ext_loop_conv_ws_io.foreach(_ <> ext_loop_conv_ws.get)
 
@@ -303,19 +296,6 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val load_controller = withClock (gated_clock) { Module(new LoadController(outer.config, coreMaxAddrBits, local_addr_t)) }
   val store_controller = withClock (gated_clock) { Module(new StoreController(outer.config, coreMaxAddrBits, local_addr_t)) }
   val ex_controller = withClock (gated_clock) { Module(new ExecuteController(xLen, tagWidth, outer.config)) }
-  val vpu_d_controller = if (use_vpu_fusion) Some(withClock(gated_clock) {
-    Module(new VpuDLoadController(outer.config))
-  }) else None
-  if (use_vpu_fusion) {
-    val matrixReadArbiter = withClock(gated_clock) { Module(
-      new GemminiVpuMatrixReadArbiter(vpuRowAddrBits.get, block_cols,
-        accType.getWidth)) }
-    matrixReadArbiter.io.execute <> ex_controller.io.vpuMatrixRead.get
-    matrixReadArbiter.io.dload <> vpu_d_controller.get.io.matrixRead
-    vpu_matrix_read_io.get <> matrixReadArbiter.io.out
-    spad.module.io.acc.vpu_d_write.get <>
-      vpu_d_controller.get.io.accWrite
-  }
 
   counters.io.event_io.collect(load_controller.io.counter)
   counters.io.event_io.collect(store_controller.io.counter)
@@ -377,26 +357,8 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
   load_controller.io.cmd.bits := reservation_station.io.issue.ld.cmd
   load_controller.io.cmd.bits.rob_id.push(reservation_station.io.issue.ld.rob_id)
-  if (use_vpu_fusion) {
-    val issuedLdLocalAddr = reservation_station.io.issue.ld.cmd.cmd.rs2(31, 0)
-      .asTypeOf(local_addr_t)
-    val issuedLdFromVsram =
-      reservation_station.io.issue.ld.cmd.cmd.inst.funct === LOAD3_CMD &&
-        issuedLdLocalAddr.is_acc_addr && issuedLdLocalAddr.d_from_vsram()
-
-    load_controller.io.cmd.valid := reservation_station.io.issue.ld.valid &&
-      !issuedLdFromVsram
-    vpu_d_controller.get.io.cmd.valid :=
-      reservation_station.io.issue.ld.valid && issuedLdFromVsram
-    vpu_d_controller.get.io.cmd.bits := reservation_station.io.issue.ld.cmd
-    vpu_d_controller.get.io.cmd.bits.rob_id.push(
-      reservation_station.io.issue.ld.rob_id)
-    reservation_station.io.issue.ld.ready := Mux(issuedLdFromVsram,
-      vpu_d_controller.get.io.cmd.ready, load_controller.io.cmd.ready)
-  } else {
-    load_controller.io.cmd.valid := reservation_station.io.issue.ld.valid
-    reservation_station.io.issue.ld.ready := load_controller.io.cmd.ready
-  }
+  load_controller.io.cmd.valid := reservation_station.io.issue.ld.valid
+  reservation_station.io.issue.ld.ready := load_controller.io.cmd.ready
 
   store_controller.io.cmd.valid := reservation_station.io.issue.st.valid
   reservation_station.io.issue.st.ready := store_controller.io.cmd.ready
@@ -416,10 +378,6 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   spad.module.io.acc.read_req <> ex_controller.io.acc.read_req
   ex_controller.io.acc.read_resp <> spad.module.io.acc.read_resp
   ex_controller.io.acc.write <> spad.module.io.acc.write
-  if (use_vpu_fusion) {
-    spad.module.io.acc.write_to_vpu.get :=
-      ex_controller.io.acc.write_to_vpu.get
-  }
   if (use_shared_ext_mem) {
     ex_controller.io.srams.grant.get <> spad.module.io.exwrite_grant.get.spad
     ex_controller.io.acc.grant.get <> spad.module.io.exwrite_grant.get.acc
@@ -480,7 +438,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
   //-------------------------------------------------------------------------
   // risc
-  val nCompletionSources = if (use_vpu_fusion) 4 else 3
+  val nCompletionSources = 3
   val reservation_station_completed_arb = Module(new Arbiter(
     UInt(log2Up(reservation_station_entries).W), nCompletionSources))
 
@@ -488,11 +446,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   reservation_station_completed_arb.io.in(0).bits := ex_controller.io.completed.bits
 
   reservation_station_completed_arb.io.in(1) <> load_controller.io.completed
-  if (use_vpu_fusion) {
-    reservation_station_completed_arb.io.in(2) <>
-      vpu_d_controller.get.io.completed
-  }
-  val storeCompletionIndex = if (use_vpu_fusion) 3 else 2
+  val storeCompletionIndex = 2
   reservation_station_completed_arb.io.in(storeCompletionIndex) <>
     store_controller.io.completed
 
@@ -510,8 +464,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val profiler_busy = if (use_profiler) profilers.get.module.io.busy else false.B
   io.busy := raw_cmd.valid || loop_conv_unroller_busy ||
     loop_matmul_unroller_busy || reservation_station.io.busy ||
-    spad.module.io.busy ||
-    vpu_d_controller.map(_.io.busy).getOrElse(false.B) || profiler_busy ||
+    spad.module.io.busy || profiler_busy ||
     loop_cmd.valid || conv_cmd.valid
 
   io.interrupt := tlbExceptions.map(_.interrupt).reduce(_ || _)

@@ -76,54 +76,56 @@ class ExtAccumulatorReadReq(n: Int) extends Bundle {
   val full = Bool() // Whether or not we return the full bitwidth output
 }
 
-class ExtAccumulatorReadResp[T <: Data: Arithmetic](fullDataType: Vec[Vec[T]]) extends Bundle {
+class ExtAccumulatorReadResp[T <: Data: Arithmetic](
+    fullDataType: Vec[Vec[T]], accBanks: Int) extends Bundle {
   val data = fullDataType.cloneType
-  val acc_bank_id = UInt(2.W) // TODO magic number
+  val acc_bank_id = UInt((1 max log2Ceil(accBanks)).W)
 }
 
-class ExtAccumulatorReadIO[T <: Data: Arithmetic](n: Int, fullDataType: Vec[Vec[T]]) extends Bundle {
+class ExtAccumulatorReadIO[T <: Data: Arithmetic](
+    n: Int, fullDataType: Vec[Vec[T]], accBanks: Int) extends Bundle {
   val req = Decoupled(new ExtAccumulatorReadReq(n))
-  val resp = Flipped(Decoupled(new ExtAccumulatorReadResp[T](fullDataType)))
+  val resp = Flipped(Decoupled(new ExtAccumulatorReadResp[T](fullDataType, accBanks)))
 }
 
 class ExtAccumulatorWriteReq[T <: Data: Arithmetic](
     n: Int,
-    t: Vec[Vec[T]],
-    useVpuFusion: Boolean = false) extends Bundle {
+    t: Vec[Vec[T]]) extends Bundle {
   val addr = UInt(log2Up(n).W)
   val data = t.cloneType
   val acc = Bool()
   val mask = Vec(t.getWidth / 8, Bool()) // TODO Use aligned_to here
   val exwrite = Bool()
-  val toVpu = if (useVpuFusion) Some(Bool()) else None
-}
-
-class ExtAccVpuWrite[T <: Data: Arithmetic](
-    nSharers: Int, n: Int, t: Vec[Vec[T]]) extends Bundle {
-  val source = UInt((1 max log2Ceil(nSharers)).W)
-  val subRow = UInt(log2Up(n).W)
-  val data = t.cloneType
-  val laneMask = Vec(t.length * t.head.length, Bool())
 }
 
 class ExtAccumulatorBankIO[T <: Data: Arithmetic](
     n: Int,
-    t: Vec[Vec[T]],
-    useVpuFusion: Boolean = false) extends Bundle {
-  val read = new ExtAccumulatorReadIO(n, t)
+    t: Vec[Vec[T]], accBanks: Int) extends Bundle {
+  val read = new ExtAccumulatorReadIO(n, t, accBanks)
   val write = Decoupled(new ExtAccumulatorWriteReq(
-    n, t, useVpuFusion))
+    n, t))
   val grant = Decoupled(Bool())
+}
+
+/** Sideband used by the unified VPU client to make a multi-row request
+  * indivisible. A physical bank reports that it selected the VPU before its
+  * Decoupled ready is exposed; the adapter enables every selected fragment
+  * only when all required banks selected the same logical request. */
+class ExtAccumulatorAtomicClientIO extends Bundle {
+  val readSelected = Input(Bool())
+  val writeSelected = Input(Bool())
+  val readAllow = Output(Bool())
+  val writeAllow = Output(Bool())
 }
 
 class ExtMemIO_new[T <: Data: Arithmetic](
     sp_banks: Int, sp_sub_banks: Int, sp_n: Int, sp_w: Int,
     sp_mask_len: Int, acc_banks: Int, acc_sub_banks: Int, acc_n: Int,
-    acc_t: Vec[Vec[T]], useVpuFusion: Boolean = false)
+    acc_t: Vec[Vec[T]])
     extends Bundle {
   val spad = Vec(sp_banks, Vec(sp_sub_banks, new ExtScratchpadBankIO(sp_n, sp_w, sp_mask_len)))
   val acc = Vec(acc_banks, Vec(acc_sub_banks, new ExtAccumulatorBankIO(
-    acc_n, acc_t, useVpuFusion)))
+    acc_n, acc_t, acc_banks)))
 }
 
 class AdderSellector(nSharers: Int, banks: Int) extends Module {
@@ -763,18 +765,22 @@ class ExtScratchpadBank(
 }
 
 class ExtAccBank[T <: Data](
-  nSharers: Int, n: Int, t: Vec[Vec[T]], acc_singleported: Boolean, acc_latency: Int,
-  enableExWrite: Boolean = true, useVpuFusion: Boolean = false
+  nSharers: Int, n: Int, t: Vec[Vec[T]], accBanks: Int,
+  acc_singleported: Boolean, acc_latency: Int,
+  enableExWrite: Boolean = true, atomicClient: Int = -1
 )
   (implicit ev: Arithmetic[T]) extends Module {
 
   import ev._
 
+  require(atomicClient < nSharers)
+
   val io = IO(new Bundle {
     val in = Vec(nSharers, Flipped(new ExtAccumulatorBankIO(
-      n, t, useVpuFusion)))
-    val vpuWrite = if (useVpuFusion) Some(Valid(new ExtAccVpuWrite(
-      nSharers, n, t))) else None
+      n, t, accBanks)))
+    val atomic = if (atomicClient >= 0) {
+      Some(Flipped(new ExtAccumulatorAtomicClientIO))
+    } else None
     val adder = new Bundle {
       val valid = Output(Bool())
       val op1 = Output(t.cloneType)
@@ -820,7 +826,7 @@ class ExtAccBank[T <: Data](
   val hasExwrite = exwriteMask.orR
 
   val pipelined_writes = Reg(Vec(acc_latency, Valid(new ExtAccumulatorWriteReq(
-    n, t, useVpuFusion))))
+    n, t))))
 
   val nonExWriteCandidate = VecInit(io.in.map(in => in.write.valid && !in.write.bits.exwrite && !hasExwrite && !pipelined_writes.map(r => r.valid && r.bits.addr === in.write.bits.addr && in.write.bits.acc).reduce(_||_)))
   val readCandidate = VecInit(io.in.map(in =>
@@ -836,8 +842,22 @@ class ExtAccBank[T <: Data](
   for (i <- 0 until nSharers) {
     val canTakeNonExWrite = nonExSelected(i) && nonExWriteCandidate(i)
     val canTakeRead = nonExSelected(i) && readCandidate(i)
-    io.in(i).write.ready := exwriteMask(i) || canTakeNonExWrite
-    io.in(i).read.req.ready := canTakeRead
+    val writeAllowed = if (i == atomicClient) {
+      io.atomic.get.writeAllow
+    } else true.B
+    val readAllowed = if (i == atomicClient) {
+      io.atomic.get.readAllow
+    } else true.B
+    io.in(i).write.ready := exwriteMask(i) ||
+      (canTakeNonExWrite && writeAllowed)
+    io.in(i).read.req.ready := canTakeRead && readAllowed
+  }
+
+  if (atomicClient >= 0) {
+    io.atomic.get.writeSelected :=
+      nonExSelected(atomicClient) && nonExWriteCandidate(atomicClient)
+    io.atomic.get.readSelected :=
+      nonExSelected(atomicClient) && readCandidate(atomicClient)
   }
 
   val writeFireVec = VecInit(io.in.map(_.write.fire))
@@ -857,17 +877,6 @@ class ExtAccBank[T <: Data](
   val selectedWriteMask = Mux1H(writeFireVec, io.in.map(_.write.bits.mask))
   val selectedWriteAcc = Mux1H(writeFireVec, io.in.map(_.write.bits.acc))
   val selectedWriteExwrite = Mux1H(writeFireVec, io.in.map(_.write.bits.exwrite))
-  val selectedWriteToVpu = if (useVpuFusion) {
-    Mux1H(writeFireVec, io.in.map(_.write.bits.toVpu.get))
-  } else {
-    false.B
-  }
-  val selectedWriteSource = if (useVpuFusion) {
-    Some(OHToUInt(writeFireVec.asUInt))
-  } else {
-    None
-  }
-
   val selectedReadAddr = Mux1H(readFireVec, io.in.map(_.read.req.bits.addr))
   val selectedReadTag = Mux1H(readFireVec, (0 until nSharers).map(i => i.U(tagWidth.W)))
 
@@ -878,22 +887,8 @@ class ExtAccBank[T <: Data](
   pipelined_writes(0).bits.data := selectedWriteData
   pipelined_writes(0).bits.mask := selectedWriteMask
   pipelined_writes(0).bits.exwrite := selectedWriteExwrite
-  if (useVpuFusion) {
-    pipelined_writes(0).bits.toVpu.get := selectedWriteToVpu
-  }
-  val pipelinedWriteSources = if (useVpuFusion) {
-    Some(Reg(Vec(acc_latency, UInt(tagWidth.W))))
-  } else {
-    None
-  }
-  if (useVpuFusion) {
-    pipelinedWriteSources.get(0) := selectedWriteSource.get
-  }
   for (i <- 1 until acc_latency) {
     pipelined_writes(i) := pipelined_writes(i - 1)
-    if (useVpuFusion) {
-      pipelinedWriteSources.get(i) := pipelinedWriteSources.get(i - 1)
-    }
   }
 
   val rdata_for_adder = Wire(t)
@@ -911,31 +906,13 @@ class ExtAccBank[T <: Data](
   mem.io.waddr := oldest_pipelined_write.bits.addr
   val finalWriteData = Mux(oldest_pipelined_write.bits.acc,
     adder_sum, oldest_pipelined_write.bits.data)
-  val oldestWriteToVpu = if (useVpuFusion) {
-    oldest_pipelined_write.bits.toVpu.get
-  } else {
-    false.B
-  }
-  mem.io.wen := oldest_pipelined_write.valid && !oldestWriteToVpu
+  mem.io.wen := oldest_pipelined_write.valid
   mem.io.wdata := finalWriteData
   mem.io.mask := oldest_pipelined_write.bits.mask
   mem.io.raddr := Mux(anyWriteFire && selectedWriteAcc, selectedWriteAddr, selectedReadAddr)
   mem.io.ren := (anyWriteFire && selectedWriteAcc) || anyReadFire
   rdata_for_adder := mem.io.rdata
   rdata_for_read_resp := mem.io.rdata
-
-  if (useVpuFusion) {
-    io.vpuWrite.get.valid := oldest_pipelined_write.valid && oldestWriteToVpu
-    io.vpuWrite.get.bits.source := pipelinedWriteSources.get(acc_latency - 1)
-    io.vpuWrite.get.bits.subRow := oldest_pipelined_write.bits.addr
-    io.vpuWrite.get.bits.data := finalWriteData
-    val bytesPerElement = t.head.head.getWidth / 8
-    require(bytesPerElement > 0 &&
-      oldest_pipelined_write.bits.mask.length % bytesPerElement == 0)
-    io.vpuWrite.get.bits.laneMask := VecInit(
-      oldest_pipelined_write.bits.mask.grouped(bytesPerElement)
-        .map(_.reduce(_ || _)).toSeq)
-  }
 
   val delayed_read_valid = RegNext(anyReadFire, false.B)
   val delayed_tag = RegNext(selectedReadTag)
@@ -1100,7 +1077,10 @@ class SharedExtMem(
 }
 
 // made
-class SharedExtMem_4[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, U, V])
+class SharedExtMem_4[T <: Data, U <: Data, V <: Data](
+    config: GemminiArrayConfig[T, U, V],
+    vpuLanes: Int = 16,
+    vpuTagBits: Int = 1)
     (implicit p: Parameters, ev: Arithmetic[T]) extends Module {
   
   import config._
@@ -1109,20 +1089,17 @@ class SharedExtMem_4[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig
   val spad_w = inputType.getWidth *  block_cols
   val sp_mask_len = (spad_w / (aligned_to * 8)) max 1
   val acc_row_t = Vec(meshColumns, Vec(tileColumns, accType))
-  val vpuRowAddrBits = 1 max log2Ceil(acc_banks * acc_bank_entries)
-
+  val vpuElementAddrBits = 1 max log2Ceil(
+    acc_banks * acc_bank_entries * block_cols)
+  val accClients = nSharers + (if (use_vpu_fusion) 1 else 0)
   val io = IO(new Bundle {
     val in = Vec(nSharers, Flipped(new ExtMemIO_new(
       sp_banks, sp_sub_banks, sp_bank_entries / sp_sub_banks, spad_w, sp_mask_len,
-      acc_banks, acc_sub_banks, acc_bank_entries / acc_sub_banks, acc_row_t,
-      use_vpu_fusion
+      acc_banks, acc_sub_banks, acc_bank_entries / acc_sub_banks, acc_row_t
     )))
-    // One final, post-RMW accumulator row per Gemmini.  The output is kept
-    // source-indexed so the VPU scratchpad can give all Gemmini matrix writes
-    // strict priority without losing the producer identity.
-    val vpuWrite = if (use_vpu_fusion) Some(Vec(nSharers,
-      Valid(new GemminiVpuMatrixWriteReq(
-        vpuRowAddrBits, block_cols, accType.getWidth)))) else None
+    val vpuMemory = if (use_vpu_fusion) Some(Flipped(
+      new GemminiVpuMemoryIO(
+        vpuElementAddrBits, vpuLanes, accType.getWidth, vpuTagBits))) else None
   })
 
   for (i <- 0 until sp_banks) {
@@ -1139,8 +1116,9 @@ class SharedExtMem_4[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig
 
   val acc_mems = Seq.tabulate(acc_banks, acc_sub_banks) { (i, s) =>
     val acc_mem = Module(new ExtAccBank(
-      nSharers, acc_bank_entries / acc_sub_banks, acc_row_t, acc_singleported, acc_latency,
-      ex_write_to_acc, use_vpu_fusion
+      accClients, acc_bank_entries / acc_sub_banks, acc_row_t,
+      acc_banks, acc_singleported, acc_latency, ex_write_to_acc,
+      atomicClient = if (use_vpu_fusion) nSharers else -1
     ))
 
     for (w <- 0 until nSharers) {
@@ -1148,6 +1126,18 @@ class SharedExtMem_4[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig
     }
 
     acc_mem
+  }
+
+  if (use_vpu_fusion) {
+    val vpuAdapter = Module(new VpuSharedAccumulatorAdapter(
+      config, vpuLanes, vpuTagBits))
+    vpuAdapter.io.vpu <> io.vpuMemory.get
+    for (bank <- 0 until acc_banks; subBank <- 0 until acc_sub_banks) {
+      vpuAdapter.io.memory(bank)(subBank) <>
+        acc_mems(bank)(subBank).io.in(nSharers)
+      vpuAdapter.io.atomic(bank)(subBank) <>
+        acc_mems(bank)(subBank).io.atomic.get
+    }
   }
 
   val flat_acc_mems = acc_mems.flatten
@@ -1183,38 +1173,6 @@ class SharedExtMem_4[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig
       when (adder_sel_oh_d(a)(b)) {
         flat_acc_mems(b).io.adder.sum := acc_adders(a).io.out
       }
-    }
-  }
-
-  if (use_vpu_fusion) {
-    val vpuWrites = flat_acc_mems.map(_.io.vpuWrite.get)
-    val reconstructedRows = vpuWrites.zipWithIndex.map { case (write, flatBank) =>
-      val accBank = flatBank / acc_sub_banks
-      val subBank = flatBank % acc_sub_banks
-      val fullRow = accBank.U * acc_bank_entries.U +
-        write.bits.subRow * acc_sub_banks.U + subBank.U
-      fullRow.pad(vpuRowAddrBits)
-    }
-    for (source <- 0 until nSharers) {
-      val sourceWrites = vpuWrites.map(w =>
-        w.valid && w.bits.source === source.U)
-
-      // A Gemmini can retire at most one matrix row per cycle.  Two writes
-      // from one source would mean that the bank/sub-bank address mapping
-      // disagrees with the execute stream and must never be silently
-      // arbitrated.
-      assert(PopCount(VecInit(sourceWrites)) <= 1.U,
-        "one Gemmini produced multiple VSRAM rows in one cycle")
-
-      io.vpuWrite.get(source).valid := sourceWrites.reduceOption(_ || _)
-        .getOrElse(false.B)
-
-      val selected = Mux1H(sourceWrites, vpuWrites.map(_.bits))
-      io.vpuWrite.get(source).bits.rowAddress :=
-        Mux1H(sourceWrites, reconstructedRows)
-      io.vpuWrite.get(source).bits.data := VecInit(
-        selected.data.flatten.map(_.asUInt))
-      io.vpuWrite.get(source).bits.laneMask := selected.laneMask
     }
   }
 

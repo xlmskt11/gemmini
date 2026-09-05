@@ -99,6 +99,18 @@ target_include_directories(${FLASH_OPT_TEST_TARGET} PRIVATE
 
 target_compile_features(${FLASH_OPT_TEST_TARGET} PRIVATE cxx_std_17)
 
+set(KV_HTC_LAYOUT_TEST_TARGET llama-firesim-kv-htc-layout-test)
+
+add_executable(${KV_HTC_LAYOUT_TEST_TARGET}
+    llama-firesim-kv-htc-layout-test.cpp
+)
+
+target_include_directories(${KV_HTC_LAYOUT_TEST_TARGET} PRIVATE
+    ${CMAKE_SOURCE_DIR}/ggml/src/ggml-gemmini
+)
+
+target_compile_features(${KV_HTC_LAYOUT_TEST_TARGET} PRIVATE cxx_std_17)
+
 set(VPU_ADMISSION_TEST_TARGET llama-firesim-vpu-admission-test)
 
 add_executable(${VPU_ADMISSION_TEST_TARGET}

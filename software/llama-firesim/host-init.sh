@@ -23,9 +23,6 @@ PAGE_PACKED_A="${GGML_GEMMINI_PAGE_PACKED_A:-0}"
 PAGE_PACKED_B="${GGML_GEMMINI_PAGE_PACKED_B:-1}"
 PAGE_PACKED_C="${GGML_GEMMINI_PAGE_PACKED_C:-0}"
 PAGE_PACKED_D="${GGML_GEMMINI_PAGE_PACKED_D:-0}"
-FLASH_PAGE_PACKED_Q="${Flash_Q_PAGE_PACKED:-${FLASH_Q_PAGE_PACKED:-0}}"
-FLASH_PAGE_PACKED_K="${Flash_K_PAGE_PACKED:-${FLASH_K_PAGE_PACKED:-1}}"
-FLASH_PAGE_PACKED_V="${Flash_V_PAGE_PACKED:-${FLASH_V_PAGE_PACKED:-1}}"
 MODEL_SELECTOR="${LLAMA_FIRESIM_MODEL:-gemma-3-270m}"
 MODEL_URL_OVERRIDE="${LLAMA_FIRESIM_MODEL_URL:-}"
 LLAMA_TAG="${LLAMA_FIRESIM_LLAMA_TAG:-b9060}"
@@ -52,7 +49,7 @@ case "${HW_PROFILE}" in
 esac
 export LLAMA_FIRESIM_HW_PROFILE="${HW_PROFILE}"
 ARTIFACT_FORMAT="gemmini-pack-v4-hybrid-${HYBRID_SPARSE_GGUF}-page-b-${PAGE_PACKED_B}"
-PAGE_PACKING_CONFIG="gemmini-a${PAGE_PACKED_A}-b${PAGE_PACKED_B}-c${PAGE_PACKED_C}-d${PAGE_PACKED_D}-flash-q${FLASH_PAGE_PACKED_Q}-k${FLASH_PAGE_PACKED_K}-v${FLASH_PAGE_PACKED_V}"
+PAGE_PACKING_CONFIG="gemmini-a${PAGE_PACKED_A}-b${PAGE_PACKED_B}-c${PAGE_PACKED_C}-d${PAGE_PACKED_D}"
 
 if [[ "${LLAMA_FIRESIM_BUILD_WEIGHT_PACK:-1}" == "0" ]]; then
     echo "llama-firesim requires its v4 Gemmini weight pack; disabling pack generation is unsupported." >&2
@@ -230,6 +227,7 @@ printf '%s\n' "${MODEL_URL}" > "${MODEL_DIR}/.${MODEL_NAME}.url"
 if [[ ! -f "${GEMMINI_SW_DIR}/include/gemmini_params.h" ||
       ! -f "${GEMMINI_SW_DIR}/include/vpu_params.h" ||
       ! -f "${GEMMINI_SW_DIR}/include/gemmini_all.h" ||
+      ! -f "${GEMMINI_SW_DIR}/include/gemmini_matmul_job.h" ||
       ! -f "${GEMMINI_SW_DIR}/include/gemmini_page_packed.h" ||
       ! -f "${GEMMINI_SW_DIR}/include/vpu.h" ||
       ! -f "${GEMMINI_SW_DIR}/include/vpu_kernels.h" ||
@@ -343,9 +341,6 @@ LLAMA_FIRESIM_HW_PROFILE=${HW_PROFILE}
 : "\${GGML_GEMMINI_PAGE_PACKED_B:=${PAGE_PACKED_B}}"
 : "\${GGML_GEMMINI_PAGE_PACKED_C:=${PAGE_PACKED_C}}"
 : "\${GGML_GEMMINI_PAGE_PACKED_D:=${PAGE_PACKED_D}}"
-: "\${Flash_Q_PAGE_PACKED:=\${FLASH_Q_PAGE_PACKED:-${FLASH_PAGE_PACKED_Q}}}"
-: "\${Flash_K_PAGE_PACKED:=\${FLASH_K_PAGE_PACKED:-${FLASH_PAGE_PACKED_K}}}"
-: "\${Flash_V_PAGE_PACKED:=\${FLASH_V_PAGE_PACKED:-${FLASH_PAGE_PACKED_V}}}"
 export LLAMA_FIRESIM_MODE
 export LLAMA_FIRESIM_HW_PROFILE
 export LLAMA_FIRESIM_SWEEP_PROMPT_MIN
@@ -358,9 +353,6 @@ export GGML_GEMMINI_PAGE_PACKED_A
 export GGML_GEMMINI_PAGE_PACKED_B
 export GGML_GEMMINI_PAGE_PACKED_C
 export GGML_GEMMINI_PAGE_PACKED_D
-export Flash_Q_PAGE_PACKED
-export Flash_K_PAGE_PACKED
-export Flash_V_PAGE_PACKED
 EOF
 chmod +x \
     "${GENERATED_ROOT}/llama-firesim/llama-firesim-cli" \

@@ -5,25 +5,27 @@ import chisel3._
 import chisel3.util._
 import Util._
 
-class AccumulatorReadRespWithFullData[T <: Data: Arithmetic, U <: Data](fullDataType: Vec[Vec[T]], scale_t: U)
+class AccumulatorReadRespWithFullData[T <: Data: Arithmetic, U <: Data](
+    fullDataType: Vec[Vec[T]], scale_t: U, accBanks: Int)
   extends Bundle {
-  val resp = new AccumulatorReadResp(fullDataType, scale_t)
+  val resp = new AccumulatorReadResp(fullDataType, scale_t, accBanks)
   val full_data = fullDataType.cloneType
 }
 
-class AccumulatorScaleResp[T <: Data: Arithmetic](fullDataType: Vec[Vec[T]], rDataType: Vec[Vec[T]]) extends Bundle {
+class AccumulatorScaleResp[T <: Data: Arithmetic](
+    fullDataType: Vec[Vec[T]], rDataType: Vec[Vec[T]], accBanks: Int) extends Bundle {
   val full_data = fullDataType.cloneType
   val data = rDataType.cloneType
-  val acc_bank_id = UInt(2.W)
+  val acc_bank_id = UInt((1 max log2Ceil(accBanks)).W)
   val fromDMA = Bool()
 }
 
 class AccumulatorScaleIO[T <: Data: Arithmetic, U <: Data](
   fullDataType: Vec[Vec[T]], scale_t: U,
-  rDataType: Vec[Vec[T]]
+  rDataType: Vec[Vec[T]], accBanks: Int
 ) extends Bundle {
-  val in = Flipped(Decoupled(new NormalizedOutput[T,U](fullDataType, scale_t)))
-  val out = Decoupled(new AccumulatorScaleResp[T](fullDataType, rDataType))
+  val in = Flipped(Decoupled(new NormalizedOutput[T,U](fullDataType, scale_t, accBanks)))
+  val out = Decoupled(new AccumulatorScaleResp[T](fullDataType, rDataType, accBanks))
 }
 
 class AccScaleDataWithIndex[T <: Data: Arithmetic, U <: Data](t: T, u: U) extends Bundle {
@@ -78,7 +80,7 @@ class AccScalePipe[T <: Data, U <: Data](t: T, rDataType: Vec[Vec[T]], scale_fun
 
 class AccumulatorScale[T <: Data, U <: Data](
   fullDataType: Vec[Vec[T]], rDataType: Vec[Vec[T]],
-  scale_t: U,
+  scale_t: U, accBanks: Int,
   read_small_data: Boolean, read_full_data: Boolean,
   scale_func: (T, U) => T,
   num_scale_units: Int,
@@ -88,12 +90,12 @@ class AccumulatorScale[T <: Data, U <: Data](
   import ev._
 
   val io = IO(new AccumulatorScaleIO[T,U](
-    fullDataType, scale_t, rDataType
+    fullDataType, scale_t, rDataType, accBanks
   )(ev))
   val t = io.in.bits.acc_read_resp.data(0)(0).cloneType
   val acc_read_data = io.in.bits.acc_read_resp.data
   val out = Wire(Decoupled(new AccumulatorScaleResp[T](
-    fullDataType, rDataType)(ev)))
+    fullDataType, rDataType, accBanks)(ev)))
 
   if (num_scale_units == -1) {
     val data = io.in.bits.acc_read_resp.data
@@ -123,7 +125,8 @@ class AccumulatorScale[T <: Data, U <: Data](
       e_clipped
     })))
 
-    val in = Wire(Decoupled(new AccumulatorReadRespWithFullData(fullDataType, scale_t)(ev)))
+    val in = Wire(Decoupled(new AccumulatorReadRespWithFullData(
+      fullDataType, scale_t, accBanks)(ev)))
     in.valid := io.in.valid
     io.in.ready := in.ready
     in.bits.resp := io.in.bits.acc_read_resp
@@ -144,9 +147,9 @@ class AccumulatorScale[T <: Data, U <: Data](
     /*val regs = Reg(Vec(nEntries, Valid(new AccumulatorReadResp[T,U](
       fullDataType, scale_t)(ev))))*/
     val regs = Reg(Vec(nEntries, Valid(new NormalizedOutput[T,U](
-      fullDataType, scale_t)(ev))))
+      fullDataType, scale_t, accBanks)(ev))))
     val out_regs = Reg(Vec(nEntries, new AccumulatorScaleResp[T](
-      fullDataType, rDataType)(ev)))
+      fullDataType, rDataType, accBanks)(ev)))
 
     val fired_masks = Reg(Vec(nEntries, Vec(width, Bool())))
     val completed_masks = Reg(Vec(nEntries, Vec(width, Bool())))
@@ -288,4 +291,3 @@ object AccumulatorScale {
     // we dont want a rounding shift
     (q_poly_iexp.asUInt.do_>>(z_iexp.asUInt(5, 0))).asTypeOf(q)
   }}
-

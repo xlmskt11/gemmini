@@ -364,6 +364,15 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
     header ++= s"#define BANK_NUM $sp_banks\n"
     header ++= s"#define BANK_ROWS $sp_bank_entries\n"
     header ++= s"#define ACC_ROWS ${acc_banks * acc_bank_entries}\n" // TODO add ACC_BANKS as well
+    // Software may emit the N/K funct=24 encoding only for a bitstream which
+    // actually contains the shared multi-Gemmini partition controller.  Keep
+    // this in the generated hardware header (rather than a generic software
+    // header) so a binary built against an old bitstream fails capability
+    // validation instead of silently changing the command interpretation.
+    // Version 1 defines M/B-K, N/A-I, and K/init-store-I ownership. Keep
+    // non-shared configurations at zero so incompatible software cannot
+    // silently issue the shared partition dialect.
+    header ++= s"#define GEMMINI_SHARED_PARTITION_AXIS_ABI_VERSION ${if (use_shared_res_entries) 1 else 0}\n"
 
     val max_bytes = 64
     header ++= s"#define MAX_BYTES $max_bytes\n"

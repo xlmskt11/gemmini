@@ -20,32 +20,6 @@ struct ggml_gemmini_page_packing_config {
     }
 };
 
-// FlashAttention performs two Gemmini matmuls with different logical
-// operands:
-//
-//   Q * K^T: Q is A, K is the (pre-transpose) B source
-//   P * V:   P is held in VSRAM and V is B
-//
-// The final FP32 result is emitted by the VPU H_STORE path in linear row-major
-// order. It never uses the Gemmini C page layout. D is an internal VSRAM
-// online accumulator and therefore also has no host page layout. Keep these
-// decisions in one header so admission, execution, and host tests cannot
-// drift apart.
-struct ggml_gemmini_flash_page_packing_config {
-    bool queries = false;
-    bool keys = false;
-    bool values = false;
-
-    // FlashAttention has an independent Q/K/V request namespace. Do not map
-    // these bits back onto generic Gemmini A/B/C/D: K and V can be selected
-    // independently even though both are B operands in different matmuls.
-    constexpr std::uint8_t mask() const {
-        return static_cast<std::uint8_t>((queries ? 1u : 0u) |
-                                         (keys ? 2u : 0u) |
-                                         (values ? 4u : 0u));
-    }
-};
-
 constexpr ggml_gemmini_page_packing_config ggml_gemmini_page_packing_from_mask(
         std::uint8_t mask) {
     return {
@@ -53,15 +27,6 @@ constexpr ggml_gemmini_page_packing_config ggml_gemmini_page_packing_from_mask(
         (mask & 0x2u) != 0,
         (mask & 0x4u) != 0,
         (mask & 0x8u) != 0,
-    };
-}
-
-constexpr ggml_gemmini_flash_page_packing_config
-ggml_gemmini_flash_page_packing_from_mask(std::uint8_t mask) {
-    return {
-        (mask & 0x1u) != 0,
-        (mask & 0x2u) != 0,
-        (mask & 0x4u) != 0,
     };
 }
 
@@ -83,23 +48,6 @@ constexpr ggml_gemmini_page_packing_config ggml_gemmini_effective_page_packing(
         ggml_gemmini_page_pack_b_operand(requested.b, k),
         ggml_gemmini_page_pack_m_operand(requested.c, m),
         has_d && ggml_gemmini_page_pack_m_operand(requested.d, m),
-    };
-}
-
-constexpr ggml_gemmini_flash_page_packing_config
-ggml_gemmini_effective_flash_page_packing(
-        const ggml_gemmini_flash_page_packing_config & requested,
-        std::uint64_t query_rows,
-        std::uint64_t q_dim,
-        std::uint64_t sequence) {
-    return {
-        // Q is the QK matmul's A, so its M dimension is query_rows.
-        ggml_gemmini_page_pack_m_operand(requested.queries, query_rows),
-        // K is the physical/source B matrix before QK's B transpose.  The
-        // logical contraction dimension is q_dim.
-        ggml_gemmini_page_pack_b_operand(requested.keys, q_dim),
-        // V is the PV matmul's B and contracts across the KV sequence.
-        ggml_gemmini_page_pack_b_operand(requested.values, sequence),
     };
 }
 

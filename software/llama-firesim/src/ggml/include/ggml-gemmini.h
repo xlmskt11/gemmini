@@ -70,6 +70,7 @@ GGML_BACKEND_API void ggml_gemmini_profiler_eval_end(const struct ggml_tensor * 
 // Later writes append only completed, not-yet-exported runs for this session.
 // Run labels must be unique within one reset generation.
 GGML_BACKEND_API int ggml_gemmini_profiler_write_results(const char * results_dir);
+
 GGML_BACKEND_API int ggml_gemmini_smoke_matmul(int32_t rows, int32_t cols_out, int32_t cols_in);
 
 #ifdef __cplusplus

@@ -35,6 +35,7 @@ set(LLAMA_FIRESIM_REQUIRED_GENERATED_HEADERS
     include/gemmini_params.h
     include/vpu_params.h
     include/gemmini_all.h
+    include/gemmini_matmul_job.h
     include/gemmini_counter.h
     include/gemmini_page_packed.h
     include/gemmini_tiling.h

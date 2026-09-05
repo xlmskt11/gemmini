@@ -1,1 +1,1 @@
-gemmini-a0-b1-c0-d0-flash-q0-k0-v0
+gemmini-a0-b1-c0-d0

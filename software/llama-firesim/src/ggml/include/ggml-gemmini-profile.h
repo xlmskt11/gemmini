@@ -102,8 +102,8 @@ GGML_GEMMINI_PROFILE_STATIC_ASSERT(sizeof(acc_t) == 4,
     "llama-firesim Gemmini accumulators must be FP32");
 GGML_GEMMINI_PROFILE_STATIC_ASSERT(VPU_VLEN == 128u,
     "llama-firesim VPU VLEN must be 128 elements");
-GGML_GEMMINI_PROFILE_STATIC_ASSERT(VPU_NLANES == 8u,
-    "llama-firesim VPU must expose eight FP32 lanes");
+GGML_GEMMINI_PROFILE_STATIC_ASSERT(VPU_NLANES == 16u,
+    "llama-firesim VPU must expose sixteen FP32 lanes");
 GGML_GEMMINI_PROFILE_STATIC_ASSERT(VPU_VSPAD_KIB == 256u,
     "llama-firesim VPU scratchpad must be 256 KiB");
 GGML_GEMMINI_PROFILE_STATIC_ASSERT(VPU_DMA_BUS_BITS == 256u,
@@ -114,12 +114,12 @@ GGML_GEMMINI_PROFILE_STATIC_ASSERT(VPU_COMPUTE_KIND == VPU_STORAGE_FP32,
     "llama-firesim VPU compute must be FP32");
 GGML_GEMMINI_PROFILE_STATIC_ASSERT(VPU_SHARED_DEPS == 1u,
     "llama-firesim fusion requires shared dependencies");
-GGML_GEMMINI_PROFILE_STATIC_ASSERT(VPU_GROUPED_COMMANDS == 1u,
-    "llama-firesim fusion requires grouped commands");
+GGML_GEMMINI_PROFILE_STATIC_ASSERT(VPU_EVENT_COMMANDS == 1u,
+    "llama-firesim fusion requires event commands");
 GGML_GEMMINI_PROFILE_STATIC_ASSERT(VPU_MATRIX_ROW_ELEMENTS == DIM,
     "VPU matrix row width must equal the live Gemmini DIM");
 GGML_GEMMINI_PROFILE_STATIC_ASSERT(
-    VPU_MATRIX_WORDS_PER_ROW * VPU_NLANES == VPU_MATRIX_ROW_ELEMENTS,
+    VPU_MATRIX_ROW_ELEMENTS * VPU_MEMORY_ROWS_PER_WORD == VPU_NLANES,
     "VPU matrix row packing is inconsistent with the live lane geometry");
 
 #endif  // GGML_GEMMINI_PROFILE_H

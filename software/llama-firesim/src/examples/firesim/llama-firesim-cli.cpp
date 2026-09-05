@@ -64,13 +64,6 @@ static bool env_flag(const char * name, bool fallback) {
     return true;
 }
 
-static bool flash_env_flag(const char * requested_name, const char * uppercase_alias, bool fallback) {
-    if (std::getenv(requested_name) != nullptr) {
-        return env_flag(requested_name, fallback);
-    }
-    return env_flag(uppercase_alias, fallback);
-}
-
 static int32_t parse_int32_exact(const std::string & value) {
     size_t parsed = 0;
     const long long result = std::stoll(value, &parsed, 0);
@@ -252,9 +245,6 @@ struct options {
     int page_packed_b = -1;
     int page_packed_c = -1;
     int page_packed_d = -1;
-    int flash_q_page_packed = -1;
-    int flash_k_page_packed = -1;
-    int flash_v_page_packed = -1;
     bool benchmark = false;
     bool arrival_benchmark = false;
     bool sweep = false;
@@ -279,7 +269,6 @@ static void print_usage(const char * argv0) {
         << "usage: " << argv0 << " [--backend gemmini|cpu] [--gemmini-mode multi|single] [--ctx-size N]\n"
         << "       [--n-predict N] [--results-dir DIR] [--prompt TEXT] [--benchmark] [--arrival-benchmark] [--sweep] [--interactive]\n"
         << "       [--gemmini-page-packed-a BOOL] [--gemmini-page-packed-b BOOL] [--gemmini-page-packed-c BOOL] [--gemmini-page-packed-d BOOL]\n"
-        << "       [--flash-q-page-packed BOOL] [--flash-k-page-packed BOOL] [--flash-v-page-packed BOOL]\n"
         << "       [--sweep-prompt-min N] [--sweep-prompt-max N] [--sweep-prompt-step N] [--sweep-masks MASK[,MASK...]]\n"
         << "       " << argv0 << " --gemmini-smoke [M N K]\n";
 }
@@ -322,12 +311,6 @@ static options parse_args(int argc, char ** argv) {
             opts.page_packed_c = parse_bool_value(argv[++i]) ? 1 : 0;
         } else if (arg == "--gemmini-page-packed-d" && i + 1 < argc) {
             opts.page_packed_d = parse_bool_value(argv[++i]) ? 1 : 0;
-        } else if (arg == "--flash-q-page-packed" && i + 1 < argc) {
-            opts.flash_q_page_packed = parse_bool_value(argv[++i]) ? 1 : 0;
-        } else if (arg == "--flash-k-page-packed" && i + 1 < argc) {
-            opts.flash_k_page_packed = parse_bool_value(argv[++i]) ? 1 : 0;
-        } else if (arg == "--flash-v-page-packed" && i + 1 < argc) {
-            opts.flash_v_page_packed = parse_bool_value(argv[++i]) ? 1 : 0;
         } else if (arg == "--ctx-size" && i + 1 < argc) {
             opts.n_ctx = std::stoi(argv[++i]);
         } else if (arg == "--n-predict" && i + 1 < argc) {
@@ -398,9 +381,6 @@ static void apply_page_packing_options(const options & opts) {
         {"GGML_GEMMINI_PAGE_PACKED_B", opts.page_packed_b},
         {"GGML_GEMMINI_PAGE_PACKED_C", opts.page_packed_c},
         {"GGML_GEMMINI_PAGE_PACKED_D", opts.page_packed_d},
-        {"Flash_Q_PAGE_PACKED", opts.flash_q_page_packed},
-        {"Flash_K_PAGE_PACKED", opts.flash_k_page_packed},
-        {"Flash_V_PAGE_PACKED", opts.flash_v_page_packed},
     };
 
     for (const auto & item : values) {
@@ -511,11 +491,6 @@ public:
                   << ",B=" << (env_flag("GGML_GEMMINI_PAGE_PACKED_B", false) ? 1 : 0)
                   << ",C=" << (env_flag("GGML_GEMMINI_PAGE_PACKED_C", false) ? 1 : 0)
                   << ",D=" << (env_flag("GGML_GEMMINI_PAGE_PACKED_D", false) ? 1 : 0)
-                  << "\n";
-        std::cout << "FLASH-PAGE-PACKING,Q="
-                  << (flash_env_flag("Flash_Q_PAGE_PACKED", "FLASH_Q_PAGE_PACKED", false) ? 1 : 0)
-                  << ",K=" << (flash_env_flag("Flash_K_PAGE_PACKED", "FLASH_K_PAGE_PACKED", true) ? 1 : 0)
-                  << ",V=" << (flash_env_flag("Flash_V_PAGE_PACKED", "FLASH_V_PAGE_PACKED", true) ? 1 : 0)
                   << "\n";
         std::cout.flush();
 

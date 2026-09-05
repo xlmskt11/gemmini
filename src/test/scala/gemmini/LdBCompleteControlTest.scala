@@ -2,239 +2,105 @@ package gemmini
 
 import chisel3._
 import chisel3.iotesters.{ChiselFlatSpec, PeekPokeTester}
-import VpuLocalAddr._
 
-class FusionLocalAddrFlagHarness extends Module {
-  private val localAddrType = new LocalAddr(
-    sp_banks = 8, sp_bank_entries = 256,
-    acc_banks = 8, acc_bank_entries = 256)
-
-  val io = IO(new Bundle {
-    val base = Input(UInt(11.W))
-    val a_from_vsram = Input(Bool())
-    val c_to_vsram = Input(Bool())
-    val d_from_vsram = Input(Bool())
-    val out_data = Output(UInt(11.W))
-    val a_flag = Output(Bool())
-    val c_flag = Output(Bool())
-    val d_flag = Output(Bool())
-  })
-
-  val baseAddr = LocalAddr.cast_to_sp_addr(localAddrType, io.base)
-  val withA = with_a_from_vsram(baseAddr, io.a_from_vsram)
-  val withBoth = with_c_to_vsram(withA, io.c_to_vsram)
-  val withAll = with_d_from_vsram(withBoth, io.d_from_vsram)
-
-  io.out_data := withAll.full_sp_addr()
-  io.a_flag := withAll.a_from_vsram()
-  io.c_flag := withAll.c_to_vsram()
-  io.d_flag := withAll.d_from_vsram()
-}
-
-class FusionLocalAddrFlagTester(c: FusionLocalAddrFlagHarness) extends PeekPokeTester(c) {
-  for {
-    a <- Seq(false, true)
-    cFlag <- Seq(false, true)
-    d <- Seq(false, true)
-  } {
-    poke(c.io.base, 0x345)
-    poke(c.io.a_from_vsram, a)
-    poke(c.io.c_to_vsram, cFlag)
-    poke(c.io.d_from_vsram, d)
-    step(1)
-    expect(c.io.out_data, 0x345)
-    expect(c.io.a_flag, a)
-    expect(c.io.c_flag, cFlag)
-    expect(c.io.d_flag, d)
-  }
-}
-
-class LdBCompleteControlTester(c: LdBCompleteControl) extends PeekPokeTester(c) {
+class LoopMatmulGroupControllerTester(c: LoopMatmulGroupController)
+    extends PeekPokeTester(c) {
   private val nSharers = 4
-  private val gemv = c.io.gemv.get
 
-  private def driveIdleMember(i: Int): Unit = {
-    poke(c.io.in(i).ldb.group_id, 0)
-    poke(c.io.in(i).ldb.group_list, 0)
-    poke(c.io.in(i).ldb.has_gemv_followup.get, false)
-    poke(c.io.in(i).ldb.k, 0)
-    poke(c.io.in(i).ldb.k_offset, 0)
-    poke(c.io.in(i).ldb.max_k, 0)
-    poke(c.io.in(i).ldb.j, 0)
-    poke(c.io.in(i).ldb.idle, true)
-
-    poke(c.io.in(i).ex.group_id, 0)
-    poke(c.io.in(i).ex.group_list, 0)
-    poke(c.io.in(i).ex.k, 0)
-    poke(c.io.in(i).ex.j, 0)
-    poke(c.io.in(i).ex.idle, true)
-
-    poke(c.io.in(i).stc.group_id, 0)
-    poke(c.io.in(i).stc.idle, true)
+  private def driveLoad(load: CoopLoadState, groupId: Int = 0,
+                        memberMask: Int = 0, idle: Boolean = true): Unit = {
+    poke(load.axis, GemminiISA.PartitionAxis.M.litValue)
+    poke(load.group_id, groupId)
+    poke(load.member_mask, memberMask)
+    poke(load.wait_event_valid.get, false)
+    poke(load.wait_event_id.get, 0)
+    poke(load.produce_event_valid.get, memberMask != 0)
+    poke(load.produce_event_id.get, 5)
+    poke(load.produce_event_seal.get, memberMask != 0)
+    poke(load.next_outer, 0)
+    poke(load.next_inner, 0)
+    poke(load.owner_offset, 0)
+    poke(load.owner_extent, if (memberMask == 0) 0 else 1)
+    poke(load.idle, idle)
   }
 
-  private def driveActiveMember(i: Int, groupId: Int, groupList: Int,
-                                hasGemv: Boolean, idle: Boolean): Unit = {
-    poke(c.io.in(i).ldb.group_id, groupId)
-    poke(c.io.in(i).ldb.group_list, groupList)
-    poke(c.io.in(i).ldb.has_gemv_followup.get, hasGemv)
-    poke(c.io.in(i).ldb.k, 0)
-    poke(c.io.in(i).ldb.k_offset, 0)
-    poke(c.io.in(i).ldb.max_k, 1)
-    poke(c.io.in(i).ldb.j, 0)
-    poke(c.io.in(i).ldb.idle, idle)
+  private def driveMember(i: Int, groupId: Int = 0, memberMask: Int = 0,
+                          idle: Boolean = true): Unit = {
+    driveLoad(c.io.in(i).lda)
+    driveLoad(c.io.in(i).ldb, groupId, memberMask, idle)
 
+    poke(c.io.in(i).ldd.axis, GemminiISA.PartitionAxis.M.litValue)
+    poke(c.io.in(i).ldd.group_id, groupId)
+    poke(c.io.in(i).ldd.idle, true)
+
+    poke(c.io.in(i).ex.axis, GemminiISA.PartitionAxis.M.litValue)
     poke(c.io.in(i).ex.group_id, groupId)
-    poke(c.io.in(i).ex.group_list, groupList)
+    poke(c.io.in(i).ex.member_mask, memberMask)
     poke(c.io.in(i).ex.k, 0)
     poke(c.io.in(i).ex.j, 0)
+    poke(c.io.in(i).ex.i, 0)
+    poke(c.io.in(i).ex.is_first_k_shard, false)
+    poke(c.io.in(i).ex.is_compute, false)
+    poke(c.io.in(i).ex.registration_fire, false)
+    poke(c.io.in(i).ex.is_last_local_k, false)
+    poke(c.io.in(i).ex.first_k_overwrites, false)
     poke(c.io.in(i).ex.idle, idle)
 
+    poke(c.io.in(i).stc.axis, GemminiISA.PartitionAxis.M.litValue)
     poke(c.io.in(i).stc.group_id, groupId)
+    poke(c.io.in(i).stc.global_j, 0)
+    poke(c.io.in(i).stc.global_i, 0)
+    poke(c.io.in(i).stc.j_blocks, 1)
+    poke(c.io.in(i).stc.registration_request, false)
+    poke(c.io.in(i).stc.registration_fire, false)
     poke(c.io.in(i).stc.idle, idle)
   }
 
-  private def driveMemberIdleState(i: Int, ldbIdle: Boolean,
-                                   exIdle: Boolean, stcIdle: Boolean): Unit = {
-    poke(c.io.in(i).ldb.idle, ldbIdle)
-    poke(c.io.in(i).ex.idle, exIdle)
-    poke(c.io.in(i).stc.idle, stcIdle)
+  for (g <- 0 until nSharers * 2) {
+    poke(c.io.event_admissions.get(g).ready, true)
   }
+  for (i <- 0 until nSharers) driveMember(i)
 
-  private def driveGemv(pending: Boolean, groupId: Int,
-                        lastDispatchFire: Boolean = false, abort: Boolean = false): Unit = {
-    poke(gemv.pending, pending)
-    poke(gemv.group_id, groupId)
-    poke(gemv.last_dispatch_fire, lastDispatchFire)
-    poke(gemv.abort, abort)
-  }
-
-  for (i <- 0 until nSharers) driveIdleMember(i)
-  driveGemv(pending = true, groupId = 0)
-  expect(gemv.group_allocated, false)
-  expect(gemv.dispatch_enable, false)
-  expect(gemv.dispatch_reject, false)
-
-  // Allocate a two-member group which requires a VPU follow-up. Both members
-  // advertise the same bit, exercising the agreement check as well.
-  driveActiveMember(0, groupId = 0, groupList = 0x3, hasGemv = true, idle = false)
-  driveActiveMember(1, groupId = 0, groupList = 0x3, hasGemv = true, idle = false)
+  // Sync-group allocation is the event admission point. One producer is
+  // attached for the whole group, independent of its Gemmini member count.
+  driveMember(0, groupId = 0, memberMask = 0x3, idle = false)
+  driveMember(1, groupId = 0, memberMask = 0x3, idle = false)
+  expect(c.io.event_admissions.get(0).request, true)
+  expect(c.io.event_admissions.get(0).commit, true)
+  expect(c.io.event_admissions.get(0).produceValid, true)
+  expect(c.io.event_admissions.get(0).produceId, 5)
+  expect(c.io.event_admissions.get(0).produceSeal, true)
   step(1)
 
-  expect(gemv.group_allocated, true)
-  expect(gemv.dispatch_enable, false)
-  expect(gemv.dispatch_reject, false)
-
-  // Each existing completion edge represents the corresponding child stream
-  // entering the local RS, SharedExtEntries, and VsramExtEntries. No partial conjunction
-  // may open VPU dispatch.
-  driveMemberIdleState(0, ldbIdle = true, exIdle = false, stcIdle = false)
-  driveMemberIdleState(1, ldbIdle = true, exIdle = false, stcIdle = false)
+  // The producer completes when all child streams have registered. VPU
+  // commands no longer participate in the sync-group lifetime.
+  driveMember(0, groupId = 0, memberMask = 0x3, idle = true)
+  driveMember(1, groupId = 0, memberMask = 0x3, idle = true)
   step(1)
-  expect(gemv.dispatch_enable, false)
-
-  driveMemberIdleState(0, ldbIdle = true, exIdle = true, stcIdle = false)
-  driveMemberIdleState(1, ldbIdle = true, exIdle = true, stcIdle = false)
+  expect(c.io.event_completions.get(0).valid, true)
+  expect(c.io.event_completions.get(0).id, 5)
   step(1)
-  expect(gemv.dispatch_enable, false)
+  expect(c.io.event_completions.get(0).valid, false)
 
-  // Dispatch opens only after all three streams are registered. These are
-  // unroller-completion signals, not functional-unit retirement signals.
-  driveMemberIdleState(0, ldbIdle = true, exIdle = true, stcIdle = true)
-  driveMemberIdleState(1, ldbIdle = true, exIdle = true, stcIdle = true)
-  step(1)
-
-  expect(gemv.group_allocated, true)
-  expect(gemv.dispatch_enable, true)
-
-  // The final VPU command entering its RS/SharedDeps closes the coarse group.
-  // Any still-running Gemmini/VPU commands retain their address dependencies
-  // in the dependency tables, so the finite group ID is immediately reusable.
-  driveGemv(pending = true, groupId = 0, lastDispatchFire = true)
-  step(1)
-  driveGemv(pending = true, groupId = 0)
-  expect(gemv.group_allocated, false)
-  expect(gemv.dispatch_enable, false)
-
-  // Reuse the released finite-width ID for an independent group. No stale
-  // registration or VPU-dispatch state may survive from the previous owner.
-  driveActiveMember(0, groupId = 0, groupList = 0x1, hasGemv = true,
-    idle = false)
-  for (i <- 1 until nSharers) driveIdleMember(i)
-  expect(c.io.in(0).loop_full, true)
-  step(1)
-  expect(gemv.group_allocated, true)
-  expect(gemv.dispatch_enable, false)
-
-  driveActiveMember(0, groupId = 0, groupList = 0x1, hasGemv = true,
-    idle = true)
-  step(1)
-  expect(gemv.group_allocated, true)
-  expect(gemv.dispatch_enable, true)
-
-  driveGemv(pending = true, groupId = 0, lastDispatchFire = true)
-  step(1)
-  expect(gemv.group_allocated, false)
-  expect(gemv.dispatch_enable, false)
-
-  // A legacy group with HAS_GEMV_FOLLOWUP clear releases after the ordinary
-  // Gemmini completion path without waiting for any VPU handshake.
-  driveActiveMember(0, groupId = 1, groupList = 0x1, hasGemv = false, idle = false)
-  driveGemv(pending = true, groupId = 1)
-  step(1)
-  expect(gemv.group_allocated, true)
-  expect(gemv.dispatch_enable, false)
-  expect(gemv.dispatch_reject, true)
-
-  driveActiveMember(0, groupId = 1, groupList = 0x1, hasGemv = false,
-    idle = true)
-  step(1)
-  expect(gemv.group_allocated, true)
-  expect(gemv.dispatch_enable, false)
-
-  step(1)
-  expect(gemv.group_allocated, false)
-
-  // Abort follows the same registered release rule as a successful final
-  // dispatch, while still waiting for the Gemmini side to be complete.
-  driveActiveMember(0, groupId = 2, groupList = 0x1, hasGemv = true, idle = false)
-  driveGemv(pending = true, groupId = 2)
-  step(1)
-  driveActiveMember(0, groupId = 2, groupList = 0x1, hasGemv = true,
-    idle = true)
-  step(1)
-  expect(gemv.dispatch_enable, true)
-
-  driveGemv(pending = true, groupId = 2, abort = true)
-  step(1)
-  expect(gemv.group_allocated, false)
-  expect(gemv.dispatch_enable, false)
+  // The finite sync ID is immediately reusable after registration completes.
+  driveMember(0, groupId = 0, memberMask = 0x1, idle = false)
+  for (i <- 1 until nSharers) driveMember(i)
+  expect(c.io.event_admissions.get(0).request, true)
+  expect(c.io.event_admissions.get(0).commit, true)
 }
 
-class LdBCompleteControlUnitTest extends ChiselFlatSpec {
-  behavior of "LdBCompleteControl"
+class LoopMatmulGroupControllerUnitTest extends ChiselFlatSpec {
+  behavior of "LoopMatmulGroupController"
 
-  it should "hold a Gemmini group until the final grouped VPU command is dispatched" in {
+  it should "release sync groups at registration and signal EventTracker" in {
     val args = Array(
       "--backend-name", "treadle",
       "--target-dir", "test_run_dir/ldb-complete-control"
     )
 
-    chisel3.iotesters.Driver.execute(args, () => new LdBCompleteControl(
+    chisel3.iotesters.Driver.execute(args, () => new LoopMatmulGroupController(
       nSharers = 4, useVpuFusion = true)) {
-      c => new LdBCompleteControlTester(c)
+      c => new LoopMatmulGroupControllerTester(c)
     } should be (true)
   }
-
-  it should "encode fusion routing flags without changing the LocalAddr data field" in {
-    val args = Array(
-      "--backend-name", "treadle",
-      "--target-dir", "test_run_dir/fusion-local-addr-flags"
-    )
-
-    chisel3.iotesters.Driver.execute(args, () => new FusionLocalAddrFlagHarness) {
-      c => new FusionLocalAddrFlagTester(c)
-    } should be (true)
-  }
-
 }

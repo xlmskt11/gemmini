@@ -114,13 +114,6 @@ static bool env_flag(const char * name, bool fallback) {
     return true;
 }
 
-static bool flash_env_flag(const char * requested_name, const char * uppercase_alias, bool fallback) {
-    if (std::getenv(requested_name) != nullptr) {
-        return env_flag(requested_name, fallback);
-    }
-    return env_flag(uppercase_alias, fallback);
-}
-
 struct activation_stage_key {
     const ggml_tensor * tensor = nullptr;
     const uint8_t * slice = nullptr;
@@ -183,7 +176,6 @@ static int env_int(const char * name, int fallback) {
 }
 
 using gemmini_page_packing_config = ggml_gemmini_page_packing_config;
-using flash_page_packing_config = ggml_gemmini_flash_page_packing_config;
 
 static const gemmini_page_packing_config & gemmini_page_packing() {
     static const gemmini_page_packing_config config{
@@ -191,18 +183,6 @@ static const gemmini_page_packing_config & gemmini_page_packing() {
         env_flag("GGML_GEMMINI_PAGE_PACKED_B", false),
         env_flag("GGML_GEMMINI_PAGE_PACKED_C", false),
         env_flag("GGML_GEMMINI_PAGE_PACKED_D", false),
-    };
-    return config;
-}
-
-static const flash_page_packing_config & flash_page_packing() {
-    // These exact, case-sensitive names intentionally do not share state
-    // with GGML_GEMMINI_PAGE_PACKED_{A,B,C,D}. Defaults preserve the former
-    // A=0/B=1 FlashAttention behavior while allowing K and V to diverge.
-    static const flash_page_packing_config config{
-        flash_env_flag("Flash_Q_PAGE_PACKED", "FLASH_Q_PAGE_PACKED", false),
-        flash_env_flag("Flash_K_PAGE_PACKED", "FLASH_K_PAGE_PACKED", true),
-        flash_env_flag("Flash_V_PAGE_PACKED", "FLASH_V_PAGE_PACKED", true),
     };
     return config;
 }
@@ -329,6 +309,23 @@ static int gemmini_active_mask() {
     }
     return env_int("GGML_GEMMINI_ACTIVE_MASK", GGML_GEMMINI_PROFILE_LOGICAL_MASK) &
         GGML_GEMMINI_PROFILE_LOGICAL_MASK;
+}
+
+static gemmini_partition_axis_t gemmini_forced_partition_axis() {
+    const int configured_axis =
+        env_int("GGML_GEMMINI_PARTITION_AXIS", GEMMINI_PARTITION_AXIS_M);
+    if (configured_axis < GEMMINI_PARTITION_AXIS_M ||
+            configured_axis > GEMMINI_PARTITION_AXIS_K) {
+        throw std::invalid_argument(
+            "GGML_GEMMINI_PARTITION_AXIS must be 0 (M), 1 (N), or 2 (K)");
+    }
+    if (!gemmini_partition_axis_supported_by_abi(
+            static_cast<gemmini_partition_axis_t>(configured_axis),
+            gemmini_partition_generated_axis_abi_version())) {
+        throw std::runtime_error(
+            "generated Gemmini headers do not advertise N/K partition support");
+    }
+    return static_cast<gemmini_partition_axis_t>(configured_axis);
 }
 
 static int gemmini_physical_mask(int logical_mask) {
@@ -830,7 +827,6 @@ struct gemmini_op_event {
     int64_t tile_j = 0;
     int64_t tile_k = 0;
     uint8_t page_packed_mask = 0;
-    uint8_t flash_page_packed_mask = 0;
 };
 
 struct token_event {
@@ -878,7 +874,6 @@ struct last_gemmini_state {
     int64_t tile_j = 0;
     int64_t tile_k = 0;
     uint8_t page_packed_mask = 0;
-    uint8_t flash_page_packed_mask = 0;
     int64_t accelerator_call_us = 0;
     uint64_t accelerator_call_cycles = 0;
     std::map<std::string, backend_component_timing> flash_attention_components;
@@ -1073,7 +1068,6 @@ static void mark_accelerator_result(
         int64_t start_us,
         uint64_t start_cycles,
         uint8_t page_packed_mask = 0,
-        uint8_t flash_page_packed_mask = 0,
         const ggml_gemmini_vpu_result * accelerator_result = nullptr) {
     const int64_t elapsed_us = ggml_time_us() - start_us;
     const uint64_t elapsed_cycles = read_cycles_local() - start_cycles;
@@ -1088,7 +1082,6 @@ static void mark_accelerator_result(
     state.accelerator_call_us = elapsed_us;
     state.accelerator_call_cycles = elapsed_cycles;
     state.page_packed_mask = page_packed_mask;
-    state.flash_page_packed_mask = flash_page_packed_mask;
     if (accelerator_result != nullptr && std::strcmp(backend_name, "flash_attention") == 0) {
         const ggml_gemmini_flash_breakdown & flash = accelerator_result->flash;
         add_backend_component(state.flash_attention_components, "input_validation",
@@ -1989,7 +1982,9 @@ static bool split_tiling_fits(size_t tI, size_t tJ, size_t tK) {
            tiled_matmul_total_acc_rows(tI, tJ) <= max_acc_rows;
 }
 
-static void choose_split_tiling_factors(shared_multi_matmul_job_t * job) {
+static void choose_split_tiling_factors(
+        shared_multi_matmul_job_t * job) {
+    const gemmini_partition_axis_t axis = job->partition_axis;
     job->gemmini_num = 0;
     for (int i = 0; i < total_gemmini_num; ++i) {
         if ((job->gemmini_list >> i) & 1) {
@@ -2012,31 +2007,64 @@ static void choose_split_tiling_factors(shared_multi_matmul_job_t * job) {
     size_t tJ = std::min(max_j, static_cast<size_t>(gemmini_tile_j()));
     size_t tK = std::min(max_k, static_cast<size_t>(gemmini_tile_k()));
 
+    const size_t members = static_cast<size_t>(job->gemmini_num);
+    const size_t min_i = (axis == GEMMINI_PARTITION_AXIS_M ||
+                          axis == GEMMINI_PARTITION_AXIS_N)
+        ? std::min(members, max_i) : 1;
+    const size_t min_j = axis == GEMMINI_PARTITION_AXIS_N
+        ? std::min(members, max_j) : 1;
+    const size_t min_k = (axis == GEMMINI_PARTITION_AXIS_M ||
+                          axis == GEMMINI_PARTITION_AXIS_K)
+        ? std::min(members, max_k) : 1;
+
+    tI = std::max(tI, min_i);
+    tJ = std::max(tJ, min_j);
+    tK = std::max(tK, min_k);
+    if (axis == GEMMINI_PARTITION_AXIS_M && max_i >= members) {
+        tI = std::max(min_i, (tI / members) * members);
+    } else if (axis == GEMMINI_PARTITION_AXIS_N && max_j >= members) {
+        tJ = std::max(min_j, (tJ / members) * members);
+    } else if (axis == GEMMINI_PARTITION_AXIS_K && max_k >= members) {
+        tK = std::max(min_k, (tK / members) * members);
+    }
+
     while (!split_tiling_fits(tI, tJ, tK)) {
-        if (tK > 1) {
-            --tK;
-        } else if (tI > 1) {
+        if (axis == GEMMINI_PARTITION_AXIS_K && tI > min_i) {
             --tI;
-        } else if (tJ > 1) {
+        } else if (axis == GEMMINI_PARTITION_AXIS_K && tJ > min_j) {
             --tJ;
+        } else if (tK > min_k) {
+            tK -= axis == GEMMINI_PARTITION_AXIS_K ? members : 1;
+        } else if (tI > min_i) {
+            tI -= axis == GEMMINI_PARTITION_AXIS_M ? members : 1;
+        } else if (tJ > min_j) {
+            tJ -= axis == GEMMINI_PARTITION_AXIS_N ? members : 1;
         } else {
-            break;
+            job->partition_status = SHARED_MULTI_PARTITION_PLAN_FAILED;
+            job->done = true;
+            return;
         }
     }
 
     while (true) {
         bool increased = false;
 
-        if (tJ < max_j && split_tiling_fits(tI, tJ + 1, tK)) {
-            ++tJ;
+        const size_t next_tJ = tJ +
+            (axis == GEMMINI_PARTITION_AXIS_N ? members : 1);
+        if (next_tJ <= max_j && split_tiling_fits(tI, next_tJ, tK)) {
+            tJ = next_tJ;
             increased = true;
         }
-        if (tI < max_i && split_tiling_fits(tI + 1, tJ, tK)) {
-            ++tI;
+        const size_t next_tI = tI +
+            (axis == GEMMINI_PARTITION_AXIS_M ? members : 1);
+        if (next_tI <= max_i && split_tiling_fits(next_tI, tJ, tK)) {
+            tI = next_tI;
             increased = true;
         }
-        if (tK < max_k && split_tiling_fits(tI, tJ, tK + 1)) {
-            ++tK;
+        const size_t next_tK = tK +
+            (axis == GEMMINI_PARTITION_AXIS_K ? members : 1);
+        if (next_tK <= max_k && split_tiling_fits(tI, tJ, next_tK)) {
+            tK = next_tK;
             increased = true;
         }
 
@@ -2053,6 +2081,7 @@ static void choose_split_tiling_factors(shared_multi_matmul_job_t * job) {
     job->sp_addr_A_stacked = tiled_matmul_A_spad_rows(tI, tJ, tK);
     job->sp_addr_B_stacked = tiled_matmul_B_spad_rows(tI, tJ, tK);
     job->acc_addr_stacked = tiled_matmul_total_acc_rows(tI, tJ);
+    job->partition_status = SHARED_MULTI_PARTITION_OK;
 }
 
 static gemmini_matmul_metrics run_gemmini_matmul(
@@ -2073,6 +2102,8 @@ static gemmini_matmul_metrics run_gemmini_matmul(
         throw std::logic_error("Gemmini matmul received non-effective page-packing flags");
     }
     const bool split_mode = request_runtime().split_mode;
+    const gemmini_partition_axis_t partition_axis =
+        gemmini_forced_partition_axis();
 #if GGML_GEMMINI_PROFILE_ID == GGML_GEMMINI_PROFILE_SINGLE_ID
     constexpr bool single_mode = true;
 #else
@@ -2080,6 +2111,10 @@ static gemmini_matmul_metrics run_gemmini_matmul(
 #endif
     if (single_mode && split_mode) {
         throw std::runtime_error("Gemmini single profile does not support split mode");
+    }
+    if (single_mode && partition_axis != GEMMINI_PARTITION_AXIS_M) {
+        throw std::runtime_error(
+            "Gemmini forced N/K partitioning requires the shared-multi profile");
     }
     const bool use_counters = !split_mode && gemmini_use_counters();
     const int gemmini_id = request_runtime().gemmini_id;
@@ -2297,6 +2332,7 @@ static gemmini_matmul_metrics run_gemmini_matmul(
         job.low_D = false;
         job.weightA = 1;
         job.dataflow = WEIGHT_STATIONARY;
+        job.partition_axis = partition_axis;
 
         if (env_flag("GGML_GEMMINI_TRACE", false)) {
             std::fprintf(stderr,
@@ -2321,6 +2357,10 @@ static gemmini_matmul_metrics run_gemmini_matmul(
         } else {
             shared_multi_choose_tiling_factors(&job);
         }
+        if (job.partition_status != SHARED_MULTI_PARTITION_OK) {
+            throw std::runtime_error(
+                "Gemmini could not satisfy the selected partition-axis tiling");
+        }
         metrics.tile_i = static_cast<int64_t>(job.tile_I);
         metrics.tile_j = static_cast<int64_t>(job.tile_J);
         metrics.tile_k = static_cast<int64_t>(job.tile_K);
@@ -2343,6 +2383,10 @@ static gemmini_matmul_metrics run_gemmini_matmul(
         component_cycles_start = read_cycles_local();
         component_us_start = ggml_time_us();
         shared_multi_tiled_matmul_job_init(&job);
+        if (job.partition_status != SHARED_MULTI_PARTITION_OK) {
+            throw std::runtime_error(
+                "Gemmini rejected the requested shared-matmul partition axis");
+        }
         metrics.gemmini_configuration_us += ggml_time_us() - component_us_start;
         metrics.gemmini_configuration_cycles += read_cycles_local() - component_cycles_start;
 
@@ -2350,6 +2394,10 @@ static gemmini_matmul_metrics run_gemmini_matmul(
         component_us_start = ggml_time_us();
         while (!job.done) {
             shared_multi_tiled_matmul_job_step(&job);
+        }
+        if (job.partition_status != SHARED_MULTI_PARTITION_OK) {
+            throw std::runtime_error(
+                "Gemmini shared partition descriptor planning failed");
         }
 
         gemmini_fence();
@@ -2508,19 +2556,6 @@ static bool is_weighted_rms_norm_mul(
     return true;
 }
 
-static uint8_t vpu_effective_flash_page_packed_mask(const ggml_tensor * op) {
-    if (op == nullptr || op->op != GGML_OP_FLASH_ATTN_EXT ||
-        op->src[0] == nullptr || op->src[1] == nullptr) {
-        return 0;
-    }
-    const auto packing = ggml_gemmini_effective_flash_page_packing(
-        flash_page_packing(),
-        static_cast<uint64_t>(op->src[0]->ne[1]),
-        static_cast<uint64_t>(op->src[0]->ne[0]),
-        static_cast<uint64_t>(op->src[1]->ne[1]));
-    return packing.mask();
-}
-
 static bool vpu_can_offload(const ggml_tensor * op, char * reason, size_t reason_capacity) {
     if (op == nullptr) {
         std::snprintf(reason, reason_capacity, "operation is null");
@@ -2551,7 +2586,6 @@ static bool vpu_can_offload(const ggml_tensor * op, char * reason, size_t reason
     }
     return ggml_gemmini_vpu_can_compute(
         op, static_cast<unsigned>(gemmini_active_mask()),
-        op->op == GGML_OP_FLASH_ATTN_EXT ? flash_page_packing().mask() : 0,
         reason, reason_capacity);
 }
 
@@ -2852,7 +2886,6 @@ static void ggml_backend_gemmini_mul_mat(ggml_tensor * dst) {
     profiler_tls().last_gemmini.tile_j = tile_j;
     profiler_tls().last_gemmini.tile_k = tile_k;
     profiler_tls().last_gemmini.page_packed_mask = packing.mask();
-    profiler_tls().last_gemmini.flash_page_packed_mask = 0;
     profiler_tls().last_gemmini.flash_attention_components.clear();
     profiler_tls().last_gemmini.accelerator_call_us = gemmini_call_us;
     profiler_tls().last_gemmini.accelerator_call_cycles = gemmini_call_cycles;
@@ -3074,8 +3107,7 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
                 const int64_t start_us = ggml_time_us();
                 const uint64_t start_cycles = read_cycles_local();
                 const ggml_gemmini_vpu_result result = ggml_gemmini_vpu_compute(
-                    node, static_cast<unsigned>(gemmini_active_mask()),
-                    node->op == GGML_OP_FLASH_ATTN_EXT ? flash_page_packing().mask() : 0);
+                    node, static_cast<unsigned>(gemmini_active_mask()));
                 if (result.status == GGML_GEMMINI_VPU_STATUS_OK) {
                     mark_accelerator_result(
                         node,
@@ -3083,7 +3115,6 @@ static enum ggml_status ggml_backend_gemmini_graph_compute(ggml_backend_t backen
                         start_us,
                         start_cycles,
                         0,
-                        vpu_effective_flash_page_packed_mask(node),
                         &result);
                     continue;
                 }
@@ -4141,7 +4172,6 @@ void ggml_gemmini_profiler_eval_end(const ggml_tensor * t, uint64_t cycles, int6
         event.tile_j = profiler_tls().last_gemmini.tile_j;
         event.tile_k = profiler_tls().last_gemmini.tile_k;
         event.page_packed_mask = profiler_tls().last_gemmini.page_packed_mask;
-        event.flash_page_packed_mask = profiler_tls().last_gemmini.flash_page_packed_mask;
         profiler_tls().last_gemmini.valid = false;
     }
 
@@ -4826,10 +4856,9 @@ int ggml_gemmini_profiler_write_results(const char * results_dir) {
         }
 
         if (write_header) {
-            out << "run_label,gemmini_mask,gemmini_count,page_packed_a,page_packed_b,page_packed_c,page_packed_d,prompt_tokens,generated_tokens,total_us,total_cycles,ttft_us,ttft_cycles,tpot_us_per_token,tpot_cycles_per_token,input_prompt,final_output,hardware_profile,flash_page_packed_q,flash_page_packed_k,flash_page_packed_v\n";
+            out << "run_label,gemmini_mask,gemmini_count,page_packed_a,page_packed_b,page_packed_c,page_packed_d,prompt_tokens,generated_tokens,total_us,total_cycles,ttft_us,ttft_cycles,tpot_us_per_token,tpot_cycles_per_token,input_prompt,final_output,hardware_profile\n";
         }
         const gemmini_page_packing_config & packing = gemmini_page_packing();
-        const flash_page_packing_config & flash_packing = flash_page_packing();
         for (const auto & kv : runs) {
             const run_totals & totals = kv.second;
             out << csv_escape(kv.first) << ","
@@ -4849,10 +4878,7 @@ int ggml_gemmini_profiler_write_results(const char * results_dir) {
                 << metric_double_or_na(totals.generated_tokens > 1, totals.tpot_cycles) << ","
                 << csv_escape(totals.input_prompt) << ","
                 << csv_escape(totals.final_output) << ","
-                << csv_escape(GGML_GEMMINI_PROFILE_NAME) << ","
-                << (flash_packing.queries ? 1 : 0) << ","
-                << (flash_packing.keys ? 1 : 0) << ","
-                << (flash_packing.values ? 1 : 0) << "\n";
+                << csv_escape(GGML_GEMMINI_PROFILE_NAME) << "\n";
         }
         out.flush();
         if (!out) {
@@ -4898,7 +4924,6 @@ int ggml_gemmini_profiler_write_results(const char * results_dir) {
                     out << ",flash_" << name << "_us,flash_" << name << "_cycles";
                 }
             }
-            out << ",flash_page_packed_q,flash_page_packed_k,flash_page_packed_v";
             out << "\n";
         }
         for (const auto & event : op_events) {
@@ -4958,9 +4983,6 @@ int ggml_gemmini_profiler_write_results(const char * results_dir) {
                 const aggregate_entry component = flash_attention_event_component(event, name);
                 out << "," << component.wall_us << "," << component.wall_cycles;
             }
-            out << "," << ((event.flash_page_packed_mask & 0x1) != 0)
-                << "," << ((event.flash_page_packed_mask & 0x2) != 0)
-                << "," << ((event.flash_page_packed_mask & 0x4) != 0);
             out << "\n";
         }
         out.flush();
@@ -5355,10 +5377,6 @@ int ggml_gemmini_profiler_write_results(const char * results_dir) {
                 << (gemmini_page_packing().b ? 1 : 0) << "/"
                 << (gemmini_page_packing().c ? 1 : 0) << "/"
                 << (gemmini_page_packing().d ? 1 : 0) << " |\n";
-            out << "| FlashAttention page packing requested (Q/K/V) | "
-                << (flash_page_packing().queries ? 1 : 0) << "/"
-                << (flash_page_packing().keys ? 1 : 0) << "/"
-                << (flash_page_packing().values ? 1 : 0) << " |\n";
             out << "| prompt tokens | " << totals.prompt_tokens << " |\n";
             out << "| generated tokens | " << totals.generated_tokens << " |\n";
             out << "| total time (us) | " << totals.wall_us << " |\n";

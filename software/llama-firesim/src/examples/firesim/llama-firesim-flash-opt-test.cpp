@@ -135,7 +135,7 @@ static bool test_direct_bf16_input_and_staging_policy() {
         base, sizeof(uint16_t), width, rows, heads, batches);
 
     auto plan = ggml_gemmini_flash_make_direct_bf16_input_slice(
-        true, false, true, true, true, view, 3, 1);
+        true, true, true, true, view, 3, 1);
     if (!plan.direct ||
             plan.address != base + 3 * view.nb[2] + view.nb[3] ||
             plan.row_stride_elements != width) {
@@ -149,57 +149,55 @@ static bool test_direct_bf16_input_and_staging_policy() {
     view.nb[2] = rows * view.nb[1];
     view.nb[3] = heads * view.nb[2];
     plan = ggml_gemmini_flash_make_direct_bf16_input_slice(
-        true, false, true, true, true, view, 7, 1);
+        true, true, true, true, view, 7, 1);
     if (plan.direct) {
         return false;
     }
 
-    const auto direct = [&](bool enabled, bool packed, bool bf16,
-                            bool identity, bool disjoint,
+    const auto direct = [&](bool enabled, bool bf16, bool identity, bool disjoint,
                             const ggml_gemmini_flash_tensor_view & candidate) {
         return ggml_gemmini_flash_make_direct_bf16_input_slice(
-            enabled, packed, bf16, identity, disjoint,
+            enabled, bf16, identity, disjoint,
             candidate, 0, 0).direct;
     };
-    if (direct(false, false, true, true, true, contiguous) ||
-            direct(true, true, true, true, true, contiguous) ||
-            direct(true, false, false, true, true, contiguous) ||
-            direct(true, false, true, false, true, contiguous) ||
-            direct(true, false, true, true, false, contiguous)) {
+    if (direct(false, true, true, true, contiguous) ||
+            direct(true, false, true, true, contiguous) ||
+            direct(true, true, false, true, contiguous) ||
+            direct(true, true, true, false, contiguous)) {
         return false;
     }
 
     auto bad = contiguous;
     bad.base += 1;
-    if (direct(true, false, true, true, true, bad)) {
+    if (direct(true, true, true, true, bad)) {
         return false;
     }
     bad = contiguous;
     bad.nb[1] = width * sizeof(uint16_t) - sizeof(uint16_t);
-    if (direct(true, false, true, true, true, bad)) {
+    if (direct(true, true, true, true, bad)) {
         return false;
     }
     bad = contiguous;
     bad.nb[1] += 1;
-    if (direct(true, false, true, true, true, bad)) {
+    if (direct(true, true, true, true, bad)) {
         return false;
     }
     bad = make_contiguous_view(
         base, sizeof(uint16_t),
         static_cast<size_t>(std::numeric_limits<uint32_t>::max() >> 1) + 1,
         1, 1, 1);
-    if (direct(true, false, true, true, true, bad)) {
+    if (direct(true, true, true, true, bad)) {
         return false;
     }
     bad = make_contiguous_view(
         base, sizeof(uint16_t),
         static_cast<size_t>(std::numeric_limits<uint32_t>::max() >> 1),
         1, 1, 1);
-    if (!direct(true, false, true, true, true, bad)) {
+    if (!direct(true, true, true, true, bad)) {
         return false;
     }
     return !ggml_gemmini_flash_make_direct_bf16_input_slice(
-        true, false, true, true, true, contiguous, heads, 0).direct;
+        true, true, true, true, contiguous, heads, 0).direct;
 }
 
 static bool test_workspace_high_water_and_no_clear() {

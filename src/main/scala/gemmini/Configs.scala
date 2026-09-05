@@ -475,11 +475,11 @@ class MultiDefaultGemminiConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
           shared_deps.io.in(2) <> gemmini2.module.ext_deps_io.get
           shared_deps.io.in(3) <> gemmini3.module.ext_deps_io.get
 
-          val ldb_ex_control = Module(new LdBCompleteControl(gemmini0.config.nSharers))
-          ldb_ex_control.io.in(0) <> gemmini0.module.ext_loop_ws_io.get
-          ldb_ex_control.io.in(1) <> gemmini1.module.ext_loop_ws_io.get
-          ldb_ex_control.io.in(2) <> gemmini2.module.ext_loop_ws_io.get
-          ldb_ex_control.io.in(3) <> gemmini3.module.ext_loop_ws_io.get
+          val loop_matmul_group_control = Module(new LoopMatmulGroupController(gemmini0.config.nSharers))
+          loop_matmul_group_control.io.in(0) <> gemmini0.module.ext_loop_ws_io.get
+          loop_matmul_group_control.io.in(1) <> gemmini1.module.ext_loop_ws_io.get
+          loop_matmul_group_control.io.in(2) <> gemmini2.module.ext_loop_ws_io.get
+          loop_matmul_group_control.io.in(3) <> gemmini3.module.ext_loop_ws_io.get
 
           val ldinput_ex_control = Module(new LdICompleteControl(gemmini0.config.nSharers))
           ldinput_ex_control.io.in(0) <> gemmini0.module.ext_loop_conv_ws_io.get

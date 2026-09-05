@@ -4,26 +4,15 @@ package gemmini
 import chisel3._
 import chisel3.util._
 import GemminiISA._
-import VpuLocalAddr._
 import Util._
 import org.chipsalliance.cde.config.Parameters
 import midas.targetutils.PerfCounter
-
-private[gemmini] object ExecuteCompletionCollision {
-  def configMayPop(configEligible: Bool,
-                   fusionMeshCompletionDeqValid: Bool): Bool = {
-    configEligible && !fusionMeshCompletionDeqValid
-  }
-}
 
 // TODO do we still need to flush when the dataflow is weight stationary? Won't the result just keep travelling through on its own?
 class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: Int, config: GemminiArrayConfig[T, U, V])
                                   (implicit p: Parameters, ev: Arithmetic[T]) extends Module {
   import config._
   import ev._
-
-  private val vpuRowAddrBits =
-    1 max log2Ceil(acc_banks * acc_bank_entries)
 
   val io = IO(new Bundle {
     val cmd = Flipped(Decoupled(new GemminiCmd(reservation_station_entries)))
@@ -45,26 +34,15 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       )))
 
       val read_resp = Flipped(Vec(acc_banks, Decoupled(new AccumulatorScaleResp(
+        Vec(meshColumns, Vec(tileColumns, accType)),
         Vec(meshColumns, Vec(tileColumns, inputType)),
-        Vec(meshColumns, Vec(tileColumns, accType))
+        acc_banks
       ))))
 
       // val write = Vec(acc_banks, new AccumulatorWriteIO(acc_bank_entries, Vec(meshColumns, Vec(tileColumns, accType))))
-      val write = Vec(acc_banks, Decoupled(new AccumulatorWriteReq(
-        acc_bank_entries, Vec(meshColumns, Vec(tileColumns, accType)))))
-      val write_to_vpu = if (use_vpu_fusion) {
-        Some(Output(Vec(acc_banks, Bool())))
-      } else {
-        None
-      }
+      val write = Vec(acc_banks, Decoupled(new AccumulatorWriteReq(acc_bank_entries, Vec(meshColumns, Vec(tileColumns, accType)))))
       val grant = if (use_shared_ext_mem) Some(Vec(acc_banks, Decoupled(new BankExWriteGrantReq(acc_bank_entries)))) else None
     }
-
-    // Fused configurations may source Gemmini's A operand directly from the
-    // VPU matrix view of VSRAM.  The transport carries one complete FP32
-    // matrix row; conversion to inputType happens at this boundary.
-    val vpuMatrixRead = if (use_vpu_fusion) Some(new GemminiVpuMatrixReadIO(
-      vpuRowAddrBits, meshRows * tileRows, accType.getWidth)) else None
 
     val completed = Valid(UInt(log2Up(reservation_station_entries).W))
     val busy = Output(Bool())
@@ -170,12 +148,6 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val d_address_rs1 = rs1s(preload_cmd_place).asTypeOf(local_addr_t)
   val c_address_rs2 = rs2s(preload_cmd_place).asTypeOf(local_addr_t)
 
-  val a_from_vsram = if (use_vpu_fusion) {
-    a_address_rs1.a_from_vsram()
-  } else {
-    false.B
-  }
-
   if (dataflow == Dataflow.OS && hardcode_d_to_garbage_addr) {
     d_address_rs1.make_this_garbage()
   } else if (dataflow == Dataflow.WS && hardcode_d_to_garbage_addr) {
@@ -212,15 +184,6 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   // Dependency stuff
   io.completed.valid := false.B
   io.completed.bits := DontCare
-
-  // CONFIG commands complete directly from the command FSM, while fused
-  // C_TO_VSRAM commands complete through the mesh-completion queue below.
-  // Both share io.completed, so keep a CONFIG command at the head of cmd_q
-  // whenever an already-queued mesh completion owns that single-wide port.
-  // Otherwise the later mesh assignment overwrites the CONFIG completion
-  // after the CONFIG has already been popped, permanently leaking its ROB
-  // entry.
-  val meshCompletionPortBusy = WireInit(false.B)
 
   // val pending_completed_rob_id = Reg(UDValid(UInt(log2Up(rob_entries).W)))
   val pending_completed_rob_ids = Reg(Vec(2, UDValid(UInt(log2Up(reservation_station_entries).W))))
@@ -287,8 +250,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   }
   // Instantiate the actual mesh
   val mesh = Module(new MeshWithDelays(inputType, spatialArrayOutputType, accType, mesh_tag, dataflow, tree_reduction, tile_latency, mesh_output_delay,
-    tileRows, tileColumns, meshRows, meshColumns, shifter_banks, shifter_banks,
-    use_shared_ext_mem = use_shared_ext_mem))
+    tileRows, tileColumns, meshRows, meshColumns, shifter_banks, shifter_banks, use_shared_ext_mem = use_shared_ext_mem))
 
   mesh.io.a.valid := false.B
   mesh.io.b.valid := false.B
@@ -365,8 +327,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val dataBBankAcc = b_address.acc_bank()
   val dataDBankAcc = d_address.acc_bank()
 
-  val a_read_from_acc = ex_read_from_acc.B && a_address_rs1.is_acc_addr &&
-    !a_from_vsram
+  val a_read_from_acc = ex_read_from_acc.B && a_address_rs1.is_acc_addr
   val b_read_from_acc = ex_read_from_acc.B && b_address_rs2.is_acc_addr
   val d_read_from_acc = ex_read_from_acc.B && d_address_rs1.is_acc_addr
 
@@ -439,10 +400,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   case class Operand(addr: LocalAddr, is_garbage: Bool, start_inputting: Bool, counter: UInt, started: Bool, can_be_im2colled: Boolean, priority: Int) {
     val done = counter === 0.U && started
   }
-  // A VSRAM read uses a physically separate banked memory and therefore does
-  // not participate in the local SPAD/ACC same-bank arbitration below.
-  val a_operand = Operand(a_address, a_address_rs1.is_garbage() || a_from_vsram,
-    start_inputting_a, a_fire_counter, a_fire_started, true, 0)
+  val a_operand = Operand(a_address, a_address_rs1.is_garbage(), start_inputting_a, a_fire_counter, a_fire_started, true, 0)
   val b_operand = Operand(b_address, b_address_rs2.is_garbage(), start_inputting_b, b_fire_counter, b_fire_started, false, 1)
   val d_operand = Operand(d_address, d_address_rs1.is_garbage(), start_inputting_d, d_fire_counter, d_fire_started, false, 2)
   val operands = Seq(a_operand, b_operand, d_operand)
@@ -530,9 +488,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
   // Scratchpad reads
   for (i <- 0 until sp_banks) {
-    val read_a = a_valid && !a_read_from_acc && !a_from_vsram &&
-      dataAbank === i.U && start_inputting_a && !multiply_garbage &&
-      a_row_is_not_all_zeros && !(im2col_wire&&im2col_en)
+    val read_a = a_valid && !a_read_from_acc && dataAbank === i.U && start_inputting_a && !multiply_garbage && a_row_is_not_all_zeros && !(im2col_wire&&im2col_en)
     val read_b = b_valid && !b_read_from_acc && dataBbank === i.U && start_inputting_b && !accumulate_zeros && b_row_is_not_all_zeros //&& !im2col_wire
     val read_d = d_valid && !d_read_from_acc && dataDbank === i.U && start_inputting_d && !preload_zeros && d_row_is_not_all_zeros //&& !im2col_wire
 
@@ -577,7 +533,8 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     }
 
     if (ex_read_from_acc) {
-      io.acc.read_req(i).valid := read_a_from_acc || read_b_from_acc || read_d_from_acc
+      io.acc.read_req(i).valid :=
+        (read_a_from_acc || read_b_from_acc || read_d_from_acc) && cntl_ready
       io.acc.read_req(i).bits.scale := acc_scale
       io.acc.read_req(i).bits.full := false.B
       io.acc.read_req(i).bits.igelu_qb := DontCare
@@ -610,25 +567,6 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     }
 
     io.acc.read_resp(i).ready := false.B
-  }
-
-  if (use_vpu_fusion) {
-    val readAFromVpu = a_valid && a_from_vsram && start_inputting_a &&
-      !multiply_garbage && a_row_is_not_all_zeros &&
-      !(im2col_wire && im2col_en)
-
-    when (readAFromVpu && !io.vpuMatrixRead.get.req.ready) {
-      a_ready := false.B
-    }
-
-    io.vpuMatrixRead.get.req.valid := readAFromVpu && cntl_ready
-    io.vpuMatrixRead.get.req.bits.rowAddress := a_address.full_sp_addr()
-    io.vpuMatrixRead.get.resp.ready := false.B
-    when (io.vpuMatrixRead.get.req.valid) {
-      assert(a_address.full_sp_addr() <
-        (acc_banks * acc_bank_entries).U,
-        "A_FROM_VSRAM matrix row is out of range")
-    }
   }
 
   // Im2Col reads
@@ -668,10 +606,8 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
       when(cmd.valid(0))
       {
-        val configEligible = DoConfig && !matmul_in_progress &&
-          !pending_completed_rob_ids.map(_.valid).reduce(_ || _)
-        when(ExecuteCompletionCollision.configMayPop(
-          configEligible, meshCompletionPortBusy)) {
+        when(DoConfig && !matmul_in_progress &&
+          !pending_completed_rob_ids.map(_.valid).reduce(_ || _)) {
           val config_ex_rs1 = rs1s(0).asTypeOf(new ConfigExRs1(acc_scale_t_bits))
           val config_ex_rs2 = rs2s(0).asTypeOf(new ConfigExRs2)
 
@@ -857,7 +793,6 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     val a_read_from_acc = Bool()
     val b_read_from_acc = Bool()
     val d_read_from_acc = Bool()
-    val a_from_vsram = if (use_vpu_fusion) Some(Bool()) else None
 
     val a_garbage = Bool()
     val b_garbage = Bool()
@@ -915,9 +850,6 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   mesh_cntl_signals_q.io.enq.bits.a_read_from_acc := a_read_from_acc
   mesh_cntl_signals_q.io.enq.bits.b_read_from_acc := b_read_from_acc
   mesh_cntl_signals_q.io.enq.bits.d_read_from_acc := d_read_from_acc
-  if (use_vpu_fusion) {
-    mesh_cntl_signals_q.io.enq.bits.a_from_vsram.get := a_from_vsram
-  }
 
   mesh_cntl_signals_q.io.enq.bits.accumulate_zeros := accumulate_zeros
   mesh_cntl_signals_q.io.enq.bits.preload_zeros := preload_zeros //&& (in_shift(19) =/= 1.U)) //fixed for negative shift?
@@ -957,18 +889,6 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   val readValid = VecInit(io.srams.read.map(bank => ex_read_from_spad.B && bank.resp.valid && !bank.resp.bits.fromDMA))
   val accReadValid = VecInit(io.acc.read_resp.map(bank => ex_read_from_acc.B && bank.valid && !bank.bits.fromDMA))
   val im2ColValid = io.im2col.resp.valid
-  val vpuReadValid = if (use_vpu_fusion) io.vpuMatrixRead.get.resp.valid else false.B
-  val vpuReadData = if (use_vpu_fusion) {
-    VecInit(io.vpuMatrixRead.get.resp.bits.data.map(raw =>
-      raw.asTypeOf(accType).withWidthOf(inputType))).asUInt
-  } else {
-    0.U((block_size * inputType.getWidth).W)
-  }
-  val cntlAFromVsram = if (use_vpu_fusion) {
-    cntl.a_from_vsram.get
-  } else {
-    false.B
-  }
 
   val anyFire = cntl.a_fire || cntl.b_fire || cntl.d_fire
   mesh_cntl_signals_q.io.deq.ready := ((!cntl.a_fire || mesh.io.a.fire || !mesh.io.a.ready) &&
@@ -976,11 +896,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
     (!cntl.d_fire || mesh.io.d.fire || !mesh.io.d.ready) &&
     (!cntl.first || mesh.io.req.ready)) && (!anyFire || mesh.io.a.ready || mesh.io.b.ready || mesh.io.d.ready)
 
-  val dataA_valid = cntl.a_garbage || cntl.a_unpadded_cols === 0.U ||
-    Mux(cntlAFromVsram, vpuReadValid,
-      Mux(cntl.im2colling, im2ColValid,
-        Mux(cntl.a_read_from_acc, accReadValid(cntl.a_bank_acc),
-          readValid(cntl.a_bank))))
+  val dataA_valid = cntl.a_garbage || cntl.a_unpadded_cols === 0.U || Mux(cntl.im2colling, im2ColValid, Mux(cntl.a_read_from_acc, accReadValid(cntl.a_bank_acc), readValid(cntl.a_bank)))
 
   val dataB_valid = cntl.b_garbage || cntl.b_unpadded_cols === 0.U || MuxCase(readValid(cntl.b_bank), Seq(
     cntl.accumulate_zeros -> false.B,
@@ -996,10 +912,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   //val neg_shift_sub = block_size.U - cntl.c_rows
   preload_zero_counter := wrappingAdd(preload_zero_counter, 1.U, block_size.U, dataA_valid && dataD_valid && cntl.preload_zeros && (cntl.perform_single_preload || cntl.perform_mul_pre))
 
-  val dataA_unpadded = Mux(cntlAFromVsram, vpuReadData,
-    Mux(cntl.im2colling, im2ColData,
-      Mux(cntl.a_read_from_acc, accReadData(cntl.a_bank_acc),
-        readData(cntl.a_bank))))
+  val dataA_unpadded = Mux(cntl.im2colling, im2ColData, Mux(cntl.a_read_from_acc, accReadData(cntl.a_bank_acc), readData(cntl.a_bank)))
   val dataB_unpadded = MuxCase(readData(cntl.b_bank), Seq(cntl.accumulate_zeros -> 0.U, cntl.b_read_from_acc -> accReadData(cntl.b_bank_acc)))
   val dataD_unpadded = MuxCase(readData(cntl.d_bank), Seq(cntl.preload_zeros -> 0.U, cntl.d_read_from_acc -> accReadData(cntl.d_bank_acc)))
 
@@ -1010,11 +923,7 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
   // Pop responses off the scratchpad io ports
   when (mesh_cntl_signals_q.io.deq.fire) {
     when (cntl.a_fire && (mesh.io.a.fire || !mesh.io.a.ready) && !cntl.a_garbage && cntl.a_unpadded_cols > 0.U && !cntl.im2colling) {
-      when (cntlAFromVsram) {
-        if (use_vpu_fusion) {
-          io.vpuMatrixRead.get.resp.ready := true.B
-        }
-      }.elsewhen (cntl.a_read_from_acc) {
+      when (cntl.a_read_from_acc) {
         io.acc.read_resp(cntl.a_bank_acc).ready := !io.acc.read_resp(cntl.a_bank_acc).bits.fromDMA
       }.otherwise {
         io.srams.read(cntl.a_bank).resp.ready := !io.srams.read(cntl.a_bank).resp.bits.fromDMA
@@ -1135,18 +1044,12 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
       io.acc.write(i).bits.data := VecInit(mesh.io.resp.bits.data.map(v => VecInit(v.map(e => e.withWidthOf(accType)))))
       io.acc.write(i).bits.acc := w_address.accumulate
       io.acc.write(i).bits.mask := w_mask.flatMap(b => Seq.fill(accType.getWidth / (aligned_to * 8))(b))
-      if (use_vpu_fusion) {
-        io.acc.write_to_vpu.get(i) := w_address.c_to_vsram()
-      }
     } else {
       io.acc.write(i).valid := false.B
       io.acc.write(i).bits.addr := DontCare
       io.acc.write(i).bits.data := DontCare
       io.acc.write(i).bits.acc := DontCare
       io.acc.write(i).bits.mask := DontCare
-      if (use_vpu_fusion) {
-        io.acc.write_to_vpu.get(i) := false.B
-      }
     }
 
     assert(!(io.acc.write(i).valid && !io.acc.write(i).ready), "Execute controller write to AccumulatorMem was skipped")
@@ -1212,82 +1115,18 @@ class ExecuteController[T <: Data, U <: Data, V <: Data](xLen: Int, tagWidth: In
 
   // Handle dependencies and turn off outputs for garbage addresses
   val mesh_completed_rob_id_fire = WireInit(false.B)
-  val fusionMeshCompletionQueue = if (use_vpu_fusion) {
-    // A delayed C_TO_VSRAM completion can coincide with the ordinary
-    // completion produced by the current mesh response.  The delayed stream
-    // is a fixed-latency copy of a subset of the one-completion-per-cycle mesh
-    // stream, so acc_latency + 1 entries cover the maximum displacement while
-    // accepting both arrivals atomically.
-    Some(Module(new MultiTailedQueue(
-      UInt(log2Up(reservation_station_entries).W),
-      entries = acc_latency + 1,
-      maxpush = 2)))
-  } else {
-    None
-  }
   //val complete_lock = RegInit(false.B)
 
-  //Seah: added for WS accumulator
   when(mesh.io.resp.fire && mesh.io.resp.bits.tag.rob_id.valid) {
     output_counter := wrappingAdd(output_counter, 1.U, w_total_output_rows)
-    start_array_outputting :=  !is_garbage_addr
-  }
+    val last = mesh.io.resp.bits.last
 
-  val ordinaryMeshCompletion = mesh.io.resp.fire && mesh.io.resp.bits.last &&
-    mesh.io.resp.bits.tag.rob_id.valid &&
-    (if (use_vpu_fusion) !mesh.io.resp.bits.tag.addr.c_to_vsram() else true.B)
-
-  if (use_vpu_fusion) {
-    // Use the tagged mesh completion rather than the final-row write fire.
-    // For a 1-3 row tail, Gemmini still emits the minimum four mesh rows and
-    // the last response may be padding (`write_this_row == false`).  Waiting
-    // acc_latency cycles from that conservative boundary guarantees that the
-    // last real post-RMW VSRAM write has committed without losing completion.
-    val vpuCompletionIn = mesh.io.resp.fire && mesh.io.resp.bits.last &&
-      mesh.io.resp.bits.tag.rob_id.valid &&
-      mesh.io.resp.bits.tag.addr.c_to_vsram()
-    val vpuCompletionValid = RegInit(VecInit(
-      Seq.fill(acc_latency)(false.B)))
-    val vpuCompletionId = Reg(Vec(acc_latency,
-      UInt(log2Up(reservation_station_entries).W)))
-
-    vpuCompletionValid(0) := vpuCompletionIn
-    vpuCompletionId(0) := mesh.io.resp.bits.tag.rob_id.bits
-    for (stage <- 1 until acc_latency) {
-      vpuCompletionValid(stage) := vpuCompletionValid(stage - 1)
-      vpuCompletionId(stage) := vpuCompletionId(stage - 1)
-    }
-
-    val delayedVpuCompletion = vpuCompletionValid(acc_latency - 1)
-    val delayedVpuCompletionId = vpuCompletionId(acc_latency - 1)
-
-    val completionQueue = fusionMeshCompletionQueue.get
-    val completionArrivalCount = PopCount(VecInit(
-      delayedVpuCompletion, ordinaryMeshCompletion))
-    completionQueue.io.enq.push := completionArrivalCount
-    // The delayed event is older than an ordinary event arriving in the same
-    // cycle, so preserve that age order in the two-push queue.
-    completionQueue.io.enq.bits(0) := Mux(delayedVpuCompletion,
-      delayedVpuCompletionId, mesh.io.resp.bits.tag.rob_id.bits)
-    completionQueue.io.enq.bits(1) := mesh.io.resp.bits.tag.rob_id.bits
-    assert(completionQueue.io.enq.ready >= completionArrivalCount,
-      "fusion execute completion queue overflow")
-
-    completionQueue.io.deq.ready := true.B
-    meshCompletionPortBusy := completionQueue.io.deq.valid
-    assert(!(completionQueue.io.deq.valid && DoConfig && cmd.valid(0) && cmd.pop.orR),
-      "CONFIG popped while a fused mesh completion owns the completion port")
-    when(completionQueue.io.deq.valid) {
-      mesh_completed_rob_id_fire := true.B
-      io.completed.valid := true.B
-      io.completed.bits := completionQueue.io.deq.bits
-    }
-  } else {
-    when(ordinaryMeshCompletion) {
+    when(last) {
       mesh_completed_rob_id_fire := true.B
       io.completed.valid := true.B
       io.completed.bits := mesh.io.resp.bits.tag.rob_id.bits
     }
+    start_array_outputting :=  !is_garbage_addr
   }
 
   when (!mesh_completed_rob_id_fire) {

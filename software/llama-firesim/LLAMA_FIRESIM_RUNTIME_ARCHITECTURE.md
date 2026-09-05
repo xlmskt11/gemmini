@@ -92,9 +92,6 @@ exec /root/llama-firesim/llama-firesim-cli \
 | `GGML_GEMMINI_PAGE_PACKED_B` | `1` | 일반 `MUL_MAT`의 B packing 요청 및 offline weight-pack layout |
 | `GGML_GEMMINI_PAGE_PACKED_C` | `0` | 일반 `MUL_MAT`의 C packing 요청 |
 | `GGML_GEMMINI_PAGE_PACKED_D` | `0` | 일반 `MUL_MAT`의 D packing 요청 |
-| `Flash_Q_PAGE_PACKED` | `0` | fused FlashAttention Q packing 요청; 일반 A와 독립 |
-| `Flash_K_PAGE_PACKED` | `1` | fused FlashAttention K packing 요청; 일반 B 및 V와 독립 |
-| `Flash_V_PAGE_PACKED` | `1` | fused FlashAttention V packing 요청; 일반 B 및 K와 독립 |
 | `GGML_GEMMINI_TRACE` | `0` | Gemmini admission/dispatch trace 비활성 |
 | `LLAMA_FIRESIM_BACKEND` | `gemmini` | hybrid Gemmini backend 사용 |
 | `LLAMA_FIRESIM_CTX_SIZE` | `2048` | llama context size |
@@ -333,23 +330,17 @@ Page-packing 환경변수는 요청값이다. 각 matmul의 실제 layout은 A/C
 전역 B layout과 섞이지 않도록 `K <= 1` entry를 생략하고 runtime GGUF
 fallback이 row-major BF16 cache를 만든다.
 
-fused FlashAttention은 일반 matmul의 A/B/C/D 요청을 재사용하지 않고 아래의
-독립 환경변수를 사용한다.
-
-| 환경변수 | 기본값 | FlashAttention buffer/layout | effective 조건 |
-| --- | --- | --- | --- |
-| `Flash_Q_PAGE_PACKED` | `0` | BF16 Q `[query_rows][q_dim]`, packed A layout | `query_rows > 1` |
-| `Flash_K_PAGE_PACKED` | `1` | BF16 K `[sequence][q_dim]`, packed B source layout | `q_dim > 1` |
-| `Flash_V_PAGE_PACKED` | `1` | BF16 V `[sequence][value_dim]`, packed B source layout | `sequence > 1` |
-| 해당 옵션 없음 | - | final FP32 output은 항상 row-major direct H_STORE | 항상 linear output |
-
-K는 원본 source layout으로 page-pack한 뒤 QK Gemmini job에서 transpose한다.
-adapter는 packed Q/K/V를 4096-byte aligned staging buffer에 만들고 kernel은
-`query_stride`, `key_stride`, `value_stride` 각각에 독립적으로 encoded layout과
-page-block offset을 각 Gemmini member에 전달한다. 따라서 K와 V packing 설정도
-서로 다를 수 있다. `GGML_GEMMINI_PAGE_PACKED_{A,B,C,D}`는 이 경로에 영향을
-주지 않는다. Q staging은 BF16 encode/packing만 수행하며 원소별 scale 곱셈은
-하지 않는다. adapter가 ggml의 양수 finite attention scale을
+fused FlashAttention은 Q/K/V page-packing 옵션을 제공하지 않는다. adapter는
+Q `[query_rows][q_dim]`, K `[sequence][q_dim]`, V
+`[sequence][value_dim]`를 linear BF16 입력으로 전달한다. physical row stride가
+logical width와 일치하고 output과 겹치지 않는 BF16 K/V head slice는 직접 DMA로
+읽으며, 나머지는 재사용 가능한 64-byte aligned linear BF16 workspace로
+변환하거나 gather한다. `GGML_GEMMINI_PAGE_PACKED_{A,B,C,D}`는 이 경로에 영향을
+주지 않는다. FireSim의 BF16 Flash KV cache는 ggml `[C,Tcap,Hkv,S]`, 즉
+물리적으로 `[stream][KV head][token][channel]`에 저장한다. graph-facing view는
+기존 `[C,Hkv,n_kv,S]` 계약을 유지하고 attention 직전 permute 뒤에는
+`[C,n_kv,Hkv,S]`가 되어 K/V를 별도 repack 없이 직접 읽을 수 있다. adapter가
+ggml의 양수 finite attention scale을
 `vpu_flashattention_config_t::score_scale`로 전달하고 VPU가 FP32 QK score에 직접
 적용한다. 0, 음수, NaN, Inf scale은 fused path admission에서 CPU fallback된다.
 online accumulator는 VSRAM 내부 상태이고, VPU는 final
@@ -574,7 +565,7 @@ QK/online-softmax/PV 실행 구간이며 내부 비율은 추정하지 않는다
 | `mask_prepare` | causal mask slice 검사와 query-base metadata 준비 |
 | `workspace_prepare` | input staging/causal workspace 크기 계산과 할당 |
 | `plan_preflight` | 각 batch/head의 FlashAttention plan 및 job preflight |
-| `input_pack` | Q/K/V BF16 staging과 각각 요청된 Flash Q/K/V page packing. Q에는 host-side scale을 곱하지 않음 |
+| `input_pack` | direct 조건을 만족하지 않는 Q/K/V의 linear BF16 변환 또는 gather. Q에는 host-side scale을 곱하지 않음 |
 | `fused_attention_run` | `vpu_flashattention_auto()` 전체 실행 |
 | `output_unpack_store` | 현재 direct output에서는 0; 호환용 profiler 항목 |
 | `other_host` | backend op wall에서 위 실측 구간을 뺀 lock/control 등 나머지 시간 |

@@ -37,6 +37,7 @@ copy_tree_file "${SCRIPT_DIR}/src/examples/firesim/llama-firesim-cli.cpp" "${LLA
 copy_tree_file "${SCRIPT_DIR}/src/examples/firesim/llama-firesim-pack.cpp" "${LLAMA_DIR}/examples/firesim/llama-firesim-pack.cpp"
 copy_tree_file "${SCRIPT_DIR}/src/examples/firesim/llama-firesim-bf16-test.cpp" "${LLAMA_DIR}/examples/firesim/llama-firesim-bf16-test.cpp"
 copy_tree_file "${SCRIPT_DIR}/src/examples/firesim/llama-firesim-flash-opt-test.cpp" "${LLAMA_DIR}/examples/firesim/llama-firesim-flash-opt-test.cpp"
+copy_tree_file "${SCRIPT_DIR}/src/examples/firesim/llama-firesim-kv-htc-layout-test.cpp" "${LLAMA_DIR}/examples/firesim/llama-firesim-kv-htc-layout-test.cpp"
 copy_tree_file "${SCRIPT_DIR}/src/examples/firesim/llama-firesim-matmul-opt-test.cpp" "${LLAMA_DIR}/examples/firesim/llama-firesim-matmul-opt-test.cpp"
 copy_tree_file "${SCRIPT_DIR}/src/examples/firesim/llama-firesim-page-packed-layout-test.cpp" "${LLAMA_DIR}/examples/firesim/llama-firesim-page-packed-layout-test.cpp"
 copy_tree_file "${SCRIPT_DIR}/src/examples/firesim/llama-firesim-profiler-append-test.cpp" "${LLAMA_DIR}/examples/firesim/llama-firesim-profiler-append-test.cpp"
@@ -245,3 +246,13 @@ replace_once(
     '    ml.init_mappings(!gemmini_hybrid_sparse, use_mlock ? &pimpl->mlock_mmaps : nullptr);\n',
 )
 PY
+
+HTC_PATCH="${SCRIPT_DIR}/patches/llama-kv-cache-htc.patch"
+if git -C "${LLAMA_DIR}" apply --reverse --check "${HTC_PATCH}" >/dev/null 2>&1; then
+    : # already applied
+elif git -C "${LLAMA_DIR}" apply --check "${HTC_PATCH}" >/dev/null 2>&1; then
+    git -C "${LLAMA_DIR}" apply "${HTC_PATCH}"
+else
+    echo "failed to apply or recognize existing HTC KV-cache patch: ${HTC_PATCH}" >&2
+    exit 1
+fi

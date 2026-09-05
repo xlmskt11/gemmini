@@ -21,14 +21,26 @@ object GemminiISA {
   val LOOP_WS_CONFIG_STRIDES_AB = 12.U
   val LOOP_WS_CONFIG_STRIDES_DC = 13.U
 
-  // made
   val SET_PROFILER_PADDR = 23.U
-  val LOOP_WS_CONFIG_MV_BOUNDS_1 = 24.U
+  // Shared LOOP_WS partition descriptor.  This retains funct=24 so legacy
+  // M-partition command streams remain binary-identical.  The historical
+  // name is kept as an alias for source compatibility with older helpers.
+  val LOOP_WS_CONFIG_PARTITION_BOUNDS = 24.U
+  val LOOP_WS_CONFIG_MV_BOUNDS_1 = LOOP_WS_CONFIG_PARTITION_BOUNDS
   val LOOP_WS_CONFIG_SPADDR = 25.U
   val LOOP_CONV_WS_CONFIG_MV_BOUNDS_1 = 26.U
   val LOOP_CONV_WS_CONFIG_SPADDR = 27.U
   val LOOP_WS_CONFIG_PAGE_OFFSETS = 28.U
-  // made end
+
+  object PartitionAxis {
+    val width = 2
+    val M = 0.U(width.W)
+    val N = 1.U(width.W)
+    val K = 2.U(width.W)
+
+    def isValid(axis: UInt): Bool = axis === M || axis === N || axis === K
+    def usesCooperativeLdA(axis: UInt): Bool = axis === N
+  }
 
   val LOAD3_CMD = 14.U
 
@@ -245,4 +257,3 @@ object GemminiISA {
     val local_addr = local_addr_t.cloneType
   }
 }
-

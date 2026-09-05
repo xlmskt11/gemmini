@@ -57,11 +57,10 @@ public:
     void admitted(
             const std::string & name,
             const ggml_tensor & op,
-            unsigned            mask = 1u,
-            uint8_t             page_packing_mask = 0u) {
+            unsigned            mask = 1u) {
         char reason[GGML_GEMMINI_VPU_REASON_CAPACITY] = {};
         if (!ggml_gemmini_vpu_can_compute(
-                &op, mask, page_packing_mask, reason, sizeof(reason))) {
+                &op, mask, reason, sizeof(reason))) {
             std::cerr << "expected admission: " << name << ": " << reason << "\n";
             ++failures_;
         } else if (reason[0] != '\0') {
@@ -73,11 +72,10 @@ public:
     void rejected(
             const std::string & name,
             const ggml_tensor & op,
-            unsigned            mask = 1u,
-            uint8_t             page_packing_mask = 0u) {
+            unsigned            mask = 1u) {
         char reason[GGML_GEMMINI_VPU_REASON_CAPACITY] = {};
         if (ggml_gemmini_vpu_can_compute(
-                &op, mask, page_packing_mask, reason, sizeof(reason))) {
+                &op, mask, reason, sizeof(reason))) {
             std::cerr << "expected CPU fallback: " << name << "\n";
             ++failures_;
         } else if (reason[0] == '\0') {
@@ -324,25 +322,6 @@ static void test_flash_attention(checks & check) {
     check.rejected("multi logical mask 0x0", flash.dst.value, 0x0u);
     check.rejected("multi out-of-range logical mask", flash.dst.value, 0x10u);
 #endif
-
-    check.admitted(
-        "FlashAttention with requested Q page packing",
-        flash.dst.value, 0x1u, 0x01u);
-    check.admitted(
-        "FlashAttention with requested K page packing",
-        flash.dst.value, 0x1u, 0x02u);
-    check.admitted(
-        "FlashAttention with requested V page packing",
-        flash.dst.value, 0x1u, 0x04u);
-    check.admitted(
-        "FlashAttention with requested Q/K/V page packing",
-        flash.dst.value, 0x1u, 0x07u);
-    check.rejected(
-        "FlashAttention with legacy generic D page-packing bit",
-        flash.dst.value, 0x1u, 0x08u);
-    check.rejected(
-        "FlashAttention with a higher unknown page-packing bit",
-        flash.dst.value, 0x1u, 0x10u);
 
     flash.dst.value.src[3] = nullptr;
     check.rejected("FlashAttention without explicit mask", flash.dst.value);

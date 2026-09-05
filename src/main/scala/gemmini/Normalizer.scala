@@ -8,15 +8,16 @@ import gemmini.AccumulatorScale.iexp
 import hardfloat.{DivSqrtRecFN_small, INToRecFN, consts, fNFromRecFN}
 
 class NormalizedInput[T <: Data: Arithmetic, U <: Data](max_len: Int, num_stats: Int, fullDataType: Vec[Vec[T]],
-                                                        scale_t: U) extends Bundle {
-  val acc_read_resp = new AccumulatorReadResp[T,U](fullDataType, scale_t)
+                                                        scale_t: U, accBanks: Int) extends Bundle {
+  val acc_read_resp = new AccumulatorReadResp[T,U](fullDataType, scale_t, accBanks)
   val len = UInt(log2Up(max_len + 1).W)
   val stats_id = UInt(log2Up(num_stats).W)
   val cmd = NormCmd()
 }
 
-class NormalizedOutput[T <: Data: Arithmetic, U <: Data](fullDataType: Vec[Vec[T]], scale_t: U) extends Bundle {
-  val acc_read_resp = new AccumulatorReadResp[T,U](fullDataType, scale_t)
+class NormalizedOutput[T <: Data: Arithmetic, U <: Data](
+    fullDataType: Vec[Vec[T]], scale_t: U, accBanks: Int) extends Bundle {
+  val acc_read_resp = new AccumulatorReadResp[T,U](fullDataType, scale_t, accBanks)
   val mean = fullDataType.head.head.cloneType
   val max = fullDataType.head.head.cloneType
   val inv_stddev = scale_t.cloneType
@@ -135,7 +136,7 @@ class MaxLanes[T <: Data](num_stats: Int, acc_t: T, n_lanes: Int, latency: Int)(
 }
 
 class Normalizer[T <: Data, U <: Data](max_len: Int, num_reduce_lanes: Int, num_stats: Int, latency: Int,
-                                       fullDataType: Vec[Vec[T]], scale_t: U)
+                                       fullDataType: Vec[Vec[T]], scale_t: U, accBanks: Int)
                                       (implicit ev: Arithmetic[T]) extends Module {
   import ev._
   val acc_t = fullDataType.head.head.cloneType
@@ -145,8 +146,9 @@ class Normalizer[T <: Data, U <: Data](max_len: Int, num_reduce_lanes: Int, num_
   assert(isPow2(n_lanes))
 
   val io = IO(new Bundle {
-    val in = Flipped(Decoupled(new NormalizedInput[T,U](max_len, num_stats, fullDataType, scale_t)))
-    val out = Decoupled(new NormalizedOutput(fullDataType, scale_t))
+    val in = Flipped(Decoupled(new NormalizedInput[T,U](
+      max_len, num_stats, fullDataType, scale_t, accBanks)))
+    val out = Decoupled(new NormalizedOutput(fullDataType, scale_t, accBanks))
   })
 
   object State extends ChiselEnum {
@@ -163,7 +165,7 @@ class Normalizer[T <: Data, U <: Data](max_len: Int, num_reduce_lanes: Int, num_
 
   // Buffers for normalization stats
   class Stats extends Bundle {
-    val req = new NormalizedInput[T,U](max_len, num_stats, fullDataType, scale_t)
+    val req = new NormalizedInput[T,U](max_len, num_stats, fullDataType, scale_t, accBanks)
     val state = State()
 
     // Running state
@@ -599,27 +601,34 @@ class Normalizer[T <: Data, U <: Data](max_len: Int, num_reduce_lanes: Int, num_
 
 object Normalizer {
   def apply[T <: Data, U <: Data](is_passthru: Boolean, max_len: Int, num_reduce_lanes: Int, num_stats: Int,
-                                  latency: Int, fullDataType: Vec[Vec[T]], scale_t: U)(implicit ev: Arithmetic[T]):
+                                  latency: Int, fullDataType: Vec[Vec[T]], scale_t: U, accBanks: Int)
+                                 (implicit ev: Arithmetic[T]):
   (DecoupledIO[NormalizedInput[T,U]], DecoupledIO[NormalizedOutput[T,U]]) = {
     if (is_passthru) {
-      passthru(max_len = max_len, num_stats = num_stats, fullDataType = fullDataType, scale_t = scale_t)
+      passthru(max_len = max_len, num_stats = num_stats, fullDataType = fullDataType,
+        scale_t = scale_t, accBanks = accBanks)
     } else {
       gen(max_len = max_len, num_reduce_lanes = num_reduce_lanes, num_stats = num_stats, latency = latency,
-        fullDataType = fullDataType, scale_t = scale_t)
+        fullDataType = fullDataType, scale_t = scale_t, accBanks = accBanks)
     }
   }
 
   def gen[T <: Data, U <: Data](max_len: Int, num_reduce_lanes: Int, num_stats: Int, latency: Int,
-                                  fullDataType: Vec[Vec[T]], scale_t: U)(implicit ev: Arithmetic[T]): (DecoupledIO[NormalizedInput[T,U]], DecoupledIO[NormalizedOutput[T,U]]) = {
-    val norm_unit_module = Module(new Normalizer(max_len, num_reduce_lanes, num_stats, latency, fullDataType, scale_t))
+                                  fullDataType: Vec[Vec[T]], scale_t: U, accBanks: Int)
+                                 (implicit ev: Arithmetic[T]): (DecoupledIO[NormalizedInput[T,U]], DecoupledIO[NormalizedOutput[T,U]]) = {
+    val norm_unit_module = Module(new Normalizer(
+      max_len, num_reduce_lanes, num_stats, latency, fullDataType, scale_t, accBanks))
     (norm_unit_module.io.in, norm_unit_module.io.out)
   }
 
-  def passthru[T <: Data, U <: Data](max_len: Int, num_stats: Int, fullDataType: Vec[Vec[T]], scale_t: U)
+  def passthru[T <: Data, U <: Data](
+      max_len: Int, num_stats: Int, fullDataType: Vec[Vec[T]], scale_t: U, accBanks: Int)
                                     (implicit ev: Arithmetic[T]): (DecoupledIO[NormalizedInput[T,U]], DecoupledIO[NormalizedOutput[T,U]]) = {
 
-    val norm_unit_passthru_q = Module(new Queue(new NormalizedInput[T,U](max_len, num_stats, fullDataType, scale_t), 2))
-    val norm_unit_passthru_out = Wire(Decoupled(new NormalizedOutput(fullDataType, scale_t)))
+    val norm_unit_passthru_q = Module(new Queue(new NormalizedInput[T,U](
+      max_len, num_stats, fullDataType, scale_t, accBanks), 2))
+    val norm_unit_passthru_out = Wire(Decoupled(new NormalizedOutput(
+      fullDataType, scale_t, accBanks)))
 
     norm_unit_passthru_out.valid := norm_unit_passthru_q.io.deq.valid
     norm_unit_passthru_out.bits.acc_read_resp := norm_unit_passthru_q.io.deq.bits.acc_read_resp
